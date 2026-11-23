@@ -80,7 +80,7 @@ flowchart LR
 - **严谨的状态机边界防护**：
   - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；会话优雅退出时进入 `Closing(250ms)` 吸收在途尾包，避免触发 `ICMP Port Unreachable`。
   - **入口预校验与抗注入**：`validate_dtls_datagram` 拒绝 `Epoch=0` 明文 Alert 及 `<18B` 的伪造加密记录；`parse_stun` 严格执行 RFC 5389 §15.4 拒绝 `MESSAGE-INTEGRITY` 后的任何夹带属性；SRTP 内置 **2048 包 RFC 6479 滑动防重放窗口**（容忍跨洋高包率 ECMP 乱序），SRTCP 内置 64-bit 滑动防重放窗口。
-  - **CGNAT 漂移与服务端重启自愈**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话；客户端按 RFC 7675 §5.1 独立追踪 `last_peer_rx`，失活超时后自动销毁旧句柄并在新端口重握恢复。
+  - **单向上行黑洞与服务端重启自愈（`v0.3.4`）**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并按 RFC 7675 §5.1 在 30s 无认证对端报文时静默回收旧会话；客户端仅凭双向 STUN Consent 应答判定上行活性（不被服务端单向下行 SRTCP/SRTP 误续命），丢失应答时按 RFC 5389 §7.2.1 同 `txid` 指数退避重传（避免单包丢包误切），3 次无应答即确认上行黑洞，旧端口转入 35s 静默接收态（零 ICMP 弹包且避免 CGNAT 复用黑洞外网端口）并立即在新端口完成重握自愈。
 - **AEAD 密文内层随机填充**：线上传输首字节固定为 `0x90 (P=0)`，`[inner_len: u16 BE] || plaintext || [0..=31B random pad]` 全部位于 AEAD 密文内，大包（`>= 1340B`）自动收窄填充至 `0..=7B` 以适配 `1492B` PPPoE MTU 避免 IP 分片。
 - **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书，支持秒级随机有效期与 High-S/Low-S 签名长度随机化；全平台 `ClientHello` 均完整宣告 3 个 ECDHE-ECDSA AEAD 套件。
 - **默认单线程无锁 + 可选多核扩展**：默认 `--workers 1` 在主线程运行单个 `mio` 非阻塞事件循环（不启用 `SO_REUSEPORT`），即可并发承载数千 UDP 会话；在 Linux 多核服务器上可按需传入 `--workers <N|auto>` 开启多核横向扩展。

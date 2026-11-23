@@ -25,6 +25,14 @@ use std::time::{Duration, Instant};
 
 const LISTEN_TOKEN: Token = Token(0);
 const CLOSING_DRAIN_MS: u64 = 250;
+/// Silent receive-only drain window after RFC 7675 consent loss (exceeds server's 30s consent
+/// expiry so trailing downlink SRTCP never triggers ICMP Port Unreachable and CGNAT never reuses
+/// the blackholed external port for the newly rotated 5-tuple).
+const BLACKHOLE_DRAIN_SECS: u64 = 35;
+const MAX_DRAINING_SESSIONS: usize = 16;
+const ACTIVE_ROTATE_WINDOW_SECS: u64 = 30;
+/// RFC 5389 §7.2.1 STUN consent retries (1 initial + 2 same-txid retransmits = 3 attempts, ~4.7s).
+const KA_MAX_RETRIES: u8 = 2;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -62,13 +70,16 @@ struct ClientSession {
     created_at: Instant,
     ready_at: Option<Instant>,
     last_data_active: Instant,
-    last_peer_rx: Instant,
     next_retry_at: Instant,
     next_keepalive_at: Instant,
     next_srtcp_at: Instant,
     dtls_next_timeout: Option<Instant>,
     retries: u32,
-    keepalive_txid: Option<[u8; 12]>,
+    /// In-flight RFC 7675 STUN consent check transaction (RFC 5389 §7.2.1 same-txid retransmission).
+    ka_txid: Option<[u8; 12]>,
+    ka_pkt: Vec<u8>,
+    ka_retries: u8,
+    ka_rto_at: Option<Instant>,
     stun_key: Option<[u8; 32]>,
     ssrc_c2s: u32,
     ssrc_s2c: u32,
@@ -197,7 +208,10 @@ fn drain_client_dtls(
             sess.state = HandshakeState::Ready;
             sess.ready_at = Some(now);
             sess.last_data_active = now;
-            sess.last_peer_rx = now;
+            sess.ka_txid = None;
+            sess.ka_pkt.clear();
+            sess.ka_retries = 0;
+            sess.ka_rto_at = None;
             sess.next_keepalive_at = now + jitter_duration_ms(cfg.keepalive_secs * 1000);
             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
 
@@ -292,6 +306,144 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     res
 }
 
+#[allow(clippy::too_many_arguments)]
+fn spawn_client_session(
+    worker_id: usize,
+    client_addr: SocketAddr,
+    cfg: &ClientConfig,
+    poll: &mut Poll,
+    sessions_by_token: &mut HashMap<Token, ClientSession>,
+    token_by_client: &mut HashMap<SocketAddr, Token>,
+    next_token_id: &mut usize,
+    dtls_buf: &mut Vec<u8>,
+    now: Instant,
+    retry_dur: Duration,
+    ka_base_ms: u64,
+    idle_dur: Duration,
+) -> Option<Token> {
+    // Bound silent receive-only draining sockets so prolonged blackholes cannot leak FDs.
+    let mut draining: Vec<(Token, Instant)> = sessions_by_token
+        .iter()
+        .filter_map(|(&t, s)| match s.state {
+            HandshakeState::Closing(deadline) => Some((t, deadline)),
+            _ => None,
+        })
+        .collect();
+    if draining.len() >= MAX_DRAINING_SESSIONS {
+        draining.sort_by_key(|&(_, d)| d);
+        let to_evict = draining.len() - MAX_DRAINING_SESSIONS + 1;
+        for (t, _) in draining.into_iter().take(to_evict) {
+            if let Some(mut old) = sessions_by_token.remove(&t) {
+                let _ = poll.registry().deregister(&mut old.upstream);
+                if token_by_client.get(&old.client_addr) == Some(&t) {
+                    token_by_client.remove(&old.client_addr);
+                }
+            }
+        }
+    }
+
+    if sessions_by_token.len() >= cfg.max_sessions {
+        let expired: Vec<Token> = sessions_by_token
+            .iter()
+            .filter(|(_, s)| {
+                matches!(s.state, HandshakeState::Closing(_))
+                    || now.duration_since(s.last_data_active) > idle_dur
+            })
+            .map(|(&t, _)| t)
+            .collect();
+        for t in expired {
+            if let Some(mut s) = sessions_by_token.remove(&t) {
+                graceful_teardown_client(&mut s, dtls_buf);
+                let _ = poll.registry().deregister(&mut s.upstream);
+                if token_by_client.get(&s.client_addr) == Some(&t) {
+                    token_by_client.remove(&s.client_addr);
+                }
+            }
+        }
+        if sessions_by_token.len() >= cfg.max_sessions {
+            log(
+                worker_id,
+                &format!(
+                    "max_sessions={} reached, dropping new client {}",
+                    cfg.max_sessions, client_addr
+                ),
+            );
+            return None;
+        }
+    }
+
+    let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false) {
+        Ok(s) => s,
+        Err(e) => {
+            log(worker_id, &format!("upstream socket error: {}", e));
+            return None;
+        }
+    };
+    let local_port = up.local_addr().map(|a| a.port()).unwrap_or(0);
+    let tok = Token(*next_token_id);
+    *next_token_id += 1;
+    if poll.registry().register(&mut up, tok, Interest::READABLE).is_err() {
+        return None;
+    }
+    let ice = SessionIceParams::generate();
+    let stun_txid = make_fresh_stun_txid(&cfg.psk);
+    let (stun_pkt, _) = build_ice_stun_request(&cfg.psk, &ice, Some(stun_txid), true);
+    let _ = up.send(&stun_pkt);
+
+    log(
+        worker_id,
+        &format!(
+            "new session client={} -> up_sport={} target={} ufrag={}",
+            client_addr, local_port, cfg.server_addr, ice.username()
+        ),
+    );
+
+    let sess = ClientSession {
+        client_addr,
+        upstream: up,
+        local_port,
+        ice,
+        stun_txid,
+        cached_initial_stun: stun_pkt,
+        state: HandshakeState::StunWait,
+        created_at: now,
+        ready_at: None,
+        last_data_active: now,
+        next_retry_at: now + retry_dur,
+        next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
+        next_srtcp_at: now + rand_duration_range_ms(250, 600),
+        dtls_next_timeout: None,
+        retries: 0,
+        ka_txid: None,
+        ka_pkt: Vec::new(),
+        ka_retries: 0,
+        ka_rto_at: None,
+        stun_key: None,
+        ssrc_c2s: 0,
+        ssrc_s2c: 0,
+        dtls: None,
+        pending_sh_suite: None,
+        dtls_suite_id: None,
+        dtls_km: None,
+        active_cipher: None,
+        cipher: None,
+        pending: VecDeque::with_capacity(64),
+        tx_pkts: 0,
+        tx_pkts_at_last_rtcp: 0,
+        tx_bytes: 0,
+        rx_pkts: 0,
+        rx_bytes: 0,
+        keepalives_ok: 0,
+        srtcp_tx: 0,
+        srtcp_rx: 0,
+        auth_drops: 0,
+    };
+    token_by_client.insert(client_addr, tok);
+    sessions_by_token.insert(tok, sess);
+    Some(tok)
+}
+
 fn run_client_worker(
     worker_id: usize,
     cfg: ClientConfig,
@@ -333,6 +485,7 @@ fn run_client_worker(
         let now = Instant::now();
         let mut wait = Duration::from_millis(150);
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
+        let mut to_rotate: Vec<(Token, SocketAddr, bool)> = Vec::new();
 
         for (&tok, sess) in sessions_by_token.iter_mut() {
             match sess.state {
@@ -385,30 +538,69 @@ fn run_client_worker(
                     }
                 }
                 HandshakeState::Ready => {
-                    // NEW-M-01: RFC 7675 §5.1 peer liveness check (default 5s * 5 = 25s) prevents half-open blackhole
-                    // deadlock after server restart or CGNAT port shift even when local traffic keeps flowing!
-                    let peer_dead = cfg.keepalive_secs > 0
-                        && now.duration_since(sess.last_peer_rx)
-                            > Duration::from_secs((cfg.keepalive_secs * 5).max(6));
-                    if now.duration_since(sess.last_data_active) > idle_dur || peer_dead {
-                        if peer_dead {
-                            log(
-                                worker_id,
-                                &format!(
-                                    "peer liveness timeout (RFC 7675 consent lost) up_sport={} -> closing for auto-rehandshake",
-                                    sess.local_port
-                                ),
-                            );
-                        }
+                    if now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_client(sess, &mut dtls_buf);
                         sess.state = HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
                         continue;
                     }
-                    if cfg.keepalive_secs > 0 && now >= sess.next_keepalive_at {
-                        let (pkt, txid) = build_ice_stun_request(&cfg.psk, &sess.ice, None, false);
-                        sess.keepalive_txid = Some(txid);
-                        sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
-                        let _ = sess.upstream.send(&pkt);
+                    // RFC 7675 §5.1 + RFC 5389 §7.2.1 bidirectional STUN consent check:
+                    // ONLY an authenticated STUN Binding Success Response proves uplink connectivity
+                    // (unsolicited server SRTCP or QUIC PTO SRTP MUST NOT mask an asymmetric uplink blackhole!).
+                    if cfg.keepalive_secs > 0 {
+                        if sess.ka_txid.is_some() {
+                            if let Some(rto_at) = sess.ka_rto_at {
+                                if now >= rto_at {
+                                    if sess.ka_retries < KA_MAX_RETRIES {
+                                        sess.ka_retries += 1;
+                                        // Retransmit the EXACT same STUN transaction (same txid) with
+                                        // jittered exponential RTO backoff matching RFC 5389 / libwebrtc.
+                                        let _ = sess.upstream.send(&sess.ka_pkt);
+                                        let next_rto = if sess.ka_retries == 1 {
+                                            rand_duration_range_ms(1400, 1800)
+                                        } else {
+                                            rand_duration_range_ms(1800, 2200)
+                                        };
+                                        sess.ka_rto_at = Some(now + next_rto);
+                                    } else {
+                                        let active_recently = now.duration_since(sess.last_data_active)
+                                            <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                        log(
+                                            worker_id,
+                                            &format!(
+                                                "RFC 7675 consent lost ({}/{} STUN unanswered) client={} up_sport={} -> draining {}s{}",
+                                                KA_MAX_RETRIES + 1,
+                                                KA_MAX_RETRIES + 1,
+                                                sess.client_addr,
+                                                sess.local_port,
+                                                BLACKHOLE_DRAIN_SECS,
+                                                if active_recently {
+                                                    " + rotating to fresh 5-tuple"
+                                                } else {
+                                                    " (idle)"
+                                                }
+                                            ),
+                                        );
+                                        graceful_teardown_client(sess, &mut dtls_buf);
+                                        sess.ka_txid = None;
+                                        sess.ka_pkt.clear();
+                                        sess.ka_retries = 0;
+                                        sess.ka_rto_at = None;
+                                        sess.state = HandshakeState::Closing(
+                                            now + Duration::from_secs(BLACKHOLE_DRAIN_SECS),
+                                        );
+                                        to_rotate.push((tok, sess.client_addr, active_recently));
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else if now >= sess.next_keepalive_at {
+                            let (pkt, txid) = build_ice_stun_request(&cfg.psk, &sess.ice, None, false);
+                            let _ = sess.upstream.send(&pkt);
+                            sess.ka_txid = Some(txid);
+                            sess.ka_pkt = pkt;
+                            sess.ka_retries = 0;
+                            sess.ka_rto_at = Some(now + rand_duration_range_ms(950, 1250));
+                        }
                     }
                     if now >= sess.next_srtcp_at {
                         let is_active_media = now.duration_since(sess.last_data_active) <= Duration::from_secs(3);
@@ -441,10 +633,34 @@ fn run_client_worker(
             }
         }
 
+        for (old_tok, client_addr, active_recently) in to_rotate {
+            if token_by_client.get(&client_addr) == Some(&old_tok) {
+                token_by_client.remove(&client_addr);
+            }
+            if active_recently {
+                let _ = spawn_client_session(
+                    worker_id,
+                    client_addr,
+                    &cfg,
+                    &mut poll,
+                    &mut sessions_by_token,
+                    &mut token_by_client,
+                    &mut next_token_id,
+                    &mut dtls_buf,
+                    now,
+                    retry_dur,
+                    ka_base_ms,
+                    idle_dur,
+                );
+            }
+        }
+
         for (tok, reason) in to_close {
             if let Some(mut sess) = sessions_by_token.remove(&tok) {
                 let _ = poll.registry().deregister(&mut sess.upstream);
-                token_by_client.remove(&sess.client_addr);
+                if token_by_client.get(&sess.client_addr) == Some(&tok) {
+                    token_by_client.remove(&sess.client_addr);
+                }
                 log(
                     worker_id,
                     &format!(
@@ -476,114 +692,37 @@ fn run_client_worker(
                         continue;
                     }
 
-                    // If existing session is in Closing drain, drop it immediately so new traffic starts fresh
+                    // If existing session is in Closing drain, detach it from token_by_client while
+                    // letting its socket finish silent receive-only drain (zero ICMP Port Unreachable).
                     if let Some(&existing_tok) = token_by_client.get(&client_addr) {
                         if matches!(
                             sessions_by_token.get(&existing_tok).map(|s| s.state),
                             Some(HandshakeState::Closing(_))
                         ) {
-                            if let Some(mut old) = sessions_by_token.remove(&existing_tok) {
-                                let _ = poll.registry().deregister(&mut old.upstream);
-                                token_by_client.remove(&client_addr);
-                            }
+                            token_by_client.remove(&client_addr);
                         }
                     }
 
                     let tok = if let Some(&existing) = token_by_client.get(&client_addr) {
                         existing
                     } else {
-                        if sessions_by_token.len() >= cfg.max_sessions {
-                            let expired: Vec<Token> = sessions_by_token
-                                .iter()
-                                .filter(|(_, s)| {
-                                    matches!(s.state, HandshakeState::Closing(_))
-                                        || now.duration_since(s.last_data_active) > idle_dur
-                                })
-                                .map(|(&t, _)| t)
-                                .collect();
-                            for t in expired {
-                                if let Some(mut s) = sessions_by_token.remove(&t) {
-                                    graceful_teardown_client(&mut s, &mut dtls_buf);
-                                    let _ = poll.registry().deregister(&mut s.upstream);
-                                    token_by_client.remove(&s.client_addr);
-                                }
-                            }
-                            if sessions_by_token.len() >= cfg.max_sessions {
-                                log(
-                                    worker_id,
-                                    &format!("max_sessions={} reached, dropping new client {}", cfg.max_sessions, client_addr),
-                                );
-                                continue;
-                            }
-                        }
-                        let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                        let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                log(worker_id, &format!("upstream socket error: {}", e));
-                                continue;
-                            }
-                        };
-                        let local_port = up.local_addr().map(|a| a.port()).unwrap_or(0);
-                        let tok = Token(next_token_id);
-                        next_token_id += 1;
-                        if poll.registry().register(&mut up, tok, Interest::READABLE).is_err() {
-                            continue;
-                        }
-                        let ice = SessionIceParams::generate();
-                        let stun_txid = make_fresh_stun_txid(&cfg.psk);
-                        let (stun_pkt, _) = build_ice_stun_request(&cfg.psk, &ice, Some(stun_txid), true);
-                        let _ = up.send(&stun_pkt);
-
-                        log(
+                        match spawn_client_session(
                             worker_id,
-                            &format!(
-                                "new session client={} -> up_sport={} target={} ufrag={}",
-                                client_addr, local_port, cfg.server_addr, ice.username()
-                            ),
-                        );
-
-                        let sess = ClientSession {
                             client_addr,
-                            upstream: up,
-                            local_port,
-                            ice,
-                            stun_txid,
-                            cached_initial_stun: stun_pkt,
-                            state: HandshakeState::StunWait,
-                            created_at: now,
-                            ready_at: None,
-                            last_data_active: now,
-                            last_peer_rx: now,
-                            next_retry_at: now + retry_dur,
-                            next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
-                            next_srtcp_at: now + rand_duration_range_ms(250, 600),
-                            dtls_next_timeout: None,
-                            retries: 0,
-                            keepalive_txid: None,
-                            stun_key: None,
-                            ssrc_c2s: 0,
-                            ssrc_s2c: 0,
-                            dtls: None,
-                            pending_sh_suite: None,
-                            dtls_suite_id: None,
-                            dtls_km: None,
-                            active_cipher: None,
-                            cipher: None,
-                            pending: VecDeque::with_capacity(64),
-                            tx_pkts: 0,
-                            tx_pkts_at_last_rtcp: 0,
-                            tx_bytes: 0,
-                            rx_pkts: 0,
-                            rx_bytes: 0,
-                            keepalives_ok: 0,
-                            srtcp_tx: 0,
-                            srtcp_rx: 0,
-                            auth_drops: 0,
-                        };
-                        token_by_client.insert(client_addr, tok);
-                        sessions_by_token.insert(tok, sess);
-                        tok
+                            &cfg,
+                            &mut poll,
+                            &mut sessions_by_token,
+                            &mut token_by_client,
+                            &mut next_token_id,
+                            &mut dtls_buf,
+                            now,
+                            retry_dur,
+                            ka_base_ms,
+                            idle_dur,
+                        ) {
+                            Some(t) => t,
+                            None => continue,
+                        }
                     };
 
                     if let Some(sess) = sessions_by_token.get_mut(&tok) {
@@ -667,7 +806,10 @@ fn run_client_worker(
                                             sess.state = HandshakeState::Ready;
                                             sess.ready_at = Some(now);
                                             sess.last_data_active = now;
-                                            sess.last_peer_rx = now;
+                                            sess.ka_txid = None;
+                                            sess.ka_pkt.clear();
+                                            sess.ka_retries = 0;
+                                            sess.ka_rto_at = None;
                                             sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
                                             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
                                             let mut flushed = 0usize;
@@ -693,11 +835,14 @@ fn run_client_worker(
                                             );
                                         }
                                     } else if sess.state == HandshakeState::Ready
-                                        && sess.keepalive_txid == Some(parsed.txid)
+                                        && sess.ka_txid == Some(parsed.txid)
                                     {
                                         sess.keepalives_ok += 1;
-                                        sess.last_peer_rx = now;
-                                        sess.keepalive_txid = None;
+                                        sess.ka_txid = None;
+                                        sess.ka_pkt.clear();
+                                        sess.ka_retries = 0;
+                                        sess.ka_rto_at = None;
+                                        sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
                                     }
                                 } else {
                                     sess.auth_drops += 1;
@@ -758,7 +903,8 @@ fn run_client_worker(
                                 if let Some(ref mut cipher) = sess.cipher {
                                     if let Some(has_bye) = cipher.verify_srtcp(pkt) {
                                         sess.srtcp_rx += 1;
-                                        sess.last_peer_rx = now;
+                                        // Note: do NOT refresh uplink consent liveness from unsolicited server
+                                        // SRTCP — only STUN Binding Success proves uplink reaches the server.
                                         if has_bye {
                                             // V3-M-05: enter brief Closing drain to absorb trailing close_notify!
                                             sess.state = HandshakeState::Closing(
@@ -778,7 +924,6 @@ fn run_client_worker(
                                 if let Some(ref mut cipher) = sess.cipher {
                                     if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
                                         sess.last_data_active = now;
-                                        sess.last_peer_rx = now;
                                         if listen_sock.send_to(&wbuf[..pn], sess.client_addr).is_ok() {
                                             sess.rx_pkts += 1;
                                             sess.rx_bytes += pn as u64;
@@ -802,6 +947,9 @@ fn run_client_worker(
         if now.duration_since(last_stats) >= stats_dur {
             last_stats = now;
             for sess in sessions_by_token.values() {
+                if matches!(sess.state, HandshakeState::Closing(_)) {
+                    continue;
+                }
                 log(
                     worker_id,
                     &format!(
@@ -819,5 +967,245 @@ fn run_client_worker(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::{demux_rfc7983, parse_stun, PacketKind, STUN_BINDING_REQUEST};
+    use crate::server::{run_server, ServerConfig};
+    use std::net::UdpSocket;
+    use std::sync::atomic::{AtomicBool, AtomicU16, AtomicUsize, Ordering};
+    use std::thread;
+
+    fn reserve_free_port() -> u16 {
+        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+        s.local_addr().unwrap().port()
+    }
+
+    #[test]
+    fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_same_txid() {
+        let psk = b"v034-asymmetric-blackhole-test-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        // 1. Local UDP echo backend (simulating Hysteria2 / QUIC backend accepting migrated source ports)
+        let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                    let _ = echo_sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+
+        // 2. Real webrtc-cloak server
+        let srv_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                workers: 1,
+                max_sessions: 64,
+                wan_mtu: 1488,
+                idle_timeout_secs: 120,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+            });
+        });
+
+        // 3. Fault-injecting UDP relay between client and server (tracks per-client-port upstream sockets)
+        let drop_first_ka = Arc::new(AtomicBool::new(true));
+        let blackhole_port = Arc::new(AtomicU16::new(0));
+        let first_port = Arc::new(AtomicU16::new(0));
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let same_txid_retransmits = Arc::new(AtomicUsize::new(0));
+        let blackholed_ka_txids_matched = Arc::new(AtomicUsize::new(0));
+        let downlink_srtcp_during_blackhole = Arc::new(AtomicUsize::new(0));
+
+        let relay_drop_first = Arc::clone(&drop_first_ka);
+        let relay_bh_port = Arc::clone(&blackhole_port);
+        let relay_first_port = Arc::clone(&first_port);
+        let relay_latest_port = Arc::clone(&latest_port);
+        let relay_same_txid = Arc::clone(&same_txid_retransmits);
+        let relay_bh_txid_match = Arc::clone(&blackholed_ka_txids_matched);
+        let relay_dl_srtcp = Arc::clone(&downlink_srtcp_during_blackhole);
+        let relay_psk = psk.clone();
+
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut dropped_ka_txid: Option<[u8; 12]> = None;
+            let mut bh_first_ka_txid: Option<[u8; 12]> = None;
+            let mut buf = [0u8; 4096];
+
+            loop {
+                // Client -> Server direction
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    let _ = relay_first_port.compare_exchange(0, cport, Ordering::SeqCst, Ordering::SeqCst);
+                    relay_latest_port.store(cport, Ordering::SeqCst);
+
+                    let pkt = &buf[..n];
+                    let is_ka_stun = demux_rfc7983(pkt) == PacketKind::Stun
+                        && parse_stun(pkt, &relay_psk)
+                            .map(|p| p.authenticated && p.msg_type == STUN_BINDING_REQUEST && !p.use_candidate)
+                            .unwrap_or(false);
+
+                    // Phase 2: Asymmetric uplink blackhole on blackhole_port (0% uplink reaches server!)
+                    let bh = relay_bh_port.load(Ordering::SeqCst);
+                    if bh != 0 && cport == bh {
+                        if is_ka_stun {
+                            if let Some(p) = parse_stun(pkt, &relay_psk) {
+                                match bh_first_ka_txid {
+                                    None => bh_first_ka_txid = Some(p.txid),
+                                    Some(prev) if prev == p.txid => {
+                                        relay_bh_txid_match.fetch_add(1, Ordering::SeqCst);
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        continue; // Drop 100% uplink for blackholed 5-tuple!
+                    }
+
+                    // Phase 1: Drop exactly ONE STUN keepalive to verify RFC 5389 same-txid retry without rotation
+                    if is_ka_stun {
+                        if let Some(p) = parse_stun(pkt, &relay_psk) {
+                            if relay_drop_first.swap(false, Ordering::SeqCst) {
+                                dropped_ka_txid = Some(p.txid);
+                                continue;
+                            }
+                            if dropped_ka_txid == Some(p.txid) {
+                                relay_same_txid.fetch_add(1, Ordering::SeqCst);
+                                dropped_ka_txid = None;
+                            }
+                        }
+                    }
+
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(pkt);
+                }
+
+                // Server -> Client direction (ALWAYS passed — even during uplink blackhole!)
+                for (&cport, (usock, cli_addr)) in upstreams.iter() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let pkt = &buf[..n];
+                        let bh = relay_bh_port.load(Ordering::SeqCst);
+                        if bh != 0 && cport == bh && demux_rfc7983(pkt) == PacketKind::Srtcp {
+                            relay_dl_srtcp.fetch_add(1, Ordering::SeqCst);
+                        }
+                        let _ = relay_front.send_to(pkt, *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+        });
+
+        // 4. Real webrtc-cloak client pointing to relay (--keepalive 1 so test completes in ~8s)
+        let cli_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                workers: 1,
+                max_sessions: 64,
+                wan_mtu: 1488,
+                retry_ms: 200,
+                max_retries: 8,
+                keepalive_secs: 1,
+                idle_timeout_secs: 120,
+                stats_interval_secs: 3600,
+            });
+        });
+
+        thread::sleep(Duration::from_millis(120));
+
+        // 5. Local app socket (simulating mihomo Hysteria2 client staying on ONE fixed local port)
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+
+        let mut rbuf = [0u8; 256];
+        let mut ready = false;
+        for _ in 0..20 {
+            let _ = app.send(b"PING_INIT");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PING_INIT" {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        assert!(ready, "initial STUN+DTLS tunnel should come up");
+        let port1 = first_port.load(Ordering::SeqCst);
+        assert_ne!(port1, 0);
+
+        // Phase 1: Wait for the 1st STUN keepalive drop + RFC 5389 same-txid retransmission recovery
+        let t_p1 = Instant::now();
+        while same_txid_retransmits.load(Ordering::SeqCst) == 0 && t_p1.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"PING_P1");
+            let _ = app.recv(&mut rbuf);
+            thread::sleep(Duration::from_millis(100));
+        }
+        assert_eq!(
+            same_txid_retransmits.load(Ordering::SeqCst),
+            1,
+            "single dropped STUN keepalive MUST trigger RFC 5389 same-txid retransmission"
+        );
+        assert_eq!(
+            latest_port.load(Ordering::SeqCst),
+            port1,
+            "single dropped STUN keepalive MUST NOT cause false 5-tuple rotation"
+        );
+
+        // Phase 2: Inject 100% asymmetric uplink blackhole on port1 while downlink SRTCP continues!
+        blackhole_port.store(port1, Ordering::SeqCst);
+        let t_bh = Instant::now();
+        let mut recovered = false;
+        while t_bh.elapsed() < Duration::from_secs(10) {
+            let _ = app.send(b"PING_AFTER_BH");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PING_AFTER_BH" && latest_port.load(Ordering::SeqCst) != port1 {
+                    recovered = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(150));
+        }
+        assert!(
+            recovered,
+            "client MUST detect asymmetric uplink blackhole despite downlink SRTCP (dl_srtcp={}) and rotate off port {}",
+            downlink_srtcp_during_blackhole.load(Ordering::SeqCst),
+            port1
+        );
+        assert_ne!(latest_port.load(Ordering::SeqCst), port1);
+        assert_eq!(
+            blackholed_ka_txids_matched.load(Ordering::SeqCst),
+            KA_MAX_RETRIES as usize,
+            "blackhole probe MUST perform exactly {} RFC 5389 same-txid retransmits before rotating",
+            KA_MAX_RETRIES
+        );
+        assert!(
+            downlink_srtcp_during_blackhole.load(Ordering::SeqCst) >= 1,
+            "test should verify server was still sending downlink SRTCP during asymmetric blackhole"
+        );
     }
 }

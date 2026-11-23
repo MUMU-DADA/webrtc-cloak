@@ -25,11 +25,14 @@ use std::time::{Duration, Instant};
 
 const LISTEN_TOKEN: Token = Token(0);
 const SEEN_TXID_TTL: Duration = Duration::from_secs(90);
-const RETRANSMIT_WINDOW: Duration = Duration::from_secs(5);
+const RETRANSMIT_WINDOW: Duration = Duration::from_secs(8);
 const MAX_STUN_RETRANSMITS: u8 = 6;
 const SEEN_TXID_CAP: usize = 65_536;
 const EARLY_SRTP_CAP: usize = 32;
 const CLOSING_DRAIN_MS: u64 = 250;
+/// RFC 7675 §5.1 consent lifetime: stop transmitting and silently release session after 30s
+/// with zero authenticated packets (STUN/SRTP/SRTCP/DTLS) received from peer.
+const PEER_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
 
 enum TxidCheck {
     Fresh,
@@ -169,6 +172,7 @@ struct ServerSession {
     /// V3-M-03: buffers early 0-RTT SRTP packets arriving before Flight 5 finishes!
     early_srtp: VecDeque<Vec<u8>>,
     last_data_active: Instant,
+    last_peer_rx: Instant,
     next_srtcp_at: Instant,
     rx_pkts: u64,
     rx_bytes: u64,
@@ -480,6 +484,12 @@ fn run_server_worker(
                     }
                 }
                 ServerState::Ready => {
+                    if now.duration_since(sess.last_peer_rx) > PEER_CONSENT_TIMEOUT {
+                        // RFC 7675 §5.1: consent expired (30s with zero authenticated peer packets) ->
+                        // cease transmitting immediately (silent close, zero ICMP bounce).
+                        to_close.push((tok, "consent_timeout"));
+                        continue;
+                    }
                     if now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_server(sess, &listen_sock, &mut dtls_buf, &mut audit_pkt);
                         sess.state = ServerState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
@@ -520,7 +530,9 @@ fn run_server_worker(
         for (tok, reason) in to_close {
             if let Some(mut sess) = sessions_by_token.remove(&tok) {
                 let _ = poll.registry().deregister(&mut sess.backend_sock);
-                token_by_peer.remove(&sess.peer_addr);
+                if token_by_peer.get(&sess.peer_addr) == Some(&tok) {
+                    token_by_peer.remove(&sess.peer_addr);
+                }
                 log(
                     worker_id,
                     &format!(
@@ -588,6 +600,13 @@ fn run_server_worker(
                                     let reply = &buf[..len as usize];
                                     audit_pkt(1, reply);
                                     let _ = listen_sock.send_to(reply, peer_addr);
+                                    if same_active {
+                                        if let Some(&tok) = token_by_peer.get(&peer_addr) {
+                                            if let Some(sess) = sessions_by_token.get_mut(&tok) {
+                                                sess.last_peer_rx = now;
+                                            }
+                                        }
+                                    }
                                     continue;
                                 }
                                 TxidCheck::Fresh => {}
@@ -604,6 +623,7 @@ fn run_server_worker(
                                     let _ = listen_sock.send_to(&resp, peer_addr);
                                     if let Some(sess) = sessions_by_token.get_mut(&tok) {
                                         sess.keepalives += 1;
+                                        sess.last_peer_rx = now;
                                     }
                                     continue;
                                 }
@@ -643,7 +663,9 @@ fn run_server_worker(
                                     if let Some(mut s) = sessions_by_token.remove(&t) {
                                         graceful_teardown_server(&mut s, &listen_sock, &mut dtls_buf, &mut audit_pkt);
                                         let _ = poll.registry().deregister(&mut s.backend_sock);
-                                        token_by_peer.remove(&s.peer_addr);
+                                        if token_by_peer.get(&s.peer_addr) == Some(&t) {
+                                            token_by_peer.remove(&s.peer_addr);
+                                        }
                                     }
                                 }
                                 if sessions_by_token.len() >= cfg.max_sessions {
@@ -717,6 +739,7 @@ fn run_server_worker(
                                 cipher: cipher_opt,
                                 early_srtp: VecDeque::new(),
                                 last_data_active: now,
+                                last_peer_rx: now,
                                 next_srtcp_at: now + rand_duration_range_ms(300, 750),
                                 rx_pkts: 0,
                                 rx_bytes: 0,
@@ -768,6 +791,7 @@ fn run_server_worker(
                                         }
                                         continue;
                                     }
+                                    sess.last_peer_rx = now;
                                     if drain_server_dtls(
                                         worker_id,
                                         sess,
@@ -795,6 +819,7 @@ fn run_server_worker(
                                         if let Some(ref mut cipher) = sess.cipher {
                                             if let Some(has_bye) = cipher.verify_srtcp(pkt) {
                                                 sess.srtcp_rx += 1;
+                                                sess.last_peer_rx = now;
                                                 if has_bye {
                                                     sess.state = ServerState::Closing(
                                                         now + Duration::from_millis(CLOSING_DRAIN_MS),
@@ -820,6 +845,7 @@ fn run_server_worker(
                                             if let Some(ref mut cipher) = sess.cipher {
                                                 if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
                                                     sess.last_data_active = now;
+                                                    sess.last_peer_rx = now;
                                                     if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
                                                         sess.rx_pkts += 1;
                                                         sess.rx_bytes += pn as u64;
@@ -874,6 +900,9 @@ fn run_server_worker(
         if now.duration_since(last_stats) >= stats_dur {
             last_stats = now;
             for sess in sessions_by_token.values() {
+                if matches!(sess.state, ServerState::Closing(_)) {
+                    continue;
+                }
                 log(
                     worker_id,
                     &format!(
