@@ -166,6 +166,8 @@ fn run_sink(listen: &str, workers: usize) {
             if reuse {
                 let _ = s.set_reuse_port(true);
             }
+            #[cfg(not(unix))]
+            let _ = reuse;
             let _ = s.set_recv_buffer_size(8 * 1024 * 1024);
             let _ = s.set_send_buffer_size(8 * 1024 * 1024);
             s.bind(&addr.into()).expect("bind sink");

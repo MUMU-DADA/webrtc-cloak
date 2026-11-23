@@ -94,6 +94,7 @@ pub struct CpuAccelInfo {
 }
 
 pub fn detect_cpu_accel() -> CpuAccelInfo {
+    #[allow(unused_mut)]
     let mut features = Vec::new();
     let has_hw_aes_gcm;
 
