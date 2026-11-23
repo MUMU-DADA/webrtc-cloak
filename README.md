@@ -38,9 +38,6 @@
 ├── README.md                              # 项目说明、协议架构与构建文档
 ├── .gitignore                             # 忽略构建产物、密钥文件与抓包日志
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线/Pages 双用）
-├── dist/                                  # 本地常用预编译产物（已剥离本机路径）
-│   ├── webrtc-cloak-linux-x86_64          # Linux x86_64 静态 musl 二进制 (2.1 MB)
-│   └── webrtc-cloak-macos-arm64           # macOS Apple Silicon 二进制 (1.5 MB)
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
     ├── Cargo.toml
     ├── Cargo.lock
@@ -105,7 +102,7 @@ flowchart LR
 
 ## 快速上手（实验部署示例）
 
-> 可直接从 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)** 下载对应平台/架构的预编译压缩包（解压即用），或直接使用仓库 `dist/` 中的二进制。
+> 请直接从 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)** 下载对应平台/架构的预编译压缩包并解压得到 `webrtc-cloak`（或 `webrtc-cloak.exe`）。
 
 ### 1. 生成共享密钥文件（推荐 `--psk-file` 或环境变量 `WEBRTC_CLOAK_PSK`）
 
@@ -117,8 +114,8 @@ chmod 600 /tmp/webrtc-cloak.psk
 ### 2. 启动服务端
 
 ```bash
-# 默认单线程 (--workers 1)、--cipher auto（两端按硬件加速自动协商）
-./dist/webrtc-cloak-linux-x86_64 server \
+# 默认单线程 (--workers 1)、--cipher auto（两端按硬件加速自动协商）、默认 --mtu 1488
+./webrtc-cloak server \
   --listen-host 0.0.0.0 \
   --listen-port 19643 \
   --backend-host 127.0.0.1 \
@@ -129,7 +126,7 @@ chmod 600 /tmp/webrtc-cloak.psk
 ### 3. 启动客户端
 
 ```bash
-./dist/webrtc-cloak-linux-x86_64 client \
+./webrtc-cloak client \
   --listen-host 127.0.0.1 \
   --listen-port 19543 \
   --server-host 203.0.113.10 \
@@ -140,7 +137,7 @@ chmod 600 /tmp/webrtc-cloak.psk
 也可以通过环境变量传入密钥：
 
 ```bash
-WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./dist/webrtc-cloak-macos-arm64 client \
+WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
   --listen-host 127.0.0.1 --listen-port 19543 \
   --server-host 203.0.113.10 --server-port 19643
 ```
@@ -161,10 +158,10 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./dist/webrtc-cloak-macos-arm64 client \
 
 ```bash
 # 查看本机硬件指令集与推荐加密套件
-./dist/webrtc-cloak-macos-arm64 cpu
+./webrtc-cloak cpu
 
 # 运行全部密码套件吞吐微基准（50000 包 × 1260B）
-./dist/webrtc-cloak-macos-arm64 bench 50000 1260 all
+./webrtc-cloak bench 50000 1260 all
 ```
 
 ---

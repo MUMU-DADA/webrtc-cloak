@@ -1,5 +1,6 @@
-# Build outputs
+# Build outputs & local release binaries
 /webrtc-cloak-rs/target/
+/dist/
 *.rs.bk
 
 # Secrets & local keys (NEVER commit)
