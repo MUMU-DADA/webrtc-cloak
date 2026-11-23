@@ -82,7 +82,7 @@ flowchart LR
 - **双重混合前向安全（Hybrid PFS）**：最终会话主密钥由 `SHA-256("webrtc-cloak-v3-pfs-mix" || stun_key || dtls_keying_material)` 派生，将预置共享密钥（PSK）认证与每次会话独立的 ECDHE-P256 前向安全密钥材料深度绑定；SRTP 与 SRTCP 通过 `dir | 0x80` 实现 100% 不相交的 AEAD Nonce 域分离。
 - **严谨的状态机边界防护**：
   - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；会话优雅退出时进入 `Closing(250ms)` 吸收在途尾包，避免触发 `ICMP Port Unreachable`。
-  - **入口预校验与抗注入**：`validate_dtls_datagram` 拒绝 `Epoch=0` 明文 Alert 及 `<18B` 的伪造加密记录；`parse_stun` 严格执行 RFC 5389 §15.4 拒绝 `MESSAGE-INTEGRITY` 后的任何夹带属性；SRTP 与 SRTCP 均内置 **64-bit 滑动防重放窗口**。
+  - **入口预校验与抗注入**：`validate_dtls_datagram` 拒绝 `Epoch=0` 明文 Alert 及 `<18B` 的伪造加密记录；`parse_stun` 严格执行 RFC 5389 §15.4 拒绝 `MESSAGE-INTEGRITY` 后的任何夹带属性；SRTP 内置 **2048 包 RFC 6479 滑动防重放窗口**（容忍跨洋高包率 ECMP 乱序），SRTCP 内置 64-bit 滑动防重放窗口。
   - **CGNAT 漂移与服务端重启自愈**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话；客户端按 RFC 7675 §5.1 独立追踪 `last_peer_rx`，失活超时后自动销毁旧句柄并在新端口重握恢复。
 - **AEAD 密文内层随机填充**：线上传输首字节固定为 `0x90 (P=0)`，`[inner_len: u16 BE] || plaintext || [0..=31B random pad]` 全部位于 AEAD 密文内，大包（`>= 1340B`）自动收窄填充至 `0..=7B` 以适配 `1492B` PPPoE MTU 避免 IP 分片。
 - **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书，支持秒级随机有效期与 High-S/Low-S 签名长度随机化；全平台 `ClientHello` 均完整宣告 3 个 ECDHE-ECDSA AEAD 套件。

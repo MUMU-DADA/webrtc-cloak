@@ -897,6 +897,9 @@ pub fn combine_session_key(stun_key: &[u8; 32], dtls_km: Option<&[u8]>) -> [u8; 
     h.finalize().into()
 }
 
+const SRTP_REPLAY_RING_WORDS: usize = 64; // 4096-bit ring buffer -> exact O(1) 2048-packet RFC 6479 window
+const SRTP_REPLAY_WINDOW: u64 = 2048;     // WireGuard-grade trans-Pacific ECMP reorder tolerance
+
 pub struct SrtpCloakCipher {
     suite: CipherSuite,
     enc_key: [u8; 32],
@@ -919,7 +922,7 @@ pub struct SrtpCloakCipher {
     rx_initialized: bool,
     pub rx_roc: u32,
     rx_highest_seq16: u16,
-    rx_replay_bitmap: u64,
+    rx_replay_ring: [u64; SRTP_REPLAY_RING_WORDS],
     tx_srtcp_idx: u32,
     rx_srtcp_seen: bool,
     rx_srtcp_highest: u32,
@@ -980,7 +983,7 @@ impl SrtpCloakCipher {
             rx_initialized: false,
             rx_roc: 0,
             rx_highest_seq16: 0,
-            rx_replay_bitmap: 0,
+            rx_replay_ring: [0u64; SRTP_REPLAY_RING_WORDS],
             tx_srtcp_idx: 1,
             rx_srtcp_seen: false,
             rx_srtcp_highest: 0,
@@ -1006,11 +1009,12 @@ impl SrtpCloakCipher {
         if ext_seq > highest {
             return false;
         }
-        let delta = highest - ext_seq;
-        if delta >= 64 {
+        if highest - ext_seq >= SRTP_REPLAY_WINDOW {
             return true;
         }
-        ((self.rx_replay_bitmap >> delta) & 1) != 0
+        let word_idx = ((ext_seq >> 6) as usize) & (SRTP_REPLAY_RING_WORDS - 1);
+        let bit_idx = ext_seq & 63;
+        ((self.rx_replay_ring[word_idx] >> bit_idx) & 1) != 0
     }
 
     #[inline]
@@ -1607,28 +1611,34 @@ impl SrtpCloakCipher {
     #[inline]
     fn update_rx_seq(&mut self, roc: u32, seq16: u16) {
         let ext_seq = ((roc as u64) << 16) | (seq16 as u64);
+        let new_block = ext_seq >> 6;
+        let bit_mask = 1u64 << (ext_seq & 63);
+        let ring_mask = SRTP_REPLAY_RING_WORDS - 1;
+
         if !self.rx_initialized {
             self.rx_initialized = true;
             self.rx_roc = roc;
             self.rx_highest_seq16 = seq16;
-            self.rx_replay_bitmap = 1;
+            self.rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
+            self.rx_replay_ring[(new_block as usize) & ring_mask] = bit_mask;
             return;
         }
         let highest = ((self.rx_roc as u64) << 16) | (self.rx_highest_seq16 as u64);
         if ext_seq > highest {
-            let shift = ext_seq - highest;
-            self.rx_replay_bitmap = if shift >= 64 {
-                1
+            let old_block = highest >> 6;
+            let diff_blocks = new_block - old_block;
+            if diff_blocks >= SRTP_REPLAY_RING_WORDS as u64 {
+                self.rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
             } else {
-                (self.rx_replay_bitmap << shift) | 1
-            };
+                for b in (old_block + 1)..=new_block {
+                    self.rx_replay_ring[(b as usize) & ring_mask] = 0;
+                }
+            }
+            self.rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
             self.rx_roc = roc;
             self.rx_highest_seq16 = seq16;
-        } else {
-            let delta = highest - ext_seq;
-            if delta < 64 {
-                self.rx_replay_bitmap |= 1u64 << delta;
-            }
+        } else if highest - ext_seq < SRTP_REPLAY_WINDOW {
+            self.rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
         }
     }
 }
@@ -1757,6 +1767,31 @@ mod tests {
                 assert_eq!(&rbuf[..rn], &p[..]);
             }
             assert!(marked_cnt <= ts_set.len(), "At most 1 M=1 per wall-clock frame!");
+
+            // v0.3.2: RFC 6479 2048-packet anti-replay window handles deep trans-Pacific ECMP reordering
+            if suite == CipherSuite::Aes128Gcm {
+                let mut pkts: Vec<Vec<u8>> = Vec::with_capacity(2060);
+                for idx in 0..2060u32 {
+                    let payload = idx.to_be_bytes();
+                    let wn = cli.wrap_into(&payload, &mut wbuf).unwrap();
+                    pkts.push(wbuf[..wn].to_vec());
+                }
+                // Receive the newest packet first (index 2059)
+                let rn = srv.unwrap_into(&pkts[2059], &mut rbuf).unwrap();
+                assert_eq!(&rbuf[..rn], &2059u32.to_be_bytes());
+                // Duplicate of newest MUST fail
+                assert!(srv.unwrap_into(&pkts[2059], &mut rbuf).is_none());
+                // 500 packets behind (previously dropped by 64-bit window!) MUST succeed
+                let rn500 = srv.unwrap_into(&pkts[1559], &mut rbuf).unwrap();
+                assert_eq!(&rbuf[..rn500], &1559u32.to_be_bytes());
+                assert!(srv.unwrap_into(&pkts[1559], &mut rbuf).is_none()); // duplicate blocked
+                // Exact window edge (2047 behind -> idx 12) MUST succeed
+                let rn_edge = srv.unwrap_into(&pkts[12], &mut rbuf).unwrap();
+                assert_eq!(&rbuf[..rn_edge], &12u32.to_be_bytes());
+                assert!(srv.unwrap_into(&pkts[12], &mut rbuf).is_none());
+                // Just outside window (2048 behind -> idx 11) MUST be rejected!
+                assert!(srv.unwrap_into(&pkts[11], &mut rbuf).is_none());
+            }
         }
     }
 }
