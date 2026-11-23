@@ -10,18 +10,24 @@ use crate::protocol::{
     build_dimpl_config, build_stun_success_response, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, parse_stun,
     rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram, CertCache, CipherPref,
-    CipherSuite, PacketKind, SrtpCloakCipher, MAX_INNER_UDP_LEN, STUN_BINDING_REQUEST,
+    CipherSuite, PacketKind, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN, STUN_BINDING_REQUEST,
 };
 use dimpl::{Config as DtlsConfig, Dtls, Output as DtlsOutput};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{ErrorKind, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static SERVER_QUIET: Cell<bool> = const { Cell::new(false) };
+}
 
 const LISTEN_TOKEN: Token = Token(0);
 const SEEN_TXID_TTL: Duration = Duration::from_secs(90);
@@ -144,6 +150,8 @@ pub struct ServerConfig {
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
     pub wire_audit_file: Option<String>,
+    pub quiet: bool,
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -210,7 +218,9 @@ fn make_udp_socket(
 }
 
 fn log(worker_id: usize, msg: &str) {
-    println!("[server-rs#{}] {}", worker_id, msg);
+    if !SERVER_QUIET.with(|q| q.get()) {
+        println!("[server-rs#{}] {}", worker_id, msg);
+    }
 }
 
 fn drain_server_dtls<F>(
@@ -348,13 +358,15 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     let cpu = detect_cpu_accel();
     let dtls_cfg = build_dimpl_config(cfg.cipher_pref, &cpu, false);
     let seen_txids = Arc::new(Mutex::new(SeenTxidCache::new()));
-    println!(
-        "[server-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(mutual-cert,cookie,pfs) silent_drop=true",
-        cpu.arch,
-        cpu.features.join(", "),
-        cpu.recommended.name(),
-        workers,
-    );
+    if !cfg.quiet {
+        println!(
+            "[server-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(mutual-cert,cookie,pfs) silent_drop=true",
+            cpu.arch,
+            cpu.features.join(", "),
+            cpu.recommended.name(),
+            workers,
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     if workers > 1 {
         eprintln!("[server-rs] WARN: SO_REUSEPORT UDP hash load-balancing is Linux-specific.");
@@ -390,6 +402,7 @@ fn run_server_worker(
     dtls_cfg: Arc<DtlsConfig>,
     seen_txids: Arc<Mutex<SeenTxidCache>>,
 ) -> std::io::Result<()> {
+    SERVER_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(256);
 
@@ -440,6 +453,11 @@ fn run_server_worker(
     };
 
     loop {
+        if let Some(ref s) = cfg.stop {
+            if s.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
         let now = Instant::now();
         let mut wait = Duration::from_millis(150);
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
@@ -544,6 +562,9 @@ fn run_server_worker(
             }
         }
 
+        if cfg.stop.is_some() && wait > Duration::from_millis(20) {
+            wait = Duration::from_millis(20);
+        }
         if let Err(e) = poll.poll(&mut events, Some(wait)) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
@@ -843,15 +864,29 @@ fn run_server_worker(
                                     match sess.state {
                                         ServerState::Ready => {
                                             if let Some(ref mut cipher) = sess.cipher {
-                                                if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
-                                                    sess.last_data_active = now;
-                                                    sess.last_peer_rx = now;
-                                                    if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
-                                                        sess.rx_pkts += 1;
-                                                        sess.rx_bytes += pn as u64;
+                                                match cipher.unwrap_into_ex(pkt, &mut wbuf) {
+                                                    Some(SrtpFrame::Data(pn)) => {
+                                                        sess.last_data_active = now;
+                                                        sess.last_peer_rx = now;
+                                                        if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
+                                                            sess.rx_pkts += 1;
+                                                            sess.rx_bytes += pn as u64;
+                                                        }
                                                     }
-                                                } else {
-                                                    sess.auth_drops += 1;
+                                                    Some(SrtpFrame::Probe(pn)) => {
+                                                        // In-band AEAD-encrypted selftest echo (0xFFFE): strictly Ready-gated,
+                                                        // 1:1 size (zero amplification), never forwarded to backend service.
+                                                        sess.last_data_active = now;
+                                                        sess.last_peer_rx = now;
+                                                        let mut pbuf = [0u8; 2048];
+                                                        if let Some(wn) = cipher.wrap_probe_into(&wbuf[..pn], &mut pbuf) {
+                                                            audit_pkt(1, &pbuf[..wn]);
+                                                            let _ = listen_sock.send_to(&pbuf[..wn], sess.peer_addr);
+                                                        }
+                                                    }
+                                                    None => {
+                                                        sess.auth_drops += 1;
+                                                    }
                                                 }
                                             }
                                         }

@@ -17,11 +17,17 @@ use dimpl::{Config as DtlsConfig, Dtls, Output as DtlsOutput};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
+use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+thread_local! {
+    static CLIENT_QUIET: Cell<bool> = const { Cell::new(false) };
+}
 
 const LISTEN_TOKEN: Token = Token(0);
 const CLOSING_DRAIN_MS: u64 = 250;
@@ -49,6 +55,8 @@ pub struct ClientConfig {
     pub keepalive_secs: u64,
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
+    pub quiet: bool,
+    pub stop: Option<Arc<AtomicBool>>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -126,7 +134,9 @@ fn make_udp_socket(
 }
 
 fn log(worker_id: usize, msg: &str) {
-    println!("[client-rs#{}] {}", worker_id, msg);
+    if !CLIENT_QUIET.with(|q| q.get()) {
+        println!("[client-rs#{}] {}", worker_id, msg);
+    }
 }
 
 fn drain_client_dtls(
@@ -273,13 +283,15 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
     let dtls_cfg = build_dimpl_config(cfg.cipher_pref, &cpu, true);
-    println!(
-        "[client-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(3-suite,mutual-cert,pfs)",
-        cpu.arch,
-        cpu.features.join(", "),
-        cpu.recommended.name(),
-        workers
-    );
+    if !cfg.quiet {
+        println!(
+            "[client-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(3-suite,mutual-cert,pfs)",
+            cpu.arch,
+            cpu.features.join(", "),
+            cpu.recommended.name(),
+            workers
+        );
+    }
     #[cfg(not(target_os = "linux"))]
     if workers > 1 {
         eprintln!("[client-rs] WARN: SO_REUSEPORT UDP hash load-balancing is Linux-specific.");
@@ -450,6 +462,7 @@ fn run_client_worker(
     reuse_port: bool,
     dtls_cfg: Arc<DtlsConfig>,
 ) -> std::io::Result<()> {
+    CLIENT_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(256);
 
@@ -482,6 +495,11 @@ fn run_client_worker(
     let mut last_stats = Instant::now();
 
     loop {
+        if let Some(ref s) = cfg.stop {
+            if s.load(Ordering::Relaxed) {
+                return Ok(());
+            }
+        }
         let now = Instant::now();
         let mut wait = Duration::from_millis(150);
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
@@ -672,6 +690,9 @@ fn run_client_worker(
             }
         }
 
+        if cfg.stop.is_some() && wait > Duration::from_millis(20) {
+            wait = Duration::from_millis(20);
+        }
         if let Err(e) = poll.poll(&mut events, Some(wait)) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
@@ -1018,6 +1039,8 @@ mod tests {
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                quiet: false,
+                stop: None,
             });
         });
 
@@ -1133,6 +1156,8 @@ mod tests {
                 keepalive_secs: 1,
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
+                quiet: false,
+                stop: None,
             });
         });
 

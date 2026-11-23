@@ -205,11 +205,15 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Dual-mode 12-scenario `webrtc-cloak selftest` suite** (`--server-host` live remote mode + `--local` offline fault-injection sandbox, `--cipher`, `--mtu`, `--count`, `--no-probe`, `--no-color`, `--json`):
+            - **Live Remote Mode**: directly audits any running `webrtc-cloak server` over the real Internet (WAN STUN + NAT mapping, 6-flight DTLS 1.2 handshake, Consent RTT/jitter/loss, `SeenTxidCache` retransmit, server Compound SRTCP downlink, in-band encrypted `0xFFFE` SRTP data-plane echo & real WAN Path MTU probing with zero backend interference, 5-tuple rotation & NAT behavior check, 7-vector live Silent-Drop audit, graceful teardown)
+            - **Local Sandbox + CPU Bench**: synthetic blackhole / restart / 35% reorder + 30% duplicate fault-injection lab, plus single-core 3-suite AEAD, all-core scaling, and P-256 ephemeral cert generation benchmarks
+          - **In-band AEAD-encrypted SRTP probe echo (`0xFFFE`)** in `server` (strictly Ready-gated, 1:1 size, zero wire fingerprint difference, never forwarded to backend)
           - Real 6-flight mutual-certificate ECDSA P-256 DTLS 1.2 (`dimpl 0.9.0`) with Hybrid PFS (`PSK + ECDHE KeyingMaterial`)
-          - Chrome `0x90` (`P=0, X=1, 0xBEDE`) SRTP with inside-AEAD random padding & wall-clock 90 kHz timestamps
+          - Chrome `0x90` (`P=0, X=1, 0xBEDE`) SRTP with inside-AEAD random padding, 2048-packet RFC 6479 replay window & wall-clock 90 kHz timestamps
           - RFC 3550 compliant Compound SRTCP (`PT=200/201`, encrypted trailing `BYE`), 64-bit sliding anti-replay window, `Closing(250ms)` drain
           - Default single-threaded `mio` reactor (`--workers 1`, 900+ Mbps on N5105), optional multi-worker `--workers <N|auto>`
-          - RFC 7675 §5.1 peer liveness auto-recovery on server restart or CGNAT rebinding
+          - Strict RFC 7675 bidirectional STUN consent freshness & silent 5-tuple rotation on asymmetric uplink blackholes or server restarts
 
           > **Disclaimer**: Strictly for network protocol learning, academic research, and authorized testing under the MIT License.
           """

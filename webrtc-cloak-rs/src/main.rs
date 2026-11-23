@@ -1,5 +1,6 @@
 mod client;
 mod protocol;
+mod selftest;
 mod server;
 
 use crate::client::{run_client, ClientConfig};
@@ -7,9 +8,10 @@ use crate::protocol::{
     combine_session_key, derive_stun_material, detect_cpu_accel, fill_random, CipherPref,
     CipherSuite, SrtpCloakCipher, DEFAULT_WAN_MTU,
 };
+use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
 use std::env;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
@@ -48,7 +50,9 @@ fn usage() -> ! {
          webrtc-cloak cpu\n  \
          webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
-         webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]"
+         webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
+         webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
+         webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--mtu 1488] [--no-color] [--json]"
     );
     process::exit(2);
 }
@@ -426,6 +430,94 @@ fn main() {
         "cpu" => {
             print_cpu_info();
         }
+        "selftest" => {
+            let mut opts = SelftestOptions::default();
+            let mut server_host = String::new();
+            let mut server_port: u16 = 19643;
+            let mut psk = String::new();
+            let mut psk_file: Option<String> = None;
+            let mut force_local = false;
+
+            let mut i = 2;
+            while i < args.len() {
+                match args[i].as_str() {
+                    "--server-host" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        server_host = args[i].clone();
+                    }
+                    "--server-port" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        server_port = args[i].parse().unwrap_or(19643);
+                    }
+                    "--psk" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        psk = args[i].clone();
+                    }
+                    "--psk-file" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        psk_file = Some(args[i].clone());
+                    }
+                    "--count" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        opts.probe_count = args[i].parse::<usize>().unwrap_or(20).clamp(5, 200);
+                    }
+                    "--no-probe" => {
+                        opts.active_probes = false;
+                    }
+                    "--local" => {
+                        force_local = true;
+                    }
+                    "--cipher" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        opts.cipher_pref = parse_cipher_pref(&args[i]);
+                    }
+                    "--mtu" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        opts.wan_mtu = args[i].parse::<usize>().unwrap_or(DEFAULT_WAN_MTU);
+                    }
+                    "--no-color" => {
+                        opts.color = false;
+                    }
+                    "--json" => {
+                        opts.json = true;
+                    }
+                    other => {
+                        eprintln!("Unknown selftest flag: {}", other);
+                        usage();
+                    }
+                }
+                i += 1;
+            }
+            if !force_local && !server_host.is_empty() {
+                let target_str = format!("{}:{}", server_host, server_port);
+                let resolved = match target_str.to_socket_addrs() {
+                    Ok(mut it) => match it.find(|a| a.is_ipv4()) {
+                        Some(a) => a,
+                        None => {
+                            eprintln!("Failed to resolve IPv4 address for {}", target_str);
+                            process::exit(2);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!("Failed to resolve {}: {}", target_str, e);
+                        process::exit(2);
+                    }
+                };
+                opts.server_addr = Some(resolved);
+                opts.server_label = Some(target_str);
+                opts.psk = Some(resolve_psk(psk, psk_file));
+            }
+            if !run_selftest(opts) {
+                process::exit(1);
+            }
+        }
         "sink" => {
             let listen = args.get(2).map(|s| s.as_str()).unwrap_or("127.0.0.1:19760");
             let workers = args.get(3).map(|s| parse_workers(s)).unwrap_or(1);
@@ -517,6 +609,8 @@ fn main() {
                 keepalive_secs,
                 idle_timeout_secs,
                 stats_interval_secs,
+                quiet: false,
+                stop: None,
             }) {
                 eprintln!("client error: {}", e);
                 process::exit(1);
@@ -577,6 +671,8 @@ fn main() {
                 idle_timeout_secs,
                 stats_interval_secs,
                 wire_audit_file,
+                quiet: false,
+                stop: None,
             }) {
                 eprintln!("server error: {}", e);
                 process::exit(1);

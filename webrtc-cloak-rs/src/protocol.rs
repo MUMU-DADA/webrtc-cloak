@@ -55,7 +55,14 @@ pub const RTP_EXT_LEN: usize = 8; // 4B 0xBEDE header + 4B one-byte transport-wi
 pub const RTP_FULL_HDR_LEN: usize = RTP_FIXED_HDR_LEN + RTP_EXT_LEN; // 20B
 pub const SRTP_TAG_LEN: usize = 16; // Unified 16B tag across AES-GCM, ChaCha20, and BLAKE2b-128
 pub const MAX_INNER_UDP_LEN: usize = 65_400; // Hard bound preventing wbuf[65664] overflow
+pub const SRTP_PROBE_MAGIC_LEN: u16 = 0xFFFE; // Reserved > MAX_INNER_UDP_LEN for in-band encrypted selftest echo
 pub const RTP_VIDEO_PT: u8 = 96;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SrtpFrame {
+    Data(usize),
+    Probe(usize),
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CipherSuite {
@@ -1344,7 +1351,23 @@ impl SrtpCloakCipher {
     ///   [16B AEAD / MAC Tag]
     #[inline]
     pub fn wrap_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
-        let fixed_overhead = RTP_FULL_HDR_LEN + 2 + SRTP_TAG_LEN; // 20B RTP+BEDE + 2B inner_len + 16B Tag = 38B
+        self.wrap_inner(false, plaintext, out)
+    }
+
+    /// Wrap an in-band AEAD-encrypted diagnostic probe (`0xFFFE || probe_len || payload || random pad`).
+    /// Identical Chrome `0x90` SRTP format on the wire; strictly disjoint from real UDP (`<= 65400`).
+    #[inline]
+    pub fn wrap_probe_into(&mut self, payload: &[u8], out: &mut [u8]) -> Option<usize> {
+        if payload.len() > 1460 {
+            return None;
+        }
+        self.wrap_inner(true, payload, out)
+    }
+
+    #[inline]
+    fn wrap_inner(&mut self, is_probe: bool, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
+        let prefix_len = if is_probe { 4 } else { 2 };
+        let fixed_overhead = RTP_FULL_HDR_LEN + prefix_len + SRTP_TAG_LEN;
         let base_total = fixed_overhead.saturating_add(plaintext.len());
         if plaintext.len() > MAX_INNER_UDP_LEN
             || base_total > out.len()
@@ -1358,7 +1381,8 @@ impl SrtpCloakCipher {
         } else {
             31
         };
-        let max_pad = if plaintext.len() >= 1340 {
+        let eff_len = plaintext.len() + if is_probe { 2 } else { 0 };
+        let max_pad = if eff_len >= 1340 {
             headroom.min(7)
         } else {
             headroom.min(31)
@@ -1369,7 +1393,7 @@ impl SrtpCloakCipher {
         } else {
             (rnd as usize) % (max_pad + 1)
         };
-        let ct_len = 2 + plaintext.len() + pad_len;
+        let ct_len = prefix_len + plaintext.len() + pad_len;
         let total = RTP_FULL_HDR_LEN + ct_len + SRTP_TAG_LEN;
         if total > out.len() || total > 65_507 {
             return None;
@@ -1418,14 +1442,23 @@ impl SrtpCloakCipher {
         out[17..19].copy_from_slice(&twcc.to_be_bytes());
         out[19] = 0x00;
 
-        // Inner encrypted payload: [inner_len: u16 BE] || [plaintext] || [random pad]
+        // Inner encrypted payload:
+        //   Data : [inner_len: u16 BE] || [plaintext] || [random pad]
+        //   Probe: [0xFFFE: u16 BE] || [probe_len: u16 BE] || [payload] || [random pad]
         let ct_end = RTP_FULL_HDR_LEN + ct_len;
-        out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
-            .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
-        out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 2 + plaintext.len()]
+        if is_probe {
+            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
+                .copy_from_slice(&SRTP_PROBE_MAGIC_LEN.to_be_bytes());
+            out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 4]
+                .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+        } else {
+            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
+                .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+        }
+        out[RTP_FULL_HDR_LEN + prefix_len..RTP_FULL_HDR_LEN + prefix_len + plaintext.len()]
             .copy_from_slice(plaintext);
         if pad_len > 0 {
-            let p_start = RTP_FULL_HDR_LEN + 2 + plaintext.len();
+            let p_start = RTP_FULL_HDR_LEN + prefix_len + plaintext.len();
             let mut st = rnd ^ 0xA076_1D64_78BD_642F;
             for b in &mut out[p_start..ct_end] {
                 st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
@@ -1476,9 +1509,18 @@ impl SrtpCloakCipher {
         Some(total)
     }
 
-    /// Zero-allocation unwrap into caller-provided `out` buffer; returns `Some(inner_len)`.
+    /// Zero-allocation unwrap into caller-provided `out` buffer; returns `Some(inner_len)` for normal UDP data.
     #[inline]
     pub fn unwrap_into(&mut self, packet: &[u8], out: &mut [u8]) -> Option<usize> {
+        match self.unwrap_into_ex(packet, out) {
+            Some(SrtpFrame::Data(n)) => Some(n),
+            _ => None,
+        }
+    }
+
+    /// Zero-allocation unwrap distinguishing normal UDP `Data(len)` from in-band encrypted `Probe(len)`.
+    #[inline]
+    pub fn unwrap_into_ex(&mut self, packet: &[u8], out: &mut [u8]) -> Option<SrtpFrame> {
         if packet.len() < RTP_FIXED_HDR_LEN + 2 + SRTP_TAG_LEN {
             return None;
         }
@@ -1631,12 +1673,24 @@ impl SrtpCloakCipher {
         if !decrypted {
             return None;
         }
-        let inner_len = u16::from_be_bytes([out[0], out[1]]) as usize;
-        if 2 + inner_len > ct_len {
+        let raw_len = u16::from_be_bytes([out[0], out[1]]);
+        if raw_len == SRTP_PROBE_MAGIC_LEN {
+            if ct_len < 4 {
+                return None;
+            }
+            let probe_len = u16::from_be_bytes([out[2], out[3]]) as usize;
+            if probe_len > 1460 || 4 + probe_len > ct_len {
+                return None;
+            }
+            out.copy_within(4..4 + probe_len, 0);
+            return Some(SrtpFrame::Probe(probe_len));
+        }
+        let inner_len = raw_len as usize;
+        if inner_len > MAX_INNER_UDP_LEN || 2 + inner_len > ct_len {
             return None;
         }
         out.copy_within(2..2 + inner_len, 0);
-        Some(inner_len)
+        Some(SrtpFrame::Data(inner_len))
     }
 
     #[inline]
@@ -1832,6 +1886,47 @@ mod tests {
                 // Just outside window (2048 behind -> idx 11) MUST be rejected!
                 assert!(srv.unwrap_into(&pkts[11], &mut rbuf).is_none());
             }
+        }
+    }
+
+    #[test]
+    fn srtp_inband_probe_roundtrip_and_zero_collision() {
+        let psk = b"probe-echo-unit-test-psk";
+        let txid = make_fresh_stun_txid(psk);
+        let (stun_key, s_c2s, s_s2c) = derive_stun_material(psk, &txid, "prb1:prb2");
+        let skey = combine_session_key(&stun_key, None);
+        for suite in [
+            CipherSuite::Aes128Gcm,
+            CipherSuite::ChaCha20Poly1305,
+            CipherSuite::Blake2b,
+        ] {
+            let mut cli = SrtpCloakCipher::new(&skey, s_c2s, s_s2c, true, suite);
+            let mut srv = SrtpCloakCipher::new(&skey, s_s2c, s_c2s, false, suite);
+            cli.set_wan_mtu(DEFAULT_WAN_MTU);
+            srv.set_wan_mtu(DEFAULT_WAN_MTU);
+
+            let mut wbuf = [0u8; 2048];
+            let mut rbuf = [0u8; 2048];
+
+            // Probe packet round-trip must be recognized as Probe, NOT Data
+            let probe = b"PING_INBAND_PROBE_123456";
+            let wn = cli.wrap_probe_into(probe, &mut wbuf).unwrap();
+            assert_eq!(wbuf[0], 0x90);
+            assert!(wn <= DEFAULT_WAN_MTU - 28);
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn], &mut rbuf), Some(SrtpFrame::Probe(probe.len())));
+            assert_eq!(&rbuf[..probe.len()], probe);
+
+            // Normal data packet must NEVER be mistaken for Probe, even if payload starts with 0xFF 0xFE
+            let tricky_data = [0xFFu8, 0xFE, 0x00, 0x04, 0xDE, 0xAD, 0xBE, 0xEF];
+            let wn2 = cli.wrap_into(&tricky_data, &mut wbuf).unwrap();
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn2], &mut rbuf), Some(SrtpFrame::Data(tricky_data.len())));
+            assert_eq!(&rbuf[..tricky_data.len()], &tricky_data);
+
+            // Exact MTU edge: 1420B probe payload + 40B fixed = 1460B UDP (= 1488B IPv4) passes; 1421B drops
+            let max_probe = vec![0x5Au8; 1420];
+            assert!(cli.wrap_probe_into(&max_probe, &mut wbuf).is_some());
+            let over_probe = vec![0x5Au8; 1421];
+            assert!(cli.wrap_probe_into(&over_probe, &mut wbuf).is_none());
         }
     }
 }

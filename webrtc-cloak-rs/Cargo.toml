@@ -1,6 +1,6 @@
 [package]
 name = "webrtc-cloak"
-version = "0.3.4"
+version = "0.3.5"
 edition = "2021"
 license = "MIT"
 description = "Pure-Rust RFC 7983 WebRTC (ICE STUN + DTLS 1.2 + SRTP/SRTCP) UDP encapsulation research prototype"
