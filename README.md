@@ -7,7 +7,12 @@
 
 一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用与 UDP 封装实验原型。本项目基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550），实现了一套完整的 `ICE STUN + 真双向证书 DTLS 1.2 + SRTP/SRTCP` 透明 UDP 传输层实验框架，用于研究现代网络协议识别（DPI）、UDP 状态化防火墙行为、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
 
-> **交互式协议原理演示**：可直接在线访问 **[GitHub Pages 交互演示页](https://mumu-dada.github.io/webrtc-cloak/)**，或克隆后离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)，即可交互查看全生命周期协议推演、字节级报文解剖、AEAD 内层填充分布模拟与 Hybrid PFS 密钥派生流程。
+> [!TIP]
+> **在线交互式原理演示（无需下载）**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**
+>
+> 支持在线交互体验 4 种对抗与自愈场景动态推演、字节级报文解剖（`ICE STUN / DTLS 1.2 / SRTP 0x90 / Compound SRTCP`）、AEAD 内层随机填充打散直方图模拟以及 Hybrid PFS 密钥派生流程（也可离线双击本地 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）。
+>
+> **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（含 Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
 ---
 
@@ -26,11 +31,14 @@
 
 ```text
 .
+├── .github/workflows/
+│   ├── release.yml                        # Tag 触发 16 架构全自动交叉编译与 Release 发布
+│   └── pages.yml                          # 自动部署交互原理演示页至 GitHub Pages
 ├── LICENSE                                # MIT 开源许可证
 ├── README.md                              # 项目说明、协议架构与构建文档
 ├── .gitignore                             # 忽略构建产物、密钥文件与抓包日志
-├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线单文件）
-├── dist/                                  # 预编译 Release 产物（已剥离本机路径）
+├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线/Pages 双用）
+├── dist/                                  # 本地常用预编译产物（已剥离本机路径）
 │   ├── webrtc-cloak-linux-x86_64          # Linux x86_64 静态 musl 二进制 (2.1 MB)
 │   └── webrtc-cloak-macos-arm64           # macOS Apple Silicon 二进制 (1.5 MB)
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
@@ -96,6 +104,8 @@ flowchart LR
 ---
 
 ## 快速上手（实验部署示例）
+
+> 可直接从 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)** 下载对应平台/架构的预编译压缩包（解压即用），或直接使用仓库 `dist/` 中的二进制。
 
 ### 1. 生成共享密钥文件（推荐 `--psk-file` 或环境变量 `WEBRTC_CLOAK_PSK`）
 
