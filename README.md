@@ -2,10 +2,12 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-Pure%20Rust%20%7C%20Zero%20C%20Deps-orange.svg)](#从源码构建与测试)
+[![Interactive Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-0ea5e9.svg)](https://mumu-dada.github.io/webrtc-cloak/)
+[![Release](https://img.shields.io/github/v/release/MUMU-DADA/webrtc-cloak?color=10b981)](https://github.com/MUMU-DADA/webrtc-cloak/releases)
 
 一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用与 UDP 封装实验原型。本项目基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550），实现了一套完整的 `ICE STUN + 真双向证书 DTLS 1.2 + SRTP/SRTCP` 透明 UDP 传输层实验框架，用于研究现代网络协议识别（DPI）、UDP 状态化防火墙行为、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
 
-> **交互式协议原理演示**：克隆仓库后，直接用浏览器打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)（单文件零外部依赖，离线可用），即可交互查看全生命周期协议推演、字节级报文解剖、AEAD 内层填充分布模拟与 Hybrid PFS 密钥派生流程。
+> **交互式协议原理演示**：可直接在线访问 **[GitHub Pages 交互演示页](https://mumu-dada.github.io/webrtc-cloak/)**，或克隆后离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)，即可交互查看全生命周期协议推演、字节级报文解剖、AEAD 内层填充分布模拟与 Hybrid PFS 密钥派生流程。
 
 ---
 
