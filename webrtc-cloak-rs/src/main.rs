@@ -5,7 +5,7 @@ mod server;
 use crate::client::{run_client, ClientConfig};
 use crate::protocol::{
     combine_session_key, derive_stun_material, detect_cpu_accel, fill_random, CipherPref,
-    CipherSuite, SrtpCloakCipher,
+    CipherSuite, SrtpCloakCipher, DEFAULT_WAN_MTU,
 };
 use crate::server::{run_server, ServerConfig};
 use std::env;
@@ -46,8 +46,8 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
-         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]"
     );
     process::exit(2);
@@ -467,6 +467,7 @@ fn main() {
             let mut dtls_decoy = true;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
+            let mut wan_mtu: usize = DEFAULT_WAN_MTU;
             let mut retry_ms: u64 = 300;
             let mut max_retries: u32 = 8;
             let mut keepalive_secs: u64 = 5; // RFC 7675 §5.1 Consent Freshness (5s ± 20%)
@@ -485,6 +486,7 @@ fn main() {
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
+                    "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
                     "--no-dtls-decoy" => { dtls_decoy = false; }
                     "--retry-ms" => { i += 1; retry_ms = args[i].parse().unwrap(); }
                     "--max-retries" => { i += 1; max_retries = args[i].parse().unwrap(); }
@@ -509,6 +511,7 @@ fn main() {
                 dtls_decoy,
                 workers,
                 max_sessions,
+                wan_mtu,
                 retry_ms,
                 max_retries,
                 keepalive_secs,
@@ -530,6 +533,7 @@ fn main() {
             let mut dtls_required = true;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
+            let mut wan_mtu: usize = DEFAULT_WAN_MTU;
             let mut idle_timeout_secs: u64 = 120;
             let mut stats_interval_secs: u64 = 10;
             let mut wire_audit_file: Option<String> = None;
@@ -546,6 +550,7 @@ fn main() {
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
+                    "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
                     "--no-dtls-decoy" => { dtls_required = false; }
                     "--idle-timeout" => { i += 1; idle_timeout_secs = args[i].parse().unwrap(); }
                     "--stats-interval" => { i += 1; stats_interval_secs = args[i].parse().unwrap(); }
@@ -568,6 +573,7 @@ fn main() {
                 dtls_required,
                 workers,
                 max_sessions,
+                wan_mtu,
                 idle_timeout_secs,
                 stats_interval_secs,
                 wire_audit_file,

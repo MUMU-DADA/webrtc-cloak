@@ -899,9 +899,14 @@ pub fn combine_session_key(stun_key: &[u8; 32], dtls_km: Option<&[u8]>) -> [u8; 
 
 const SRTP_REPLAY_RING_WORDS: usize = 64; // 4096-bit ring buffer -> exact O(1) 2048-packet RFC 6479 window
 const SRTP_REPLAY_WINDOW: u64 = 2048;     // WireGuard-grade trans-Pacific ECMP reorder tolerance
+/// Default outer IPv4 WAN MTU ceiling (1488B < 1492B PPPoE -> max outer UDP payload 1460B).
+/// Eliminates IPv4 UDP fragmentation on PPPoE/CGNAT links and forces inner QUIC DPLPMTUD
+/// (e.g. Hysteria 2 over 127.0.0.1) to converge cleanly without fragmented packets.
+pub const DEFAULT_WAN_MTU: usize = 1488;
 
 pub struct SrtpCloakCipher {
     suite: CipherSuite,
+    max_wire_udp: usize,
     enc_key: [u8; 32],
     mac_key: [u8; 32],
     aes_gcm: Aes128Gcm,
@@ -963,6 +968,7 @@ impl SrtpCloakCipher {
 
         Self {
             suite,
+            max_wire_udp: DEFAULT_WAN_MTU - 28,
             enc_key,
             mac_key,
             aes_gcm,
@@ -989,6 +995,15 @@ impl SrtpCloakCipher {
             rx_srtcp_highest: 0,
             rx_srtcp_bitmap: 0,
         }
+    }
+
+    /// Configure outer IPv4 WAN MTU ceiling (`0` disables cap for jumbo/loopback testing).
+    pub fn set_wan_mtu(&mut self, wan_mtu: usize) {
+        self.max_wire_udp = if wan_mtu == 0 {
+            0
+        } else {
+            wan_mtu.saturating_sub(28).max(576)
+        };
     }
 
     #[inline]
@@ -1329,14 +1344,30 @@ impl SrtpCloakCipher {
     ///   [16B AEAD / MAC Tag]
     #[inline]
     pub fn wrap_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
-        if plaintext.len() > MAX_INNER_UDP_LEN {
-            return None;
+        let fixed_overhead = RTP_FULL_HDR_LEN + 2 + SRTP_TAG_LEN; // 20B RTP+BEDE + 2B inner_len + 16B Tag = 38B
+        let base_total = fixed_overhead.saturating_add(plaintext.len());
+        if plaintext.len() > MAX_INNER_UDP_LEN
+            || base_total > out.len()
+            || base_total > 65_507
+            || (self.max_wire_udp > 0 && base_total > self.max_wire_udp)
+        {
+            return None; // Prevents IPv4 fragmentation & guides inner QUIC DPLPMTUD cleanly
         }
-        let rnd = self.next_rng();
-        let pad_len: usize = if plaintext.len() >= 1340 {
-            (rnd as usize) & 7 // 0..=7B near MTU (stays safely under 1472B Ethernet MTU)
+        let headroom = if self.max_wire_udp > 0 {
+            self.max_wire_udp - base_total
         } else {
-            (rnd as usize) & 31 // 0..=31B breaks WG 148B/92B/16*k & QUIC size fingerprints
+            31
+        };
+        let max_pad = if plaintext.len() >= 1340 {
+            headroom.min(7)
+        } else {
+            headroom.min(31)
+        };
+        let rnd = self.next_rng();
+        let pad_len: usize = if max_pad == 0 {
+            0
+        } else {
+            (rnd as usize) % (max_pad + 1)
         };
         let ct_len = 2 + plaintext.len() + pad_len;
         let total = RTP_FULL_HDR_LEN + ct_len + SRTP_TAG_LEN;
@@ -1753,6 +1784,15 @@ mod tests {
             let mut rbuf = vec![0u8; 65536 + 128];
             let huge = vec![0x42u8; 65_500];
             assert!(cli.wrap_into(&huge, &mut wbuf).is_none());
+
+            // v0.3.3: Default 1488B WAN MTU caps wire UDP <= 1460B (1422B plain fits; 1452B QUIC probe dropped)
+            let wg_1420 = vec![0x55u8; 1420];
+            let wn_wg = cli.wrap_into(&wg_1420, &mut wbuf).unwrap();
+            assert!(wn_wg <= DEFAULT_WAN_MTU - 28, "wire UDP {} exceeded PPPoE-safe ceiling!", wn_wg);
+            let rn_wg = srv.unwrap_into(&wbuf[..wn_wg], &mut rbuf).unwrap();
+            assert_eq!(rn_wg, 1420);
+            let quic_probe_1452 = vec![0x66u8; 1452];
+            assert!(cli.wrap_into(&quic_probe_1452, &mut wbuf).is_none(), "1452B probe MUST be dropped before IPv4 frag!");
 
             // V3-M-02: Burst of 20 small packets in <1ms -> same wall-clock TS, ONLY 1 packet has M=1!
             let mut marked_cnt = 0;

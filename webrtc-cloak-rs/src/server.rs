@@ -137,6 +137,7 @@ pub struct ServerConfig {
     pub dtls_required: bool,
     pub workers: usize,
     pub max_sessions: usize,
+    pub wan_mtu: usize,
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
     pub wire_audit_file: Option<String>,
@@ -260,13 +261,15 @@ where
         let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
         let final_key = combine_session_key(&sess.stun_key, sess.dtls_km.as_deref());
         sess.negotiated_cipher = Some(chosen);
-        sess.cipher = Some(SrtpCloakCipher::new(
+        let mut c = SrtpCloakCipher::new(
             &final_key,
             sess.ssrc_s2c,
             sess.ssrc_c2s,
             false,
             chosen,
-        ));
+        );
+        c.set_wan_mtu(cfg.wan_mtu);
+        sess.cipher = Some(c);
         sess.state = ServerState::Ready;
         sess.ready_at = Some(now);
         sess.last_data_active = now;
@@ -677,7 +680,8 @@ fn run_server_worker(
                             } else {
                                 let chosen = resolve_srtp_suite(cfg.cipher_pref, None, &cpu, true);
                                 let final_key = combine_session_key(&stun_key, None);
-                                let c = SrtpCloakCipher::new(&final_key, s_s2c, s_c2s, false, chosen);
+                                let mut c = SrtpCloakCipher::new(&final_key, s_s2c, s_c2s, false, chosen);
+                                c.set_wan_mtu(cfg.wan_mtu);
                                 (ServerState::Ready, None, Some(c), Some(chosen), Some(now))
                             };
 

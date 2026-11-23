@@ -35,6 +35,7 @@ pub struct ClientConfig {
     pub dtls_decoy: bool,
     pub workers: usize,
     pub max_sessions: usize,
+    pub wan_mtu: usize,
     pub retry_ms: u64,
     pub max_retries: u32,
     pub keepalive_secs: u64,
@@ -184,13 +185,15 @@ fn drain_client_dtls(
             let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
             let final_key = combine_session_key(&stun_key, sess.dtls_km.as_deref());
             sess.active_cipher = Some(chosen);
-            sess.cipher = Some(SrtpCloakCipher::new(
+            let mut c = SrtpCloakCipher::new(
                 &final_key,
                 sess.ssrc_c2s,
                 sess.ssrc_s2c,
                 true,
                 chosen,
-            ));
+            );
+            c.set_wan_mtu(cfg.wan_mtu);
+            sess.cipher = Some(c);
             sess.state = HandshakeState::Ready;
             sess.ready_at = Some(now);
             sess.last_data_active = now;
@@ -656,9 +659,11 @@ fn run_client_worker(
                                             let chosen = resolve_srtp_suite(cfg.cipher_pref, None, &cpu, true);
                                             let final_key = combine_session_key(&stun_key, None);
                                             sess.active_cipher = Some(chosen);
-                                            sess.cipher = Some(SrtpCloakCipher::new(
+                                            let mut c = SrtpCloakCipher::new(
                                                 &final_key, s_c2s, s_s2c, true, chosen,
-                                            ));
+                                            );
+                                            c.set_wan_mtu(cfg.wan_mtu);
+                                            sess.cipher = Some(c);
                                             sess.state = HandshakeState::Ready;
                                             sess.ready_at = Some(now);
                                             sess.last_data_active = now;

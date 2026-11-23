@@ -155,6 +155,7 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./dist/webrtc-cloak-macos-arm64 client \
 | `--keepalive <SECS>` | `5` | RFC 7675 STUN 保活间隔（自动加 `±20%` 抖动，失活阈值 `5 × keepalive`） |
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE` + DTLS `close_notify` 优雅退出 |
 | `--max-sessions <N>` | `4096` | 单 worker 最大并发 UDP 会话数 |
+| `--mtu <BYTES>` | `1488` | 外层 IPv4 WAN MTU 上限（默认 `1488 < 1492` PPPoE，自动引导内层 QUIC/Hysteria 2 收敛至零分片；`0` 表示不限制） |
 
 ### 5. 内置基准与环回诊断
 
