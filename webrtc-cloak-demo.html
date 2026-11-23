@@ -1,0 +1,1469 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>WebRTC-Cloak V3.1 协议原理与抗 DPI 对抗可视化演示</title>
+<style>
+  :root {
+    --bg: #070b14;
+    --bg-card: #0f172a;
+    --bg-elev: #16213a;
+    --bg-deep: #091020;
+    --border: #233354;
+    --border-hi: #38bdf8;
+    --text: #e6eefb;
+    --muted: #8ea3c6;
+    --blue: #3b82f6;
+    --cyan: #22d3ee;
+    --green: #10b981;
+    --amber: #f59e0b;
+    --red: #ef4444;
+    --purple: #a855f7;
+    --pink: #ec4899;
+    --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  }
+
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    background:
+      radial-gradient(1100px 550px at 12% -8%, rgba(59,130,246,0.16), transparent 60%),
+      radial-gradient(900px 500px at 88% 4%, rgba(16,185,129,0.11), transparent 55%),
+      radial-gradient(800px 600px at 50% 100%, rgba(168,85,247,0.08), transparent 60%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    line-height: 1.6;
+    padding: 28px 18px 72px;
+  }
+
+  .container { max-width: 1220px; margin: 0 auto; }
+
+  /* Header */
+  header {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: flex-end;
+    gap: 16px;
+    padding-bottom: 22px;
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 24px;
+  }
+
+  .title-wrap h1 {
+    font-size: 28px;
+    font-weight: 800;
+    letter-spacing: -0.02em;
+    background: linear-gradient(95deg, #f8fafc 0%, #7dd3fc 52%, #34d399 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+
+  .title-wrap p {
+    color: var(--muted);
+    font-size: 14px;
+    margin-top: 6px;
+    max-width: 720px;
+  }
+
+  .badge-row { display: flex; flex-wrap: wrap; gap: 8px; }
+  .badge {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    padding: 4px 10px;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: rgba(22, 33, 58, 0.85);
+    color: var(--cyan);
+  }
+  .badge.green { color: #34d399; border-color: rgba(16,185,129,0.45); }
+  .badge.purple { color: #d8b4fe; border-color: rgba(168,85,247,0.45); }
+  .badge.amber { color: #fcd34d; border-color: rgba(245,158,11,0.45); }
+
+  /* Quick Nav */
+  .nav-pills {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    margin-bottom: 22px;
+  }
+  .nav-pill {
+    text-decoration: none;
+    color: var(--muted);
+    font-size: 13px;
+    font-weight: 600;
+    padding: 6px 13px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: rgba(15, 23, 42, 0.75);
+    transition: all 0.18s;
+  }
+  .nav-pill:hover { color: var(--text); border-color: var(--cyan); background: rgba(34,211,238,0.08); }
+
+  /* Card */
+  .card {
+    background: rgba(15, 23, 42, 0.88);
+    border: 1px solid var(--border);
+    border-radius: 16px;
+    padding: 22px;
+    margin-bottom: 24px;
+    box-shadow: 0 14px 40px rgba(0, 0, 0, 0.38);
+  }
+
+  .card-head {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+    margin-bottom: 16px;
+  }
+
+  .card-title {
+    font-size: 17px;
+    font-weight: 700;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+  .card-title .dot {
+    width: 10px; height: 10px; border-radius: 50%;
+    background: var(--cyan);
+    box-shadow: 0 0 12px var(--cyan);
+  }
+  .card-title .dot.green { background: var(--green); box-shadow: 0 0 12px var(--green); }
+  .card-title .dot.purple { background: var(--purple); box-shadow: 0 0 12px var(--purple); }
+  .card-title .dot.amber { background: var(--amber); box-shadow: 0 0 12px var(--amber); }
+
+  /* Controls */
+  .controls { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+
+  .mode-tabs {
+    display: inline-flex;
+    flex-wrap: wrap;
+    background: var(--bg-deep);
+    border: 1px solid var(--border);
+    border-radius: 10px;
+    padding: 4px;
+    gap: 4px;
+  }
+
+  .tab-btn {
+    border: none;
+    background: transparent;
+    color: var(--muted);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 7px 12px;
+    border-radius: 7px;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: var(--sans);
+  }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.active-red { background: rgba(239,68,68,0.2); color: #fca5a5; box-shadow: inset 0 0 0 1px rgba(239,68,68,0.5); }
+  .tab-btn.active-green { background: rgba(16,185,129,0.2); color: #6ee7b7; box-shadow: inset 0 0 0 1px rgba(16,185,129,0.5); }
+  .tab-btn.active-purple { background: rgba(168,85,247,0.2); color: #e9d5ff; box-shadow: inset 0 0 0 1px rgba(168,85,247,0.5); }
+  .tab-btn.active-amber { background: rgba(245,158,11,0.2); color: #fde68a; box-shadow: inset 0 0 0 1px rgba(245,158,11,0.5); }
+  .tab-btn.active-cyan { background: rgba(34,211,238,0.18); color: #a5f3fc; box-shadow: inset 0 0 0 1px rgba(34,211,238,0.5); }
+
+  .action-btn {
+    border: 1px solid var(--border);
+    background: var(--bg-elev);
+    color: var(--text);
+    font-size: 12.5px;
+    font-weight: 600;
+    padding: 7px 13px;
+    border-radius: 8px;
+    cursor: pointer;
+    transition: all 0.18s;
+    font-family: var(--sans);
+  }
+  .action-btn:hover { border-color: var(--cyan); background: #1e2d4d; }
+  .action-btn.primary { background: linear-gradient(135deg, #2563eb, #0891b2); border-color: transparent; }
+  .action-btn.primary:hover { filter: brightness(1.12); }
+
+  /* Simulator Stage */
+  .sim-stage {
+    background:
+      linear-gradient(rgba(35, 51, 84, 0.22) 1px, transparent 1px),
+      linear-gradient(90deg, rgba(35, 51, 84, 0.22) 1px, transparent 1px),
+      var(--bg-deep);
+    background-size: 26px 26px;
+    border: 1px solid var(--border);
+    border-radius: 14px;
+    padding: 14px;
+    overflow-x: auto;
+  }
+
+  svg#flowSvg { width: 100%; min-width: 980px; height: 320px; display: block; }
+
+  .sim-bottom {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 16px;
+    margin-top: 16px;
+  }
+  @media (max-width: 900px) { .sim-bottom { grid-template-columns: 1fr; } }
+
+  .step-list {
+    display: flex;
+    flex-direction: column;
+    gap: 7px;
+    max-height: 330px;
+    overflow-y: auto;
+    padding-right: 4px;
+  }
+  .step-item {
+    display: flex;
+    gap: 11px;
+    align-items: flex-start;
+    padding: 9px 12px;
+    border-radius: 10px;
+    background: #0b1324;
+    border: 1px solid #1b2844;
+    cursor: pointer;
+    transition: all 0.2s;
+  }
+  .step-item:hover { border-color: #355084; }
+  .step-item.active { background: rgba(34,211,238,0.09); border-color: rgba(34,211,238,0.58); }
+  .step-num {
+    flex-shrink: 0;
+    width: 24px; height: 24px;
+    border-radius: 7px;
+    display: grid; place-items: center;
+    font-family: var(--mono); font-size: 12px; font-weight: 700;
+    background: #16233d; color: var(--cyan);
+  }
+  .step-item.active .step-num { background: var(--cyan); color: #051120; }
+  .step-title { font-size: 13px; font-weight: 700; color: var(--text); }
+  .step-desc { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  .inspector-panel {
+    background: #0a1120;
+    border: 1px solid #1d2b49;
+    border-radius: 12px;
+    padding: 15px;
+    display: flex;
+    flex-direction: column;
+    gap: 10px;
+  }
+  .inspector-panel h3 {
+    font-size: 13px; font-weight: 700; color: var(--cyan);
+    display: flex; justify-content: space-between; align-items: center;
+  }
+  .tag-pill {
+    font-family: var(--mono); font-size: 11px;
+    padding: 2px 8px; border-radius: 6px;
+    background: rgba(59,130,246,0.16); color: #93c5fd;
+    border: 1px solid rgba(59,130,246,0.35);
+  }
+  .tag-pill.drop { background: rgba(239,68,68,0.16); color: #fca5a5; border-color: rgba(239,68,68,0.4); }
+  .tag-pill.pass { background: rgba(16,185,129,0.16); color: #6ee7b7; border-color: rgba(16,185,129,0.4); }
+  .tag-pill.warn { background: rgba(245,158,11,0.16); color: #fde68a; border-color: rgba(245,158,11,0.4); }
+
+  .kv-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px;
+  }
+  .kv-box {
+    background: #0f1a30;
+    border: 1px solid #1e2e4f;
+    border-radius: 8px;
+    padding: 8px 10px;
+  }
+  .kv-box .k { font-size: 11px; color: var(--muted); }
+  .kv-box .v { font-family: var(--mono); font-size: 12px; font-weight: 700; color: var(--text); margin-top: 2px; }
+
+  .wire-hex {
+    font-family: var(--mono);
+    font-size: 11.5px;
+    line-height: 1.55;
+    background: #060b16;
+    border: 1px solid #1b2844;
+    border-radius: 8px;
+    padding: 10px 12px;
+    color: #93c5fd;
+    white-space: pre-wrap;
+    word-break: break-all;
+  }
+
+  .narrative-box {
+    font-size: 12.5px;
+    color: #cbd5e1;
+    background: rgba(34,211,238,0.05);
+    border-left: 3px solid var(--cyan);
+    padding: 9px 12px;
+    border-radius: 0 8px 8px 0;
+  }
+
+  /* Section 2: Byte-Level Packet Inspector */
+  .packet-layout {
+    display: grid;
+    grid-template-columns: 1.35fr 1fr;
+    gap: 18px;
+    align-items: start;
+  }
+  @media (max-width: 900px) { .packet-layout { grid-template-columns: 1fr; } }
+
+  .byte-grid {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    background: var(--bg-deep);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+
+  .field-block {
+    border-radius: 9px;
+    padding: 10px 12px;
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: transform 0.15s, box-shadow 0.15s, border-color 0.15s;
+    min-width: 112px;
+    flex: 1 1 130px;
+  }
+  .field-block:hover { transform: translateY(-2px); }
+  .field-block.selected {
+    border-color: #ffffff !important;
+    box-shadow: 0 0 0 2px rgba(56,189,248,0.45), 0 8px 20px rgba(0,0,0,0.4);
+  }
+  .field-block .fb-top {
+    display: flex; justify-content: space-between; gap: 6px;
+    font-family: var(--mono); font-size: 10.5px; opacity: 0.82;
+  }
+  .field-block .fb-name { font-size: 13px; font-weight: 700; margin-top: 3px; }
+  .field-block .fb-val { font-family: var(--mono); font-size: 11px; margin-top: 4px; opacity: 0.92; word-break: break-all; }
+
+  .tone-plain { background: rgba(59,130,246,0.14); border-color: rgba(59,130,246,0.42); color: #dbeafe; }
+  .tone-aad { background: rgba(34,211,238,0.13); border-color: rgba(34,211,238,0.42); color: #cffafe; }
+  .tone-enc { background: rgba(16,185,129,0.15); border-color: rgba(16,185,129,0.48); color: #d1fae5; }
+  .tone-auth { background: rgba(168,85,247,0.16); border-color: rgba(168,85,247,0.48); color: #f3e8ff; }
+  .tone-pad { background: rgba(245,158,11,0.15); border-color: rgba(245,158,11,0.48); color: #fef3c7; }
+
+  .legend-row {
+    display: flex; flex-wrap: wrap; gap: 12px;
+    margin-bottom: 12px; font-size: 12px; color: var(--muted);
+  }
+  .legend-item { display: flex; align-items: center; gap: 6px; }
+  .legend-swatch { width: 11px; height: 11px; border-radius: 3px; display: inline-block; }
+
+  .field-detail {
+    background: #0a1120;
+    border: 1px solid #1e2d4d;
+    border-radius: 12px;
+    padding: 16px;
+  }
+  .field-detail h4 { font-size: 15px; font-weight: 700; color: #f8fafc; margin-bottom: 6px; }
+  .field-detail .meta-row { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 12px; }
+  .field-detail .sec { margin-top: 10px; font-size: 13px; color: #cbd5e1; }
+  .field-detail .sec strong { color: var(--cyan); display: block; font-size: 11.5px; text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 2px; }
+
+  /* Padding Simulator */
+  .pad-sim {
+    margin-top: 16px;
+    background: #091121;
+    border: 1px solid #1f3052;
+    border-radius: 12px;
+    padding: 15px;
+  }
+  .pad-controls {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    margin-bottom: 12px;
+    font-size: 13px;
+  }
+  .pad-controls input[type=range] { accent-color: var(--cyan); width: 180px; }
+  .hist-grid {
+    display: grid;
+    grid-template-columns: repeat(16, 1fr);
+    gap: 5px;
+    height: 82px;
+    align-items: end;
+    padding: 8px 6px 4px;
+    background: #060b16;
+    border-radius: 8px;
+    border: 1px solid #1a2640;
+  }
+  .hist-col { display: flex; flex-direction: column; align-items: center; justify-content: flex-end; height: 100%; }
+  .hist-bar { width: 100%; border-radius: 3px 3px 0 0; background: linear-gradient(180deg, #22d3ee, #10b981); transition: height 0.25s; min-height: 2px; }
+  .hist-lbl { font-family: var(--mono); font-size: 9.5px; color: var(--muted); margin-top: 4px; }
+
+  /* Section 3: Hybrid PFS & RFC 7983 Demux */
+  .two-col {
+    display: grid;
+    grid-template-columns: 1.25fr 1fr;
+    gap: 18px;
+  }
+  @media (max-width: 920px) { .two-col { grid-template-columns: 1fr; } }
+
+  .demux-bar {
+    display: flex;
+    height: 44px;
+    border-radius: 10px;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    margin: 12px 0;
+  }
+  .demux-seg {
+    display: flex; flex-direction: column; justify-content: center; align-items: center;
+    font-family: var(--mono); font-size: 11px; font-weight: 700;
+    padding: 2px 4px;
+    overflow: hidden; white-space: nowrap;
+  }
+
+  /* Section 4: Scores & Benchmarks */
+  .score-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 14px;
+    margin-bottom: 18px;
+  }
+  @media (max-width: 820px) { .score-grid { grid-template-columns: 1fr; } }
+
+  .score-card {
+    background: #0a1222;
+    border: 1px solid #1e2e4f;
+    border-radius: 12px;
+    padding: 15px;
+  }
+  .score-card .sc-title { font-size: 13.5px; font-weight: 700; color: var(--text); }
+  .score-card .sc-sub { font-size: 11.5px; color: var(--muted); margin-bottom: 12px; }
+  .bar-row { display: grid; grid-template-columns: 42px 1fr 44px; align-items: center; gap: 8px; margin-bottom: 7px; font-family: var(--mono); font-size: 11.5px; }
+  .bar-track { height: 9px; border-radius: 99px; background: #131f38; overflow: hidden; }
+  .bar-fill { height: 100%; border-radius: 99px; }
+
+  .metric-grid {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 12px;
+  }
+  @media (max-width: 900px) { .metric-grid { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 520px) { .metric-grid { grid-template-columns: 1fr; } }
+
+  .metric-box {
+    background: linear-gradient(180deg, rgba(22,33,58,0.65), rgba(10,17,32,0.9));
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    padding: 14px;
+  }
+  .metric-box .m-label { font-size: 11.5px; color: var(--muted); }
+  .metric-box .m-val { font-family: var(--mono); font-size: 22px; font-weight: 800; color: #34d399; margin: 4px 0 2px; }
+  .metric-box .m-val.cyan { color: var(--cyan); }
+  .metric-box .m-val.purple { color: #d8b4fe; }
+  .metric-box .m-val.amber { color: #fcd34d; }
+  .metric-box .m-note { font-size: 11.5px; color: #94a3b8; }
+
+  footer {
+    text-align: center;
+    color: var(--muted);
+    font-size: 12px;
+    margin-top: 28px;
+    padding-top: 18px;
+    border-top: 1px solid var(--border);
+  }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <div class="title-wrap">
+      <h1>WebRTC-Cloak V3.1 协议原理与抗 DPI 交互演示</h1>
+      <p>纯 Rust · 零 C 依赖 · 嵌入式真 DTLS 1.2 (<code>dimpl</code>) + ICE STUN + Chrome 形态 SRTP/SRTCP 单端口隧道前置</p>
+    </div>
+    <div class="badge-row">
+      <span class="badge green">Production-Freeze V3.1</span>
+      <span class="badge">RFC 7983 / 5389 / 6347 / 7714</span>
+      <span class="badge purple">Hybrid PFS (PSK ⊕ ECDHE)</span>
+      <span class="badge amber">Default Single-Thread 900+ Mbps</span>
+    </div>
+  </header>
+
+  <nav class="nav-pills">
+    <a class="nav-pill" href="#sec-sim">1. 全生命周期与对抗推演</a>
+    <a class="nav-pill" href="#sec-packet">2. 字节级报文解剖 &amp; 填充模拟器</a>
+    <a class="nav-pill" href="#sec-crypto">3. Hybrid PFS 密钥派生 &amp; RFC 7983 分流</a>
+    <a class="nav-pill" href="#sec-bench">4. 红队评分与实测数据</a>
+  </nav>
+
+  <!-- ==================== SECTION 1: INTERACTIVE FLOW SIMULATOR ==================== -->
+  <section class="card" id="sec-sim">
+    <div class="card-head">
+      <div class="card-title"><span class="dot"></span> 1. 全生命周期协议流与红队对抗动态推演</div>
+      <div class="controls">
+        <div class="mode-tabs" id="scenarioTabs">
+          <button class="tab-btn" data-mode="raw">对照：裸发 UDP 五包断流</button>
+          <button class="tab-btn active-green" data-mode="v31">V3.1 完整建连与转发</button>
+          <button class="tab-btn" data-mode="attack">红队主动探测与旁路注入</button>
+          <button class="tab-btn" data-mode="heal">服务端重启 / CGNAT 自愈</button>
+        </div>
+        <button class="action-btn" id="btnPrev">← 上一步</button>
+        <button class="action-btn primary" id="btnPlay">▶ 自动播放</button>
+        <button class="action-btn" id="btnNext">下一步 →</button>
+      </div>
+    </div>
+
+    <div class="sim-stage">
+      <svg id="flowSvg" viewBox="0 0 1060 320" xmlns="http://www.w3.org/2000/svg">
+        <defs>
+          <linearGradient id="gLine" x1="0%" y1="0%" x2="100%" y2="0%">
+            <stop offset="0%" stop-color="#3b82f6" stop-opacity="0.5"/>
+            <stop offset="50%" stop-color="#22d3ee" stop-opacity="0.8"/>
+            <stop offset="100%" stop-color="#10b981" stop-opacity="0.5"/>
+          </linearGradient>
+          <filter id="glow"><feGaussianBlur stdDeviation="3.5" result="b"/><feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge></filter>
+        </defs>
+
+        <!-- Backbone links -->
+        <line x1="165" y1="150" x2="360" y2="150" stroke="#334155" stroke-width="3" stroke-dasharray="6 4"/>
+        <line x1="485" y1="150" x2="625" y2="150" stroke="url(#gLine)" stroke-width="3.5"/>
+        <line x1="755" y1="150" x2="880" y2="150" stroke="url(#gLine)" stroke-width="3.5"/>
+
+        <!-- Attacker branch (shown in attack mode) -->
+        <g id="attackerNode" opacity="0.22">
+          <rect x="468" y="14" width="166" height="58" rx="10" fill="#1f1020" stroke="#ef4444" stroke-width="1.6" stroke-dasharray="4 3"/>
+          <text x="551" y="38" text-anchor="middle" fill="#fca5a5" font-size="12.5" font-weight="700">旁路 MITM / 扫描器</text>
+          <text x="551" y="56" text-anchor="middle" fill="#fda4af" font-size="10.5" font-family="monospace">探测 / 畸形 Alert / 注入</text>
+          <line x1="551" y1="72" x2="551" y2="145" stroke="#ef4444" stroke-width="2" stroke-dasharray="4 4"/>
+        </g>
+
+        <!-- Node 1: Local App -->
+        <g id="nodeApp">
+          <rect x="20" y="96" width="145" height="108" rx="12" fill="#101b33" stroke="#3b82f6" stroke-width="1.8"/>
+          <text x="92" y="124" text-anchor="middle" fill="#93c5fd" font-size="13" font-weight="700">本地代理 / 应用</text>
+          <text x="92" y="144" text-anchor="middle" fill="#94a3b8" font-size="11">Hysteria 2 / WG</text>
+          <rect x="34" y="160" width="117" height="28" rx="6" fill="#091121" stroke="#1e3a5f"/>
+          <text id="lblAppState" x="92" y="178" text-anchor="middle" fill="#60a5fa" font-size="10.5" font-family="monospace">127.0.0.1:19543</text>
+        </g>
+
+        <!-- Node 2: webrtc-cloak client -->
+        <g id="nodeClient">
+          <rect x="215" y="88" width="165" height="124" rx="12" fill="#101d36" stroke="#22d3ee" stroke-width="2"/>
+          <text x="297" y="114" text-anchor="middle" fill="#67e8f9" font-size="13.5" font-weight="700">webrtc-cloak client</text>
+          <text x="297" y="133" text-anchor="middle" fill="#94a3b8" font-size="11">软路由 / 单线程 mio</text>
+          <rect x="228" y="146" width="139" height="24" rx="6" fill="#081120" stroke="#1f3b5b"/>
+          <text id="lblCliState" x="297" y="162" text-anchor="middle" fill="#22d3ee" font-size="11" font-family="monospace">STATE: IDLE</text>
+          <rect x="228" y="176" width="139" height="24" rx="6" fill="#081120" stroke="#1f3b5b"/>
+          <text id="lblCliExtra" x="297" y="192" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">pending: 0 | ka: 5s</text>
+        </g>
+
+        <!-- Node 3: ISP DPI / GFW -->
+        <g id="nodeDpi">
+          <rect id="dpiBox" x="620" y="88" width="150" height="124" rx="12" fill="#1a1628" stroke="#f59e0b" stroke-width="2"/>
+          <text x="695" y="114" text-anchor="middle" fill="#fde68a" font-size="13.5" font-weight="700">运营商 DPI / GFW</text>
+          <text x="695" y="133" text-anchor="middle" fill="#94a3b8" font-size="11">五元组状态机审查</text>
+          <rect x="633" y="146" width="124" height="24" rx="6" fill="#0d0d1a" stroke="#443222"/>
+          <text id="lblDpiState" x="695" y="162" text-anchor="middle" fill="#fbbf24" font-size="11" font-family="monospace">DPI: INSPECT</text>
+          <rect x="633" y="176" width="124" height="24" rx="6" fill="#0d0d1a" stroke="#443222"/>
+          <text id="lblDpiSub" x="695" y="192" text-anchor="middle" fill="#cbd5e1" font-size="10.5" font-family="monospace">五包计数: 0/5</text>
+        </g>
+
+        <!-- Node 4: webrtc-cloak server -->
+        <g id="nodeServer">
+          <rect id="srvBox" x="870" y="88" width="170" height="124" rx="12" fill="#0e2226" stroke="#10b981" stroke-width="2"/>
+          <text x="955" y="114" text-anchor="middle" fill="#6ee7b7" font-size="13.5" font-weight="700">webrtc-cloak server</text>
+          <text x="955" y="133" text-anchor="middle" fill="#94a3b8" font-size="11">云主机 :19643 → 后端</text>
+          <rect x="883" y="146" width="144" height="24" rx="6" fill="#07151a" stroke="#18473e"/>
+          <text id="lblSrvState" x="955" y="162" text-anchor="middle" fill="#34d399" font-size="11" font-family="monospace">STATE: LISTEN</text>
+          <rect x="883" y="176" width="144" height="24" rx="6" fill="#07151a" stroke="#18473e"/>
+          <text id="lblSrvExtra" x="955" y="192" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">silent_drop=true</text>
+        </g>
+
+        <!-- Bottom Status Ribbon -->
+        <rect x="20" y="242" width="1020" height="62" rx="10" fill="#0c1528" stroke="#1e2f52"/>
+        <text id="ribbonBadge" x="38" y="266" fill="#22d3ee" font-size="12" font-weight="700" font-family="monospace">[STEP 1]</text>
+        <text id="ribbonTitle" x="120" y="266" fill="#f8fafc" font-size="13.5" font-weight="700">就绪</text>
+        <text id="ribbonDesc" x="38" y="289" fill="#94a3b8" font-size="12">点击「自动播放」或右侧任意步骤观察报文流向、DPI 判定与状态机跃迁。</text>
+
+        <!-- Flying Packet Pill -->
+        <g id="pktPill" filter="url(#glow)" opacity="0">
+          <rect id="pktBg" x="-64" y="-17" width="128" height="34" rx="17" fill="#0891b2" stroke="#67e8f9" stroke-width="1.6"/>
+          <text id="pktTxt" x="0" y="4" text-anchor="middle" fill="#ffffff" font-size="11.5" font-weight="700" font-family="monospace">STUN REQ</text>
+        </g>
+
+        <!-- Drop X marker -->
+        <g id="dropMark" opacity="0">
+          <circle cx="695" cy="150" r="22" fill="rgba(239,68,68,0.22)" stroke="#ef4444" stroke-width="2.5"/>
+          <text x="695" y="156" text-anchor="middle" fill="#fca5a5" font-size="20" font-weight="800">✕</text>
+        </g>
+      </svg>
+    </div>
+
+    <div class="sim-bottom">
+      <div class="step-list" id="stepList"></div>
+      <div class="inspector-panel">
+        <h3>
+          <span id="inspHeader">当前步骤报文遥测</span>
+          <span class="tag-pill pass" id="inspVerdict">PASS</span>
+        </h3>
+        <div class="kv-grid">
+          <div class="kv-box"><div class="k">线速协议类型 (RFC 7983)</div><div class="v" id="kvProto">—</div></div>
+          <div class="kv-box"><div class="k">首字节 / 关键标志</div><div class="v" id="kvHdr">—</div></div>
+          <div class="kv-box"><div class="k">DPI / 旁路视角</div><div class="v" id="kvDpi">—</div></div>
+          <div class="kv-box"><div class="k">安全 / 状态机动作</div><div class="v" id="kvSec">—</div></div>
+        </div>
+        <div class="wire-hex" id="inspHex"></div>
+        <div class="narrative-box" id="inspNote"></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== SECTION 2: BYTE-LEVEL PACKET INSPECTOR ==================== -->
+  <section class="card" id="sec-packet">
+    <div class="card-head">
+      <div class="card-title"><span class="dot green"></span> 2. 字节级报文解剖器与 AEAD 内层填充模拟器</div>
+      <div class="mode-tabs" id="pktTabs">
+        <button class="tab-btn active-cyan" data-pkt="srtp">SRTP 数据包 (0x90 + 0xBEDE)</button>
+        <button class="tab-btn" data-pkt="stun">ICE STUN 鉴权/保活</button>
+        <button class="tab-btn" data-pkt="dtls">DTLS 1.2 (dimpl 6-Flight)</button>
+        <button class="tab-btn" data-pkt="srtcp">Compound SRTCP (PT=200/201)</button>
+      </div>
+    </div>
+
+    <div class="legend-row">
+      <div class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span> 明文标准协议头</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:#22d3ee"></span> AEAD 关联认证数据 (AAD 明文不可篡改)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:#10b981"></span> AEAD 加密密文体 (高熵密文)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:#f59e0b"></span> 密文内层随机填充 (DPI 不可见)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:#a855f7"></span> 认证标签 / 指纹 / 索引</div>
+    </div>
+
+    <div class="packet-layout">
+      <div>
+        <div class="byte-grid" id="byteGrid"></div>
+
+        <!-- Interactive Padding Simulator (shown for SRTP) -->
+        <div class="pad-sim" id="padSimBox">
+          <div class="pad-controls">
+            <strong style="color:var(--amber)">AEAD 内层随机填充分布模拟：</strong>
+            <label>原始负载: <code id="lblOrigLen" style="color:var(--cyan)">148</code> B</label>
+            <input type="range" id="rngOrigLen" min="48" max="1400" step="4" value="148"/>
+            <button class="action-btn" id="btnPresetWG">WireGuard 148B</button>
+            <button class="action-btn" id="btnPresetHy2">Hysteria2 1200B</button>
+            <button class="action-btn primary" id="btnSimPad">模拟连发 64 包</button>
+          </div>
+          <div style="font-size:12px;color:var(--muted);margin-bottom:8px" id="padSummary">
+            线长 = 20B (SRTP+0xBEDE) + 2B (密文内层长度) + 原始负载 + rand(0..31B) + 16B Tag；首字节恒为 <code>0x90 (P=0)</code>，不暴露任何填充标志。
+          </div>
+          <div class="hist-grid" id="padHist"></div>
+          <div style="display:flex;justify-content:space-between;font-size:11px;color:var(--muted);margin-top:6px;font-family:var(--mono)">
+            <span>横轴：线上 UDP 包长 mod 16 桶 (0..15)</span>
+            <span id="padModStats">覆盖 16/16 桶 · 最大线长 ≤ 1445B (零分片)</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="field-detail" id="fieldDetail"></div>
+    </div>
+  </section>
+
+  <!-- ==================== SECTION 3: HYBRID PFS & RFC 7983 DEMUX ==================== -->
+  <section class="card" id="sec-crypto">
+    <div class="card-head">
+      <div class="card-title"><span class="dot purple"></span> 3. 双重混合前向安全（Hybrid PFS）与 RFC 7983 单端口分流</div>
+    </div>
+
+    <div class="two-col">
+      <div style="background:var(--bg-deep);border:1px solid var(--border);border-radius:12px;padding:14px;">
+        <div style="font-size:13px;font-weight:700;color:#d8b4fe;margin-bottom:10px;">Hybrid PFS 密钥派生与域分离 (Nonce 100% 不相交)</div>
+        <svg viewBox="0 0 600 260" style="width:100%;height:auto;display:block;" xmlns="http://www.w3.org/2000/svg">
+          <!-- Input 1 -->
+          <rect x="10" y="14" width="235" height="62" rx="9" fill="#131f3a" stroke="#3b82f6" stroke-width="1.5"/>
+          <text x="127" y="36" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="700">路径 A：ICE STUN 鉴权材料</text>
+          <text x="127" y="54" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">HKDF(PSK, txid || ufrag)</text>
+          <text x="127" y="68" text-anchor="middle" fill="#67e8f9" font-size="10" font-family="monospace">→ stun_key(32B) + SSRC_c2s / s2c</text>
+
+          <!-- Input 2 -->
+          <rect x="10" y="102" width="235" height="62" rx="9" fill="#1c1433" stroke="#a855f7" stroke-width="1.5"/>
+          <text x="127" y="124" text-anchor="middle" fill="#e9d5ff" font-size="12" font-weight="700">路径 B：真 DTLS 1.2 (dimpl)</text>
+          <text x="127" y="142" text-anchor="middle" fill="#94a3b8" font-size="10.5" font-family="monospace">ECDHE P-256 + 双向自签证书</text>
+          <text x="127" y="156" text-anchor="middle" fill="#d8b4fe" font-size="10" font-family="monospace">→ RFC 5764 KeyingMaterial(64B)</text>
+
+          <!-- Arrows into combiner -->
+          <path d="M 245 45 L 285 45 L 285 88 L 310 88" fill="none" stroke="#3b82f6" stroke-width="2"/>
+          <path d="M 245 133 L 285 133 L 285 96 L 310 96" fill="none" stroke="#a855f7" stroke-width="2"/>
+
+          <!-- Combiner -->
+          <rect x="310" y="56" width="275" height="72" rx="10" fill="#0d2526" stroke="#10b981" stroke-width="1.8"/>
+          <text x="447" y="79" text-anchor="middle" fill="#6ee7b7" font-size="12.5" font-weight="700">SHA-256 混合主密钥 (Hybrid PFS)</text>
+          <text x="447" y="98" text-anchor="middle" fill="#cbd5e1" font-size="10.2" font-family="monospace">SHA256("webrtc-cloak-v3-pfs-mix"</text>
+          <text x="447" y="114" text-anchor="middle" fill="#cbd5e1" font-size="10.2" font-family="monospace">|| stun_key || dtls_km)</text>
+
+          <!-- Output splits -->
+          <path d="M 447 128 L 447 166" fill="none" stroke="#10b981" stroke-width="2"/>
+          <path d="M 447 166 L 160 166 L 160 186" fill="none" stroke="#22d3ee" stroke-width="1.8"/>
+          <path d="M 447 166 L 447 186" fill="none" stroke="#f59e0b" stroke-width="1.8"/>
+
+          <!-- SRTP Domain -->
+          <rect x="18" y="186" width="278" height="62" rx="9" fill="#0b1d2e" stroke="#22d3ee" stroke-width="1.5"/>
+          <text x="157" y="207" text-anchor="middle" fill="#67e8f9" font-size="12" font-weight="700">SRTP 数据面密钥 + 64-bit 防重放</text>
+          <text x="157" y="224" text-anchor="middle" fill="#94a3b8" font-size="10.2" font-family="monospace">Nonce = [dir(0x01/0x02), 0, SSRC, pkt_idx]</text>
+          <text x="157" y="239" text-anchor="middle" fill="#34d399" font-size="10" font-family="monospace">AES-128-GCM / ChaCha20 / BLAKE2b</text>
+
+          <!-- SRTCP Domain -->
+          <rect x="310" y="186" width="275" height="62" rx="9" fill="#1e180d" stroke="#f59e0b" stroke-width="1.5"/>
+          <text x="447" y="207" text-anchor="middle" fill="#fde68a" font-size="12" font-weight="700">SRTCP 控制面密钥 + 64-bit 防重放</text>
+          <text x="447" y="224" text-anchor="middle" fill="#94a3b8" font-size="10.2" font-family="monospace">Nonce = [dir|0x80, 0, SSRC, srtcp_idx]</text>
+          <text x="447" y="239" text-anchor="middle" fill="#fcd34d" font-size="10" font-family="monospace">最高位翻转 · 零 Nonce 重用可能</text>
+        </svg>
+      </div>
+
+      <div style="background:var(--bg-deep);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;justify-content:space-between;">
+        <div>
+          <div style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:6px;">RFC 7983 首字节单端口精准分流图谱 (0x00 ~ 0xFF)</div>
+          <p style="font-size:12px;color:var(--muted);">V3.1 刻意收窄 DTLS 区间为合法 TLS ContentType <code>20..=23</code>（而非宽松的 <code>20..=63</code>），将旁路乱序垃圾字节直接拦截在密码引擎之外。</p>
+
+          <div class="demux-bar">
+            <div class="demux-seg" style="width:12%;background:rgba(59,130,246,0.35);color:#bfdbfe;" title="0..=3 STUN">0..3<br/>STUN</div>
+            <div class="demux-seg" style="width:11%;background:#111827;color:#64748b;" title="4..=19 Drop">DROP</div>
+            <div class="demux-seg" style="width:14%;background:rgba(168,85,247,0.38);color:#f3e8ff;" title="20..=23 DTLS">20..23<br/>DTLS</div>
+            <div class="demux-seg" style="width:21%;background:#111827;color:#64748b;" title="24..=127 Drop">24..127 DROP</div>
+            <div class="demux-seg" style="width:27%;background:rgba(16,185,129,0.35);color:#d1fae5;" title="128..=191 SRTP/SRTCP">128..191<br/>SRTP / SRTCP</div>
+            <div class="demux-seg" style="width:15%;background:#111827;color:#64748b;" title="192..=255 Drop">DROP</div>
+          </div>
+        </div>
+
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:10px;">
+          <div class="kv-box">
+            <div class="k">SRTP vs SRTCP 区分</div>
+            <div class="v" style="color:#6ee7b7">b[1] &amp; 0x7F ∈ 64..=95 → SRTCP</div>
+          </div>
+          <div class="kv-box">
+            <div class="k">未认证 / 非法首字节</div>
+            <div class="v" style="color:#fca5a5">100% Silent Drop (0B 回复)</div>
+          </div>
+          <div class="kv-box">
+            <div class="k">X.509 证书伪装</div>
+            <div class="v" style="color:#d8b4fe">无扩展 CN=WebRTC · 20-24h 轮换</div>
+          </div>
+          <div class="kv-box">
+            <div class="k">自适应密码套件</div>
+            <div class="v" style="color:#fcd34d">AES-NI→GCM / 软算→ChaCha20</div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ==================== SECTION 4: AUDIT SCORES & REAL BENCHMARKS ==================== -->
+  <section class="card" id="sec-bench">
+    <div class="card-head">
+      <div class="card-title"><span class="dot amber"></span> 4. 三轮独立红队隐蔽性演进 &amp; 实机性能基线</div>
+      <span class="badge green">Gemini 4 Carbon 三轮审计 · 14+2 项全闭环</span>
+    </div>
+
+    <div class="score-grid">
+      <div class="score-card">
+        <div class="sc-title">运营商家宽 DPI 对抗</div>
+        <div class="sc-sub">五包断流 / UDP QoS / WebRTC 白名单</div>
+        <div class="bar-row"><span>V2</span><div class="bar-track"><div class="bar-fill" style="width:75%;background:#64748b"></div></div><span>7.5</span></div>
+        <div class="bar-row"><span>V3</span><div class="bar-track"><div class="bar-fill" style="width:88%;background:#3b82f6"></div></div><span>8.8</span></div>
+        <div class="bar-row"><span style="color:#34d399;font-weight:700">V3.1</span><div class="bar-track"><div class="bar-fill" style="width:98%;background:linear-gradient(90deg,#06b6d4,#10b981)"></div></div><span style="color:#34d399;font-weight:700">9.8</span></div>
+      </div>
+
+      <div class="score-card">
+        <div class="sc-title">商业 NGFW / 主动探测</div>
+        <div class="sc-sub">Censys / 畸形包探测 / 端口存活检测</div>
+        <div class="bar-row"><span>V2</span><div class="bar-track"><div class="bar-fill" style="width:65%;background:#64748b"></div></div><span>6.5</span></div>
+        <div class="bar-row"><span>V3</span><div class="bar-track"><div class="bar-fill" style="width:78%;background:#3b82f6"></div></div><span>7.8</span></div>
+        <div class="bar-row"><span style="color:#34d399;font-weight:700">V3.1</span><div class="bar-track"><div class="bar-fill" style="width:99%;background:linear-gradient(90deg,#06b6d4,#10b981)"></div></div><span style="color:#34d399;font-weight:700">9.9</span></div>
+      </div>
+
+      <div class="score-card">
+        <div class="sc-title">国家级深度对抗 (GFW)</div>
+        <div class="sc-sub">深度状态机 / 旁路主动注入 / 包长统计</div>
+        <div class="bar-row"><span>V2</span><div class="bar-track"><div class="bar-fill" style="width:45%;background:#64748b"></div></div><span>4.5</span></div>
+        <div class="bar-row"><span>V3</span><div class="bar-track"><div class="bar-fill" style="width:62%;background:#3b82f6"></div></div><span>6.2</span></div>
+        <div class="bar-row"><span style="color:#34d399;font-weight:700">V3.1</span><div class="bar-track"><div class="bar-fill" style="width:93%;background:linear-gradient(90deg,#a855f7,#22d3ee)"></div></div><span style="color:#67e8f9;font-weight:700">9.3</span></div>
+      </div>
+    </div>
+
+    <div class="metric-grid">
+      <div class="metric-box">
+        <div class="m-label">N5105 软路由 · 默认单核 (1W)</div>
+        <div class="m-val">900.0 Mbps</div>
+        <div class="m-note">0.00% 丢包 · p50 RTT 50 µs · RSS 2.1 MB</div>
+      </div>
+      <div class="metric-box">
+        <div class="m-label">N5105 软路由 · 多核可选 (4W/8S)</div>
+        <div class="m-val cyan">1,448.7 Mbps</div>
+        <div class="m-note">0.00% 丢包 · 143.7 kpps · RSS 2.5 MB</div>
+      </div>
+      <div class="metric-box">
+        <div class="m-label">Xeon 云主机 · 默认单核加解密</div>
+        <div class="m-val purple">3,228.6 Mbps</div>
+        <div class="m-note">单核环回 1,124 Mbps · 双向 DTLS 3.0 ms</div>
+      </div>
+      <div class="metric-box">
+        <div class="m-label">移动家宽公网实测 (20 Mbps 3000包)</div>
+        <div class="m-val amber">0.00% 丢包</div>
+        <div class="m-note">抖动 &lt;1.3 ms · 0/5 探测回包 · 重启自愈</div>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    WebRTC-Cloak V3.1 (Pure Rust / dimpl 0.9.0 / mio) · 本地单文件离线原理演示 · 打开即用无需联网
+  </footer>
+</div>
+
+<script>
+// ===================== SECTION 1: PROTOCOL FLOW SIMULATOR =====================
+const SCENARIOS = {
+  raw: {
+    name: "裸发 UDP 五包断流",
+    accent: "red",
+    attacker: false,
+    steps: [
+      {
+        title: "第 1~3 包：直接发送高熵随机 UDP / QUIC 包",
+        desc: "未经 STUN/DTLS 握手，直接向境外 UDP 端口发送高熵密文。",
+        dir: "c2s", pill: "RAW UDP #1..3", pillColor: "#ef4444",
+        cli: "RAW SEND", cliEx: "no handshake", dpi: "DPI: SUSPECT", dpiSub: "五包计数: 3/5", dpiColor: "#f59e0b",
+        srv: "RECV #1..3", srvEx: "normal", verdict: "WARN", verdictCls: "warn",
+        proto: "Unknown High-Entropy UDP", hdr: "0xC3 / 随机首字节", dpiView: "未命中任何白名单协议", secAct: "放行观察窗口中",
+        hex: "c3 00 00 00 01 08 a7 9e ... [1260B high-entropy random/QUIC]",
+        note: "运营商出境 UDP DPI 为防止误杀正常首包，通常会放行新五元组的前 5 个未知 UDP 包用于深度协议识别。"
+      },
+      {
+        title: "第 4~5 包：仍未出现合法协议特征（临界点）",
+        desc: "连续 5 个包均为高熵无结构载荷，未能触发 STUN / WebRTC / DNS 白名单。",
+        dir: "c2s", pill: "RAW UDP #4..5", pillColor: "#f59e0b",
+        cli: "RAW SEND", cliEx: "pkts=5", dpi: "DPI: CLASSIFY!", dpiSub: "五包计数: 5/5 (满)", dpiColor: "#ef4444",
+        srv: "RECV #4..5", srvEx: "normal", verdict: "WARN", verdictCls: "warn",
+        proto: "Unknown UDP (Quota Exhausted)", hdr: "连续 5 包未识别", dpiView: "标记五元组为非白名单", secAct: "触发黑洞截断策略",
+        hex: "4f 91 2a 88 e3 10 7b c4 ... [Packet #5 — last allowed packet]",
+        note: "实测对照组中，15 个 1260B 随机 UDP 包精确收到 5/15，第 5 包是该五元组最后一条被放行的数据报。"
+      },
+      {
+        title: "第 6 包起：五元组被运营商 DPI 彻底截断（全丢）",
+        desc: "后续所有数据包在运营商骨干出口被静默丢弃，连接彻底卡死。",
+        dir: "drop_dpi", pill: "RAW UDP #6 (DROP)", pillColor: "#dc2626",
+        cli: "TIMEOUT!", cliEx: "loss=100%", dpi: "DPI: BLOCKED", dpiSub: "第 6 包起全丢 ✕", dpiColor: "#ef4444",
+        srv: "NO TRAFFIC", srvEx: "0 pkts arrived", verdict: "DROP", verdictCls: "drop",
+        proto: "Blocked 5-Tuple", hdr: "DROP AT ISP", dpiView: "五元组进入临时阻断表", secAct: "上层隧道彻底失联",
+        hex: "[DROPPED IN TRANSIT] Packet #6..#15 never reach destination server.",
+        note: "即便偶发重连换端口，每个新端口也只能活 5 个包，导致原生 Hysteria 2 / WireGuard 在此类宽带下完全不可用。"
+      }
+    ]
+  },
+
+  v31: {
+    name: "V3.1 完整建连与转发",
+    accent: "green",
+    attacker: false,
+    steps: [
+      {
+        title: "Step 1 · 本地应用首包触发会话创建与 Pending 暂存",
+        desc: "Hysteria 2 / WireGuard 发来首包，客户端先存入 pending 队列并生成 4:4 Base64 ufrag。",
+        dir: "app2cli", pill: "APP UDP #1", pillColor: "#3b82f6",
+        cli: "STATE: STUN_WAIT", cliEx: "pending: 1 | ufrag=HQeh:Rt+v", dpi: "DPI: IDLE", dpiSub: "尚未发往公网", dpiColor: "#64748b",
+        srv: "STATE: LISTEN", srvEx: "silent_drop=true", verdict: "PASS", verdictCls: "pass",
+        proto: "Localhost UDP", hdr: "127.0.0.1:19543", dpiView: "公网零暴露", secAct: "生成随机会话与时间锚定 txid",
+        hex: "Local App -> client:19543 (queued in pending[0] until DTLS Ready)",
+        note: "首包绝不裸发公网，避免在握手完成前触发任何未知 UDP 特征或首包泄露。"
+      },
+      {
+        title: "Step 2 · ICE STUN 鉴权请求解锁运营商白名单",
+        desc: "携带 USERNAME(4:4)、PRIORITY、ICE-CONTROLLING、USE-CANDIDATE、HMAC-SHA1 与尾部 FINGERPRINT。",
+        dir: "c2s", pill: "ICE STUN REQ", pillColor: "#2563eb",
+        cli: "STATE: STUN_WAIT", cliEx: "txid=timestamp_hmac", dpi: "DPI: STUN HIT!", dpiSub: "命中 WebRTC 白名单 ✓", dpiColor: "#10b981",
+        srv: "AUTH STUN OK", srvEx: "derive stun_key + SSRC", verdict: "PASS", verdictCls: "pass",
+        proto: "ICE STUN Binding Req (0x0001)", hdr: "b[0]=0x00 | Magic=2112A442", dpiView: "标准 WebRTC ICE 连通性检查", secAct: "校验 PSK + ±30s 防重放 + 拒尾注入",
+        hex: "00 01 00 54 21 12 a4 42 [12B txid] 00 06 00 09 'HQeh:Rt+v' ... 00 25 00 00 (USE-CAND) 00 08 00 14 [20B HMAC] 80 28 00 04 [CRC32]",
+        note: "严格遵守 RFC 5389 §15.4：MESSAGE-INTEGRITY 之后只允许精确 8 字节 FINGERPRINT；未认证包服务端静默丢弃（0 字节回复）。"
+      },
+      {
+        title: "Step 3 · 服务端返回 STUN Binding Success",
+        desc: "包含 XOR-MAPPED-ADDRESS（客户端公网 CGNAT 映射地址）、HMAC-SHA1 与 FINGERPRINT。",
+        dir: "s2c", pill: "STUN SUCCESS", pillColor: "#0891b2",
+        cli: "ICE STUN OK", cliEx: "start dimpl DTLS 1.2", dpi: "DPI: WHITELIST", dpiSub: "STUN 双向握手成立 ✓", dpiColor: "#10b981",
+        srv: "DTLS_HANDSHAKE", srvEx: "await ClientHello", verdict: "PASS", verdictCls: "pass",
+        proto: "STUN Binding Success (0x0101)", hdr: "b[0]=0x01 | 56 Bytes", dpiView: "合法 STUN 应答，解锁五元组", secAct: "双方派生一致 stun_key 与 SSRC",
+        hex: "01 01 00 24 21 12 a4 42 [same txid] 00 20 00 08 [XOR-MAPPED] 00 08 00 14 [HMAC] 80 28 00 04 [FP]",
+        note: "实测中国移动家宽在此步仅需 1 RTT（~162ms），运营商白名单状态机立刻放行后续全部流量。"
+      },
+      {
+        title: "Step 4 · 真 DTLS 1.2 握手：ClientHello (3-Suite) ⇄ HelloVerifyRequest Cookie",
+        desc: "内置纯 Rust dimpl 发起标准 DTLS 1.2 握手，服务端发送 Cookie 挑战防 UDP 放大攻击。",
+        dir: "c2s_s2c", pill: "DTLS CH ⇄ HVR", pillColor: "#9333ea",
+        cli: "DTLS_HANDSHAKE", cliEx: "3 suites: C02B/C02C/CCA9", dpi: "DPI: DTLS 1.2", dpiSub: "标准 WebRTC DTLS-SRTP", dpiColor: "#10b981",
+        srv: "SEND HVR COOKIE", srvEx: "msg_seq=0 stateless", verdict: "PASS", verdictCls: "pass",
+        proto: "DTLS 1.2 Handshake (CT=22)", hdr: "b[0]=0x16 | Ver=0xFEFD", dpiView: "完整 3 套件，无单套件指纹", secAct: "任何 CPU 均宣告全部 3 个 AEAD 套件",
+        hex: "16 fe fd 00 00 ... ClientHello [0xC02B, 0xC02C, 0xCCA9, use_srtp]  ⇄  16 fe fd ... HelloVerifyRequest [cookie]",
+        note: "V3.1 在无 AES-NI 硬件上通过重排（而非裁剪）套件列表，确保 ClientHello 永远携带全部 3 个 ECDHE-ECDSA 套件。"
+      },
+      {
+        title: "Step 5 · 双向 ECDSA P-256 证书交换 + Hybrid PFS 密钥派生",
+        desc: "双方交换无扩展 CN=WebRTC 自签证书（50/50 High-S/Low-S），完成 ECDHE 密钥交换并混合 PSK。",
+        dir: "s2c_c2s", pill: "CERT + ECDHE + FIN", pillColor: "#a855f7",
+        cli: "STATE: READY ✓", cliEx: "cipher=aes-128-gcm", dpi: "DPI: WEBRTC OK", dpiSub: "双向真证书验签通过 ✓", dpiColor: "#10b981",
+        srv: "STATE: READY ✓", srvEx: "flush early_srtp", verdict: "PASS", verdictCls: "pass",
+        proto: "DTLS 1.2 Flight 4~6 (PFS)", hdr: "b[0]=0x16/0x14 | Epoch 0→1", dpiView: "Chrome BoringSSL 无扩展证书", secAct: "Key = SHA256(stun_key || 64B DTLS KM)",
+        hex: "ServerHello(msg_seq=1) + Cert(CN=WebRTC, 289B DER) + SKE(P-256) + CertReq + SHD ⇄ ClientCert + CKE + CV + CCS + Finished",
+        note: "证书按 worker 缓存 20~24h，不仅握手提速 ~25%，还消除每连接现算证书的时延与特征异常。"
+      },
+      {
+        title: "Step 6 · 高速 SRTP (0x90 + 0xBEDE) 数据面加密转发",
+        desc: "刷出 pending 首包并进入零锁零分配高速转发；AEAD 密文内部自动叠加 0..=31B 随机填充。",
+        dir: "c2s", pill: "SRTP 0x90 (AEAD)", pillColor: "#10b981",
+        cli: "READY (FORWARD)", cliEx: "0x90 P=0 | 90kHz clock", dpi: "DPI: RTP VIDEO", dpiSub: "VP8/H.264 30fps 视频流", dpiColor: "#10b981",
+        srv: "UNWRAP → BACKEND", srvEx: "64-bit anti-replay ✓", verdict: "PASS", verdictCls: "pass",
+        proto: "SRTP AEAD_AES_128_GCM (RFC 7714)", hdr: "b[0]=0x90 | ext=0xBEDE", dpiView: "纯墙钟 90kHz 30fps + 均匀包长", secAct: "[len||plain||0..31B pad] 全在密文内",
+        hex: "90 60 00 01 [4B 90kHz TS] [4B SSRC] be de 00 01 [4B ext] [AEAD(u16_len || payload || rand_pad)] [16B GCM Tag]",
+        note: "彻底移除了 V2/V3 易被识别的明文 P=1(0xB0) 尾部填充；突发 200 小包时时间戳仍严格锁定 90kHz 墙钟斜率。"
+      },
+      {
+        title: "Step 7 · 周期性 RFC 7675 保活 + Compound SRTCP + 优雅退场",
+        desc: "每 5s±20% 发送 STUN 保活，周期互发加密 Compound SRTCP (PT=200/201)；空闲时加密 BYE + close_notify + 250ms 排空。",
+        dir: "c2s_s2c", pill: "KA 5s + SRTCP + BYE", pillColor: "#0ea5e9",
+        cli: "CLOSING (250ms)", cliEx: "零 ICMP Port Unreach", dpi: "DPI: CLEAN END", dpiSub: "标准 WebRTC 通话挂断 ✓", dpiColor: "#10b981",
+        srv: "CLOSING (250ms)", srvEx: "吸收在途尾包后清理", verdict: "PASS", verdictCls: "pass",
+        proto: "STUN KA + Compound SRTCP + Alert", hdr: "PT=200/201 (零明文 203)", dpiView: "合规 SR/RR + 加密 close_notify", secAct: "Closing(250ms) 杜绝 ICMP 端口反弹",
+        hex: "81 c8 00 0c [4B SSRC] [Enc(SR + SDES 202 + FB 205/206 + BYE 203)] [16B Tag] [4B E|SRTCP_Idx]  +  15 fe fd 00 01 ... (close_notify)",
+        note: "首包明文永远只出现 PT=200(SR) 或 PT=201(RR)，BYE(203) 隐藏在加密复合包尾部；250ms 吸收窗口防止关口触发 ICMP 泄露。"
+      }
+    ]
+  },
+
+  attack: {
+    name: "红队主动探测与旁路注入",
+    accent: "purple",
+    attacker: true,
+    steps: [
+      {
+        title: "攻击 1 · 互联网扫描器发送裸 STUN / HTTP / 垃圾探测",
+        desc: "扫描器向服务端公网端口发送标准无认证 STUN Binding Request 或随机负载试图测绘特征。",
+        dir: "atk2srv", pill: "UNAUTH PROBE", pillColor: "#ef4444",
+        cli: "NORMAL TRAFFIC", cliEx: "unaffected", dpi: "SCANNER PROBE", dpiSub: "等待端口回包指纹", dpiColor: "#a855f7",
+        srv: "SILENT DROP (0B)", srvEx: "unauth_drops += 1", verdict: "DROP", verdictCls: "drop",
+        proto: "Unauthenticated Probe", hdr: "缺 PSK HMAC / 非法首字节", dpiView: "端口像黑洞，无任何响应", secAct: "彻底移除公开 STUN 伪装，100% 静默",
+        hex: "00 01 00 00 21 12 a4 42 [random 12B txid]  ==>  Server returns 0 bytes (Silent Drop)",
+        note: "V3.1 彻底删除了 --public-stun-camouflage，实测 5/5 未认证探测回包为 0，主动扫描器无法确认端口上跑着任何服务。"
+      },
+      {
+        title: "攻击 2 · 旁路 MITM 精确 4 元组注入 1B 畸形 DTLS / Epoch=0 Fatal Alert",
+        desc: "在途攻击者冒充对端 IP:Port，向活会话注入畸形 DTLS 或明文 Fatal Alert 企图 DoS 瞬杀会话（V3-H-01）。",
+        dir: "atk2cli", pill: "FORGED ALERT", pillColor: "#dc2626",
+        cli: "PRE-VALID DROP ✓", cliEx: "SRTP 隧道 100% 存活", dpi: "MITM INJECT", dpiSub: "企图诱导断流 Oracle", dpiColor: "#ef4444",
+        srv: "PRE-VALID DROP ✓", srvEx: "auth_drops += 1", verdict: "PASS", verdictCls: "pass",
+        proto: "Forged DTLS Alert (Epoch=0 / <18B)", hdr: "15 fe fd 00 00 ... / len<18", dpiView: "目标会话毫无波澜，探测失败", secAct: "validate_dtls_datagram 入口拦截",
+        hex: "15 fe fd 00 00 00 00 00 00 00 01 00 02 02 28  ==>  Rejected BEFORE dimpl.handle_packet()!",
+        note: "不仅在入口一刀切拒绝 Epoch=0 明文 Alert 及 <18B 伪造加密 Alert，即便 dimpl 返回错误也绝不销毁已建立的 SRTP 隧道。"
+      },
+      {
+        title: "攻击 3 · 截获合法 STUN 并在 MESSAGE-INTEGRITY 后追加恶意 USERNAME",
+        desc: "攻击者保留原 HMAC，在 MI 后塞入 evil:ufrag 并重算尾部 FINGERPRINT 试图触发假 REKEY（V3-H-02）。",
+        dir: "atk2srv", pill: "STUN TAIL INJECT", pillColor: "#dc2626",
+        cli: "SESSION INTACT", cliEx: "0% loss", dpi: "MITM TAMPER", dpiSub: "篡改 MI 之后属性", dpiColor: "#ef4444",
+        srv: "RFC 5389 REJECT ✓", srvEx: "next_pos + 8 != end", verdict: "PASS", verdictCls: "pass",
+        proto: "Tampered STUN Request", hdr: "MI 后夹带 0x0006 属性", dpiView: "假 REKEY 攻击彻底失效", secAct: "parse_stun 严格校验尾部唯一 8B FP",
+        hex: "... [20B valid HMAC-SHA1] [00 06 00 0c 'evil:ufrag12'] [80 28 00 04 recomputed_FP] ==> None!",
+        note: "parse_stun 在遇到 MESSAGE-INTEGRITY 时强制要求 next_pos + 8 == end，MI 后多出哪怕 4 字节立即整包丢弃。"
+      },
+      {
+        title: "攻击 4 · 握手期注入伪造 ServerHello (0xCCA9) 企图毒化套件协商",
+        desc: "在真实 ServerHello (0xC02B) 到达间隙注入伪造 ChaCha20 ServerHello 企图导致双端加解密失步（V3-H-05）。",
+        dir: "atk2cli", pill: "SPOOF SH 0xCCA9", pillColor: "#dc2626",
+        cli: "LOCKED 0xC02B ✓", cliEx: "msg_seq==1 + Flight5 锁", dpi: "MITM POISON", dpiSub: "伪造套件协商", dpiColor: "#ef4444",
+        srv: "LOCKED 0xC02B ✓", srvEx: "AES-128-GCM 正常转发", verdict: "PASS", verdictCls: "pass",
+        proto: "Forged DTLS ServerHello", hdr: "0xCCA9 spoofed", dpiView: "双端仍一致协商 aes-128-gcm", secAct: "HVR 清空暂存 + Flight 5 原子锁定",
+        hex: "Spoofed ServerHello(suite=0xCCA9) injected after Flight 4 ==> Ignored (dtls_suite_id already locked!)",
+        note: "客户端仅接受 msg_seq==1 的 ServerHello，且在 dimpl 真正推进发出 Flight 5 后才原子锁定套件，免疫抢注毒化。"
+      }
+    ]
+  },
+
+  heal: {
+    name: "服务端重启 / CGNAT 自愈",
+    accent: "amber",
+    attacker: false,
+    steps: [
+      {
+        title: "场景触发 · 云端服务端重启（或家宽 CGNAT 发生源端口漂移）",
+        desc: "旧会话状态在服务端瞬间清空，但本地 WireGuard / Hysteria 2 仍在每 5s 持续发包，不断刷新客户端本地活跃计时器。",
+        dir: "c2s", pill: "OLD SRTP (ORPHAN)", pillColor: "#f59e0b",
+        cli: "READY (STALE)", cliEx: "本地流量不断刷新", dpi: "CGNAT :4793", dpiSub: "旧映射端口转发中", dpiColor: "#f59e0b",
+        srv: "RESTARTED!", srvEx: "无旧会话 → 静默丢弃", verdict: "WARN", verdictCls: "warn",
+        proto: "Orphan SRTP (Old SSRC/Key)", hdr: "旧会话密文", dpiView: "正常流量形态", secAct: "新服务端不认识旧会话，静默丢弃",
+        hex: "Client keeps sending SRTP encrypted with pre-restart session key -> Server silently drops",
+        note: "这是 Carbon 第 3 轮审出的经典生产隐患（NEW-M-01）：若无专门自愈机制，本地持续流量会导致客户端 120s 空闲超时永远不触发。"
+      },
+      {
+        title: "关键拦截 · 服务端拒绝无 USE-CANDIDATE 的孤儿 STUN 保活",
+        desc: "客户端发出 5s 周期保活（不带 USE-CANDIDATE）。新版服务端坚决不回复 STUN Success，防止误导客户端以为链路健康！",
+        dir: "c2s", pill: "ORPHAN STUN KA", pillColor: "#f59e0b",
+        cli: "AWAIT KA REPLY", cliEx: "last_peer_rx 停止更新", dpi: "DPI: STUN KA", dpiSub: "正常 RFC 7675 保活", dpiColor: "#10b981",
+        srv: "DROP ORPHAN KA ✓", srvEx: "!use_candidate → drop", verdict: "PASS", verdictCls: "pass",
+        proto: "STUN Keepalive (no USE-CAND)", hdr: "use_candidate = false", dpiView: "无异常回包或状态抖动", secAct: "阻断半开黑洞死锁的根源",
+        hex: "if !parsed.use_candidate { unauth_drops += 1; continue; } // Never ACK orphan keepalive!",
+        note: "修复前，服务端把孤儿保活误当新连接回 STUN Success，客户端误以为保活成功永远不重握；修复后服务端静默丢弃。"
+      },
+      {
+        title: "失活触发 · 客户端 25s (5×ka) 触发 RFC 7675 失活关闭",
+        desc: "客户端独立监控 last_peer_rx 超时，主动触发优雅关闭并进入 Closing(250ms)，销毁旧 socket。",
+        dir: "app2cli", pill: "LIVENESS TIMEOUT", pillColor: "#a855f7",
+        cli: "PEER DEAD → CLOSE", cliEx: "last_peer_rx > 25s", dpi: "OLD PORT END", dpiSub: "旧五元组优雅释放", dpiColor: "#64748b",
+        srv: "STATE: LISTEN", srvEx: "ready for fresh conn", verdict: "WARN", verdictCls: "warn",
+        proto: "RFC 7675 §5.1 Consent Lost", hdr: "peer_dead = true", dpiView: "正常通话异常断线清理", secAct: "销毁旧僵死会话，准备新五元组",
+        hex: "[client-rs#0] peer liveness timeout (RFC 7675 consent lost) up_sport=54706 -> closing for auto-rehandshake",
+        note: "即便本地 WireGuard 每秒发包，只要对端 5 个保活周期没有任何合法认证回包（STUN KA / SRTCP / SRTP），客户端必触发自愈。"
+      },
+      {
+        title: "全自动恢复 · 下一包在新端口完成 STUN + DTLS 1.2 重握",
+        desc: "本地应用下一包立即分配新本地源端口（新 CGNAT 映射），携带 USE-CANDIDATE 在 ~657ms 内完成新握手并恢复转发！",
+        dir: "c2s_s2c", pill: "FRESH HS → READY", pillColor: "#10b981",
+        cli: "STATE: READY ✓", cliEx: "new CGNAT :4805 | 657ms", dpi: "DPI: NEW WEBRTC", dpiSub: "新五元组白名单解锁 ✓", dpiColor: "#10b981",
+        srv: "AUTH + DTLS OK ✓", srvEx: "new PFS key active", verdict: "PASS", verdictCls: "pass",
+        proto: "Fresh ICE STUN + DTLS 1.2", hdr: "USE-CANDIDATE = true", dpiView: "全新 WebRTC 重连会话", secAct: "零人工干预，100% 自动恢复",
+        hex: "AUTH STUN OK new session ufrag=Csc1:AD8e -> DTLS 1.2 (dimpl mutual-cert PFS) OK -> READY flushed=1",
+        note: "已在移动家宽公网实测验证：强杀云端服务后全自动重握恢复，无需重启路由器客户端进程。"
+      }
+    ]
+  }
+};
+
+let curMode = "v31";
+let curStep = 0;
+let playTimer = null;
+
+function setSvgText(id, txt) { const el = document.getElementById(id); if (el) el.textContent = txt; }
+
+function animatePill(dir, label, color) {
+  const pill = document.getElementById("pktPill");
+  const bg = document.getElementById("pktBg");
+  const txt = document.getElementById("pktTxt");
+  const drop = document.getElementById("dropMark");
+
+  bg.setAttribute("fill", color);
+  bg.setAttribute("stroke", "#e2e8f0");
+  txt.textContent = label;
+  drop.setAttribute("opacity", "0");
+
+  const paths = {
+    app2cli:  { x0: 92,  y0: 150, x1: 297, y1: 150 },
+    c2s:      { x0: 365, y0: 150, x1: 900, y1: 150 },
+    s2c:      { x0: 900, y0: 150, x1: 365, y1: 150 },
+    c2s_s2c:  { x0: 375, y0: 136, x1: 890, y1: 136, bounce: true },
+    s2c_c2s:  { x0: 890, y0: 164, x1: 375, y1: 164, bounce: true },
+    drop_dpi: { x0: 365, y0: 150, x1: 695, y1: 150, dropAtEnd: true },
+    atk2srv:  { x0: 551, y0: 66,  x1: 900, y1: 150 },
+    atk2cli:  { x0: 551, y0: 66,  x1: 365, y1: 150 }
+  };
+  const p = paths[dir] || paths.c2s;
+  const t0 = performance.now();
+  const dur = 760;
+
+  if (window._pktRaf) cancelAnimationFrame(window._pktRaf);
+  pill.setAttribute("opacity", "1");
+
+  function frame(now) {
+    const raw = Math.min(1, (now - t0) / dur);
+    let t = raw;
+    let x, y;
+    if (p.bounce) {
+      if (raw < 0.5) {
+        const u = raw * 2;
+        x = p.x0 + (p.x1 - p.x0) * u;
+        y = p.y0;
+      } else {
+        const u = (raw - 0.5) * 2;
+        x = p.x1 + (p.x0 - p.x1) * u;
+        y = p.y0 + 26;
+      }
+    } else {
+      const ease = 1 - Math.pow(1 - t, 3);
+      x = p.x0 + (p.x1 - p.x0) * ease;
+      y = p.y0 + (p.y1 - p.y0) * ease;
+    }
+    pill.setAttribute("transform", `translate(${x.toFixed(1)}, ${y.toFixed(1)})`);
+    if (raw < 1) {
+      window._pktRaf = requestAnimationFrame(frame);
+    } else if (p.dropAtEnd) {
+      drop.setAttribute("opacity", "1");
+    }
+  }
+  window._pktRaf = requestAnimationFrame(frame);
+}
+
+function renderScenario() {
+  const sc = SCENARIOS[curMode];
+  const st = sc.steps[curStep];
+
+  // Mode tab active styling
+  document.querySelectorAll("#scenarioTabs .tab-btn").forEach(btn => {
+    btn.className = "tab-btn";
+    if (btn.dataset.mode === curMode) {
+      btn.classList.add("active-" + sc.accent);
+    }
+  });
+
+  // Attacker visibility
+  document.getElementById("attackerNode").setAttribute("opacity", sc.attacker ? "1" : "0.18");
+
+  // Step list
+  const listEl = document.getElementById("stepList");
+  listEl.innerHTML = "";
+  sc.steps.forEach((item, idx) => {
+    const div = document.createElement("div");
+    div.className = "step-item" + (idx === curStep ? " active" : "");
+    div.innerHTML = `<div class="step-num">${idx + 1}</div><div><div class="step-title">${item.title}</div><div class="step-desc">${item.desc}</div></div>`;
+    div.onclick = () => { stopAutoPlay(); curStep = idx; renderScenario(); };
+    listEl.appendChild(div);
+  });
+
+  // SVG node labels
+  setSvgText("lblCliState", st.cli);
+  setSvgText("lblCliExtra", st.cliEx);
+  setSvgText("lblDpiState", st.dpi);
+  setSvgText("lblDpiSub", st.dpiSub);
+  document.getElementById("dpiBox").setAttribute("stroke", st.dpiColor);
+  setSvgText("lblSrvState", st.srv);
+  setSvgText("lblSrvExtra", st.srvEx);
+  setSvgText("ribbonBadge", `[${curStep + 1}/${sc.steps.length}]`);
+  setSvgText("ribbonTitle", st.title);
+  setSvgText("ribbonDesc", st.desc);
+
+  // Inspector
+  document.getElementById("inspHeader").textContent = `${sc.name} · 步骤 ${curStep + 1}`;
+  const vEl = document.getElementById("inspVerdict");
+  vEl.textContent = st.verdict;
+  vEl.className = "tag-pill " + st.verdictCls;
+  document.getElementById("kvProto").textContent = st.proto;
+  document.getElementById("kvHdr").textContent = st.hdr;
+  document.getElementById("kvDpi").textContent = st.dpiView;
+  document.getElementById("kvSec").textContent = st.secAct;
+  document.getElementById("inspHex").textContent = st.hex;
+  document.getElementById("inspNote").textContent = st.note;
+
+  animatePill(st.dir, st.pill, st.pillColor);
+}
+
+function stopAutoPlay() {
+  if (playTimer) { clearInterval(playTimer); playTimer = null; }
+  document.getElementById("btnPlay").textContent = "▶ 自动播放";
+}
+
+document.querySelectorAll("#scenarioTabs .tab-btn").forEach(btn => {
+  btn.onclick = () => { stopAutoPlay(); curMode = btn.dataset.mode; curStep = 0; renderScenario(); };
+});
+document.getElementById("btnPrev").onclick = () => {
+  stopAutoPlay();
+  const len = SCENARIOS[curMode].steps.length;
+  curStep = (curStep - 1 + len) % len;
+  renderScenario();
+};
+document.getElementById("btnNext").onclick = () => {
+  stopAutoPlay();
+  const len = SCENARIOS[curMode].steps.length;
+  curStep = (curStep + 1) % len;
+  renderScenario();
+};
+document.getElementById("btnPlay").onclick = () => {
+  if (playTimer) { stopAutoPlay(); return; }
+  document.getElementById("btnPlay").textContent = "⏸ 暂停播放";
+  playTimer = setInterval(() => {
+    const len = SCENARIOS[curMode].steps.length;
+    curStep = (curStep + 1) % len;
+    renderScenario();
+  }, 2400);
+};
+
+// ===================== SECTION 2: BYTE-LEVEL PACKET INSPECTOR =====================
+const PACKETS = {
+  srtp: {
+    showPadSim: true,
+    fields: [
+      {
+        off: "0", len: "1B", name: "V=2 P=0 X=1 CC=0", val: "0x90", tone: "tone-aad",
+        scope: "AEAD AAD (明文受完整认证)",
+        dpi: "标准 Chrome WebRTC 视频包头（含扩展头，无外部明文填充标志 P=0）。",
+        v31: "V3-H-03 关键修复：废弃 V2/V3 易暴露的 0xB0 (P=1) 外置填充，100% 对齐真实 Chrome 流量。"
+      },
+      {
+        off: "1", len: "1B", name: "M | Payload Type", val: "0x60 / 0xE0 (PT=96)", tone: "tone-aad",
+        scope: "AEAD AAD",
+        dpi: "动态视频负载类型 PT=96 (VP8/H.264)，每 33.33ms 帧窗口最多置一次 Marker M=1。",
+        v31: "V3-M-02 修复：消除小包突发连续打 M=1 的异常，遵循 30fps 视频帧语义。"
+      },
+      {
+        off: "2..3", len: "2B", name: "RTP Sequence", val: "0x0001 (+1/pkt)", tone: "tone-aad",
+        scope: "AEAD AAD + 64-bit Nonce 构造",
+        dpi: "单调递增的 16-bit 序列号（配合内部 32-bit ROC 组成 48-bit 防重放索引）。",
+        v31: "配合 64 包滑动防重放位图，既容忍公网乱序又彻底阻断重放攻击。"
+      },
+      {
+        off: "4..7", len: "4B", name: "90kHz Timestamp", val: "wall_90k (3000/帧)", tone: "tone-aad",
+        scope: "AEAD AAD",
+        dpi: "与真实系统时间严格同步的 90,000 Hz 墙钟斜率（每 33.33ms +3000）。",
+        v31: "V3-M-02 修复：采用 u64 墙钟消除 13.25h 截断回绕与突发 10x~33x 斜率暴涨。"
+      },
+      {
+        off: "8..11", len: "4B", name: "SSRC", val: "HKDF 随机 32-bit", tone: "tone-aad",
+        scope: "AEAD AAD + Nonce 域绑定",
+        dpi: "每会话客户端→服务端与服务端→客户端各自独立的随机媒体流标识符。",
+        v31: "由 STUN 鉴权阶段密钥派生，解包前先校验 SSRC 匹配，零成本过滤杂包。"
+      },
+      {
+        off: "12..19", len: "8B", name: "RFC 8285 0xBEDE Ext", val: "be de 00 01 [twcc/abs]", tone: "tone-aad",
+        scope: "AEAD AAD (8B 标准扩展)",
+        dpi: "Chrome 必带的 One-Byte Header Extension（模拟 abs-send-time / transport-cc）。",
+        v31: "与首字节 0x90 (X=1) 严丝合缝匹配，提升商业 DPI 协议置信度。"
+      },
+      {
+        off: "20..21", len: "2B", name: "inner_len (密文内)", val: "Enc(u16 BE)", tone: "tone-enc",
+        scope: "AEAD 密文内层（线上传输完全不可见）",
+        dpi: "DPI 只能看到均匀高熵密文，无法区分真实载荷与填充边界。",
+        v31: "受 MAX_INNER_UDP_LEN=65,400 严格保护，彻底消除 65507B 大包越界 panic。"
+      },
+      {
+        off: "22..N", len: "Var", name: "原始 UDP 载荷 (密文)", val: "Enc(Hysteria2 / WG)", tone: "tone-enc",
+        scope: "AEAD 密文主体",
+        dpi: "无法解析内层协议，外观等同于加密 VP8/H.264 视频帧负载。",
+        v31: "使用 Hybrid PFS 混合密钥加密（AES-128-GCM / ChaCha20-Poly1305 / BLAKE2b）。"
+      },
+      {
+        off: "N+1..", len: "0..31B", name: "内层随机填充 (密文)", val: "Enc(SplitMix64 pad)", tone: "tone-pad",
+        scope: "AEAD 密文内部填充（零明文泄露）",
+        dpi: "将 WireGuard 148B/92B 等尖锐包长尖峰打散覆盖全部 16 个 mod-16 桶。",
+        v31: "每会话 CSPRNG 种子 SplitMix64 生成，零 syscall 开销；>=1340B 自动缩至 0..7B 防分片。"
+      },
+      {
+        off: "Tail", len: "16B", name: "AEAD Auth Tag", val: "128-bit GCM/Poly1305", tone: "tone-auth",
+        scope: "全包完整性认证标签",
+        dpi: "标准 RFC 7714 AEAD_AES_128_GCM 16 字节认证尾（全套件统一长度）。",
+        v31: "任意 1 bit 篡改即认证失败静默丢弃，并绝不推进防重放滑动窗口。"
+      }
+    ]
+  },
+
+  stun: {
+    showPadSim: false,
+    fields: [
+      {
+        off: "0..1", len: "2B", name: "Message Type", val: "0x0001 Req / 0x0101 OK", tone: "tone-plain",
+        scope: "STUN 头部（前两位恒为 00）",
+        dpi: "RFC 5389 标准 STUN Binding Request / Success Response。",
+        v31: "首字节落入 RFC 7983 0..3 区间，用于第一时间命中运营商 WebRTC/STUN 白名单。"
+      },
+      {
+        off: "2..3", len: "2B", name: "Message Length", val: "4 字节严格对齐", tone: "tone-plain",
+        scope: "STUN 头部",
+        dpi: "记录 20B 头部之后所有属性总长度。",
+        v31: "解析器强制要求 20 + msg_len == data.len() 且 msg_len % 4 == 0，拒绝尾部垃圾。"
+      },
+      {
+        off: "4..7", len: "4B", name: "Magic Cookie", val: "0x2112A442", tone: "tone-plain",
+        scope: "RFC 5389 魔数",
+        dpi: "所有 DPI 识别 STUN 协议的核心固定魔数。",
+        v31: "客户端与服务端双向强校验。"
+      },
+      {
+        off: "8..19", len: "12B", name: "Transaction ID", val: "u32_ts ⊕ mask || tag", tone: "tone-auth",
+        scope: "隐蔽时间戳防重放锚点",
+        dpi: "外观呈均匀随机 96-bit 事务 ID（与随机掩码异或混淆）。",
+        v31: "服务端按 PSK 解出时间戳并校验 ±30s 新鲜度，跨日/过期重放包直接 Silent Drop。"
+      },
+      {
+        off: "20..", len: "Var", name: "ICE 属性簇", val: "USERNAME(4:4) + PRIO + USE-CAND", tone: "tone-aad",
+        scope: "受 HMAC-SHA1 完整保护",
+        dpi: "模拟真实 WebRTC ICE 提名检查（4:4 Base64 ufrag、ICE-CONTROLLING）；保活包不含 USE-CANDIDATE。",
+        v31: "NEW-M-01 修复：服务端仅允许带 USE-CANDIDATE 的提名请求建新会话，孤儿保活一律静默丢弃！"
+      },
+      {
+        off: "End-28", len: "24B", name: "MESSAGE-INTEGRITY", val: "0x0008 + 20B HMAC-SHA1", tone: "tone-auth",
+        scope: "PSK 双向身份鉴权",
+        dpi: "标准 RFC 5389 §15.4 完整性属性。",
+        v31: "V3-H-02 修复：强制断言 next_pos + 8 == end，MI 之后绝不允许夹带任何额外属性！"
+      },
+      {
+        off: "End-8", len: "8B", name: "FINGERPRINT", val: "0x8028 + CRC32^0x5354554E", tone: "tone-auth",
+        scope: "强制唯一尾属性",
+        dpi: "标准 RFC 5389 §15.5 魔数异或 CRC32 校验。",
+        v31: "必须位于报文绝对末尾且校验通过，缺省或提前出现均整包拒收。"
+      }
+    ]
+  },
+
+  dtls: {
+    showPadSim: false,
+    fields: [
+      {
+        off: "0", len: "1B", name: "ContentType", val: "20..=23 (CCS/Alert/HS/App)", tone: "tone-plain",
+        scope: "DTLS 1.2 Record Header",
+        dpi: "严格限定为标准 TLS 内容类型 0x14/0x15/0x16/0x17。",
+        v31: "V3-H-01 修复：收窄分流区间并拒绝 Epoch=0 明文 Alert 与 <18B 伪造加密 Alert。"
+      },
+      {
+        off: "1..2", len: "2B", name: "ProtocolVersion", val: "0xFEFD (DTLS 1.2)", tone: "tone-plain",
+        scope: "DTLS Record Header",
+        dpi: "标准 DTLS 1.2 版本号（首包 ClientHello 兼容 0xFEFF）。",
+        v31: "入口预校验过滤非法版本号，防旁路畸形包触发状态机异常。"
+      },
+      {
+        off: "3..4", len: "2B", name: "Epoch", val: "0x0000 (明文) → 0x0001 (加密)", tone: "tone-aad",
+        scope: "DTLS 纪元号",
+        dpi: "Flight 1~5 为 Epoch=0，ChangeCipherSpec 后切入 Epoch=1 加密握手与 Alert。",
+        v31: "Ready 期满 5s（服务端首包 SRTP 即刻）后仅放行 Epoch>=1 加密 close_notify Alert。"
+      },
+      {
+        off: "5..12", len: "8B", name: "Seq (6B) + Length (2B)", val: "严格精确边界校验", tone: "tone-aad",
+        scope: "DTLS Record 分帧",
+        dpi: "标准 DTLS 记录序列号与载荷长度，支持单数据报打包最多 16 条记录。",
+        v31: "NEW-L-01：Epoch>=1 记录强制要求 rec_len >= 18B（2B 载荷 + 16B AEAD Tag）。"
+      },
+      {
+        off: "13..", len: "Var", name: "6-Flight 完整握手体", val: "CH(3 suites) ⇄ HVR ⇄ Cert(P-256) ⇄ Fin", tone: "tone-enc",
+        scope: "由 dimpl 0.9.0 完整驱动",
+        dpi: "真 Cookie 挑战 + 真 ECDHE P-256 签名 + 无扩展 CN=WebRTC 证书（50/50 High-S/Low-S）。",
+        v31: "V3-H-05 & V3-M-01：全平台 3 套件 ClientHello + msg_seq==1 绑定 + 20~24h 证书缓存。"
+      },
+      {
+        off: "Export", len: "64B", name: "RFC 5764 KeyingMaterial", val: "EXTRACTOR-dtls_srtp", tone: "tone-auth",
+        scope: "内部导出（不上线传输）",
+        dpi: "完全驻留内存，与 PSK STUN 密钥做 SHA-256 混合生成最终前向安全主密钥。",
+        v31: "确保任何历史抓包即便未来 PSK 泄露也无法回溯解密。"
+      }
+    ]
+  },
+
+  srtcp: {
+    showPadSim: false,
+    fields: [
+      {
+        off: "0", len: "1B", name: "V=2 P=0 RC", val: "0x80 (RC=0) / 0x81 (RC=1)", tone: "tone-aad",
+        scope: "SRTCP 明文头 (RFC 7714 §9.1)",
+        dpi: "无收包时真实报 RC=0，收到媒体包后自动切为 RC=1，严格匹配包长字段。",
+        v31: "V3-H-04 修复：彻底消除零流量却虚报 RC=1 的逻辑漏洞。"
+      },
+      {
+        off: "1", len: "1B", name: "Packet Type (PT)", val: "恒为 200 (SR) 或 201 (RR)", tone: "tone-aad",
+        scope: "SRTCP 明文头",
+        dpi: "RFC 3550 §6.1 强制规定复合 RTCP 首包只能是 SR(200) 或 RR(201)，绝不可是 BYE(203)。",
+        v31: "V3-H-04 核心修复：退场 BYE(203) 移至加密复合体尾部，线上明文 100% 合规！"
+      },
+      {
+        off: "2..3", len: "2B", name: "Primary Length", val: "12 / 6 (SR) · 7 / 1 (RR)", tone: "tone-aad",
+        scope: "SRTCP 明文头",
+        dpi: "32-bit 字长减一，与 RC=0/1 对应的 52B/28B/32B/8B 字节级精确吻合。",
+        v31: "通过 Wireshark / 严格 RFC 3550 解析器校验零报错。"
+      },
+      {
+        off: "4..7", len: "4B", name: "Sender SSRC", val: "与 SRTP 流一致的 SSRC", tone: "tone-aad",
+        scope: "SRTCP 明文头 + Nonce 绑定",
+        dpi: "标识该控制报告归属的媒体发送源。",
+        v31: "Nonce 首字节为 dir | 0x80，与 SRTP Nonce 空间 100% 数学隔离。"
+      },
+      {
+        off: "8..N", len: "Var", name: "加密复合体 (SR/RR+SDES+FB+BYE)", val: "Enc(NTP + SDES 202 + FB 205/206 + BYE 203)", tone: "tone-enc",
+        scope: "AEAD 密文体",
+        dpi: "仅暴露前 8B 明文头，其余 SR/RR 字段、SDES CNAME、随机 REMB/TWCC 反馈及退场 BYE 全程加密。",
+        v31: "收到合法认证的加密 BYE 后，对端进入 Closing(250ms) 优雅排空退出。"
+      },
+      {
+        off: "Tail-20", len: "16B", name: "Unified Auth Tag", val: "16B AEAD / Blake2bMac<U16>", tone: "tone-auth",
+        scope: "全套件统一 16 字节认证标签",
+        dpi: "无论是 AES-GCM、ChaCha20 还是 BLAKE2b，均统一输出 16B 标签，无长度侧信道。",
+        v31: "V3-H-04 修复：抹平不同套件 SRTCP 包尾长度差异。"
+      },
+      {
+        off: "Tail-4", len: "4B", name: "E-bit | SRTCP Index", val: "0x80000000 | idx(31-bit)", tone: "tone-auth",
+        scope: "AEAD AAD + 64-bit 防重放索引",
+        dpi: "最高位 E=1 表示已加密，低 31 位为单调递增 SRTCP 索引。",
+        v31: "V3-L-03：内置 64-bit 滑动窗口防重放，重放的 BYE 包无法关闭活跃会话。"
+      }
+    ]
+  }
+};
+
+let curPkt = "srtp";
+let curFieldIdx = 0;
+
+function renderPacket() {
+  const pk = PACKETS[curPkt];
+  document.querySelectorAll("#pktTabs .tab-btn").forEach(btn => {
+    btn.className = "tab-btn" + (btn.dataset.pkt === curPkt ? " active-cyan" : "");
+  });
+
+  const grid = document.getElementById("byteGrid");
+  grid.innerHTML = "";
+  pk.fields.forEach((f, idx) => {
+    const el = document.createElement("div");
+    el.className = `field-block ${f.tone}` + (idx === curFieldIdx ? " selected" : "");
+    el.innerHTML = `
+      <div class="fb-top"><span>@${f.off}</span><span>${f.len}</span></div>
+      <div class="fb-name">${f.name}</div>
+      <div class="fb-val">${f.val}</div>
+    `;
+    el.onclick = () => { curFieldIdx = idx; renderPacket(); };
+    grid.appendChild(el);
+  });
+
+  const sel = pk.fields[curFieldIdx] || pk.fields[0];
+  document.getElementById("fieldDetail").innerHTML = `
+    <h4>${sel.name}</h4>
+    <div class="meta-row">
+      <span class="tag-pill">偏移: ${sel.off}</span>
+      <span class="tag-pill">长度: ${sel.len}</span>
+      <span class="tag-pill pass">${sel.scope}</span>
+    </div>
+    <div class="wire-hex" style="margin-bottom:10px">${sel.val}</div>
+    <div class="sec"><strong>DPI / Wireshark 线上视角</strong>${sel.dpi}</div>
+    <div class="sec"><strong>V3.1 工程安全加固点</strong>${sel.v31}</div>
+  `;
+
+  document.getElementById("padSimBox").style.display = pk.showPadSim ? "block" : "none";
+}
+
+document.querySelectorAll("#pktTabs .tab-btn").forEach(btn => {
+  btn.onclick = () => { curPkt = btn.dataset.pkt; curFieldIdx = 0; renderPacket(); };
+});
+
+// Interactive AEAD inner padding simulator
+function runPadSim() {
+  const orig = parseInt(document.getElementById("rngOrigLen").value, 10);
+  document.getElementById("lblOrigLen").textContent = orig;
+  const maxPad = orig >= 1340 ? 7 : 31;
+  const buckets = new Array(16).fill(0);
+  let minW = 99999, maxW = 0;
+  for (let i = 0; i < 64; i++) {
+    const pad = Math.floor(Math.random() * (maxPad + 1));
+    const wire = 20 + 2 + orig + pad + 16; // 20B SRTP+BEDE + 2B inner_len + orig + pad + 16B tag
+    buckets[wire % 16]++;
+    if (wire < minW) minW = wire;
+    if (wire > maxW) maxW = wire;
+  }
+  const maxB = Math.max(1, ...buckets);
+  const covered = buckets.filter(c => c > 0).length;
+  const hist = document.getElementById("padHist");
+  hist.innerHTML = "";
+  buckets.forEach((cnt, b) => {
+    const col = document.createElement("div");
+    col.className = "hist-col";
+    const h = Math.round((cnt / maxB) * 58) + (cnt > 0 ? 4 : 0);
+    col.innerHTML = `<div class="hist-bar" style="height:${h}px;opacity:${cnt > 0 ? 1 : 0.15}" title="mod 16 = ${b}: ${cnt} 包"></div><div class="hist-lbl">${b}</div>`;
+    hist.appendChild(col);
+  });
+  document.getElementById("padSummary").innerHTML =
+    `当前规则：原始负载 <code>${orig}B</code> → 内层填充范围 <code>0..=${maxPad}B</code> ${orig >= 1340 ? '<span style="color:#fcd34d">(已自动收窄防 PPPoE 1492B 分片)</span>' : '(全范围打散模长模态)'} · 线上总长分布 <code>${minW}B ~ ${maxW}B</code> · 首字节恒为 <code>0x90 (P=0)</code>`;
+  document.getElementById("padModStats").textContent =
+    `覆盖 ${covered}/16 个 mod-16 桶 · 最大 IP 包 ${maxW + 28}B ${maxW + 28 <= 1492 ? '(≤1492 PPPoE 零分片 ✓)' : ''}`;
+}
+
+document.getElementById("rngOrigLen").oninput = runPadSim;
+document.getElementById("btnSimPad").onclick = runPadSim;
+document.getElementById("btnPresetWG").onclick = () => { document.getElementById("rngOrigLen").value = 148; runPadSim(); };
+document.getElementById("btnPresetHy2").onclick = () => { document.getElementById("rngOrigLen").value = 1200; runPadSim(); };
+
+// Initial render
+renderScenario();
+renderPacket();
+runPadSim();
+</script>
+</body>
+</html>

@@ -1,0 +1,23 @@
+# Build outputs
+/webrtc-cloak-rs/target/
+*.rs.bk
+
+# Secrets & local keys (NEVER commit)
+*.psk
+*.key
+*.pem
+*.der
+.env
+.env.*
+
+# Logs & captures
+*.log
+*.pcap
+*.pcapng
+*.audit
+
+# OS / Editor metadata
+.DS_Store
+._*
+.idea/
+.vscode/
