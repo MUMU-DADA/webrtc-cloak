@@ -11,8 +11,7 @@ use crate::server::{run_server, ServerConfig};
 use std::env;
 use std::net::{SocketAddr, UdpSocket};
 use std::process;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
+use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
 
 fn parse_workers(s: &str) -> usize {
@@ -141,19 +140,14 @@ fn run_bench(count: usize, payload_bytes: usize, suite: CipherSuite) {
 fn run_sink(listen: &str, workers: usize) {
     let workers = workers.max(1);
     let addr: SocketAddr = listen.parse().expect("sink addr");
-    let cnt = Arc::new(AtomicU64::new(0));
-    let bytes = Arc::new(AtomicU64::new(0));
+    // (cnt, bytes, first_ns, last_ns) — Mutex avoids AtomicU64 for 32-bit targets like armv5te
+    let stats = Arc::new(Mutex::new((0u64, 0u64, 0u64, 0u64)));
     let start_epoch = Instant::now();
-    let first_ns = Arc::new(AtomicU64::new(0));
-    let last_ns = Arc::new(AtomicU64::new(0));
 
     println!("[sink-rs] listening on {} (workers={})", listen, workers);
 
     let spawn_one = |reuse: bool| {
-        let cnt = Arc::clone(&cnt);
-        let bytes = Arc::clone(&bytes);
-        let first_ns = Arc::clone(&first_ns);
-        let last_ns = Arc::clone(&last_ns);
+        let stats = Arc::clone(&stats);
         move || {
             let s = socket2::Socket::new(
                 socket2::Domain::IPV4,
@@ -181,30 +175,24 @@ fn run_sink(listen: &str, workers: usize) {
                 let pkt = &buf[..n];
                 if pkt.starts_with(b"SINK:") {
                     let ns = start_epoch.elapsed().as_nanos() as u64;
-                    let _ = first_ns.compare_exchange(0, ns, Ordering::Relaxed, Ordering::Relaxed);
-                    last_ns.store(ns, Ordering::Relaxed);
-                    cnt.fetch_add(1, Ordering::Relaxed);
-                    bytes.fetch_add(n as u64, Ordering::Relaxed);
+                    let mut st = stats.lock().unwrap();
+                    if st.2 == 0 {
+                        st.2 = ns;
+                    }
+                    st.3 = ns;
+                    st.0 += 1;
+                    st.1 += n as u64;
                 } else if pkt.starts_with(b"RESET") {
-                    cnt.store(0, Ordering::Relaxed);
-                    bytes.store(0, Ordering::Relaxed);
-                    first_ns.store(0, Ordering::Relaxed);
-                    last_ns.store(0, Ordering::Relaxed);
+                    *stats.lock().unwrap() = (0, 0, 0, 0);
                     let _ = sock.send_to(b"RESET_OK", peer);
                 } else if pkt.starts_with(b"STAT") {
-                    let f = first_ns.load(Ordering::Relaxed);
-                    let l = last_ns.load(Ordering::Relaxed);
+                    let (c, b, f, l) = *stats.lock().unwrap();
                     let dur = if f > 0 && l > f {
                         ((l - f) as f64) / 1e9
                     } else {
                         0.000_001
                     };
-                    let msg = format!(
-                        "STAT:{}:{}:{:.6}",
-                        cnt.load(Ordering::Relaxed),
-                        bytes.load(Ordering::Relaxed),
-                        dur
-                    );
+                    let msg = format!("STAT:{}:{}:{:.6}", c, b, dur);
                     let _ = sock.send_to(msg.as_bytes(), peer);
                 } else {
                     let _ = sock.send_to(pkt, peer);
