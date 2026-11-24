@@ -302,18 +302,6 @@ impl TelemetryInner {
         }
         let unauth_drops_last_10m: u64 = self.unauth_deltas_10m.iter().map(|&(_, d)| d).sum();
 
-        // Update smoothed Mbps rate when >= 500ms has elapsed
-        let dt_s = now.saturating_duration_since(self.rate_prev_at).as_secs_f64();
-        if dt_s >= 0.5 {
-            let dtx = tx_bytes_total.saturating_sub(self.rate_prev_tx_bytes);
-            let drx = rx_bytes_total.saturating_sub(self.rate_prev_rx_bytes);
-            self.tx_mbps = (dtx as f64 * 8.0) / dt_s / 1_000_000.0;
-            self.rx_mbps = (drx as f64 * 8.0) / dt_s / 1_000_000.0;
-            self.rate_prev_at = now;
-            self.rate_prev_tx_bytes = tx_bytes_total;
-            self.rate_prev_rx_bytes = rx_bytes_total;
-        }
-
         let stun_loss_pct = if self.stun_outcomes.is_empty() {
             0.0
         } else {
@@ -734,12 +722,33 @@ impl TelemetryHub {
     }
 
     /// Push a worker's periodic counter snapshot (called every `interval`, NEVER per data packet).
+    /// Throughput rates (`tx_mbps` / `rx_mbps`) are computed ONLY here when fresh worker byte
+    /// counters arrive, so read-only `/status` or `/metrics` scrapes between ticks never zero them.
     pub fn update_worker(&self, worker_id: usize, snap: WorkerSnapshot) {
         if let Ok(mut g) = self.inner.lock() {
             if worker_id >= g.workers.len() {
                 g.workers.resize_with(worker_id + 1, WorkerSnapshot::default);
             }
             g.workers[worker_id] = snap;
+            let now = Instant::now();
+            let total_tx: u64 = g
+                .workers
+                .iter()
+                .fold(0u64, |acc, w| acc.saturating_add(w.tx_bytes_total));
+            let total_rx: u64 = g
+                .workers
+                .iter()
+                .fold(0u64, |acc, w| acc.saturating_add(w.rx_bytes_total));
+            let dt_s = now.saturating_duration_since(g.rate_prev_at).as_secs_f64();
+            if dt_s >= 0.5 {
+                let dtx = total_tx.saturating_sub(g.rate_prev_tx_bytes);
+                let drx = total_rx.saturating_sub(g.rate_prev_rx_bytes);
+                g.tx_mbps = (dtx as f64 * 8.0) / dt_s / 1_000_000.0;
+                g.rx_mbps = (drx as f64 * 8.0) / dt_s / 1_000_000.0;
+                g.rate_prev_at = now;
+                g.rate_prev_tx_bytes = total_tx;
+                g.rate_prev_rx_bytes = total_rx;
+            }
         }
         self.flush_file_if_needed(true);
     }
@@ -922,6 +931,33 @@ mod tests {
 
         let r_405 = http_get("POST /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
         assert!(r_405.starts_with("HTTP/1.1 405 Method Not Allowed"));
+
+        // 3b. Read-only scrapes between worker ticks MUST preserve non-zero tx_mbps / rx_mbps!
+        thread::sleep(Duration::from_millis(550));
+        hub.update_worker(
+            0,
+            WorkerSnapshot {
+                active_sessions: 1,
+                tx_bytes_total: 600_000,
+                rx_bytes_total: 2_500_000,
+                tx_pkts_total: 600,
+                rx_pkts_total: 2000,
+                active_up_sport: 45678,
+                dtls_version: "1.3",
+                cipher: "aes-128-gcm",
+                dual_ssrc: true,
+                ..Default::default()
+            },
+        );
+        thread::sleep(Duration::from_millis(550));
+        let r_rate1 = http_get("GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let b_rate1 = r_rate1.split_once("\r\n\r\n").unwrap().1;
+        let vr1: serde_json::Value = serde_json::from_str(b_rate1).unwrap();
+        assert!(vr1["link"]["rx_mbps"].as_f64().unwrap() > 10.0);
+        let r_rate2 = http_get("GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+        let b_rate2 = r_rate2.split_once("\r\n\r\n").unwrap().1;
+        let vr2: serde_json::Value = serde_json::from_str(b_rate2).unwrap();
+        assert_eq!(vr1["link"]["rx_mbps"], vr2["link"]["rx_mbps"]);
 
         // 4. Two blackholes in 10m -> critical -> /healthz returns 503!
         hub.record_blackhole(3, "bh#1".to_string());
