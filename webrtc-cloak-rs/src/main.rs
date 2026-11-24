@@ -2,6 +2,7 @@ mod client;
 mod protocol;
 mod selftest;
 mod server;
+mod telemetry;
 
 use crate::client::{run_client, ClientConfig};
 use crate::protocol::{
@@ -11,6 +12,7 @@ use crate::protocol::{
 };
 use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
+use crate::telemetry::TelemetryConfig;
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
@@ -74,8 +76,8 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
-         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
          webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--no-color] [--json]"
@@ -600,6 +602,7 @@ fn main() {
             let mut keepalive_secs: u64 = 5; // RFC 7675 §5.1 Consent Freshness (5s ± 20%)
             let mut idle_timeout_secs: u64 = 120;
             let mut stats_interval_secs: u64 = 10;
+            let mut telemetry = TelemetryConfig::default();
 
             let mut i = 2;
             while i < args.len() {
@@ -623,6 +626,15 @@ fn main() {
                     "--keepalive" => { i += 1; keepalive_secs = args[i].parse().unwrap(); }
                     "--idle-timeout" => { i += 1; idle_timeout_secs = args[i].parse().unwrap(); }
                     "--stats-interval" => { i += 1; stats_interval_secs = args[i].parse().unwrap(); }
+                    "--status-file" => { i += 1; telemetry.status_file = Some(args[i].clone()); }
+                    "--status-http" => {
+                        i += 1;
+                        telemetry.status_http = Some(args[i].parse().unwrap_or_else(|_| {
+                            eprintln!("Invalid --status-http address: {} (expected IP:PORT, e.g. 127.0.0.1:19544)", args[i]);
+                            process::exit(2);
+                        }));
+                    }
+                    "--status-interval" => { i += 1; telemetry.status_interval_secs = args[i].parse().unwrap(); }
                     other => { eprintln!("Unknown flag: {}", other); usage(); }
                 }
                 i += 1;
@@ -657,6 +669,7 @@ fn main() {
                 keepalive_secs,
                 idle_timeout_secs,
                 stats_interval_secs,
+                telemetry,
                 quiet: false,
                 stop: Some(stop),
             }) {
@@ -680,6 +693,7 @@ fn main() {
             let mut idle_timeout_secs: u64 = 120;
             let mut stats_interval_secs: u64 = 10;
             let mut wire_audit_file: Option<String> = None;
+            let mut telemetry = TelemetryConfig::default();
 
             let mut i = 2;
             while i < args.len() {
@@ -699,6 +713,15 @@ fn main() {
                     "--idle-timeout" => { i += 1; idle_timeout_secs = args[i].parse().unwrap(); }
                     "--stats-interval" => { i += 1; stats_interval_secs = args[i].parse().unwrap(); }
                     "--wire-audit-file" => { i += 1; wire_audit_file = Some(args[i].clone()); }
+                    "--status-file" => { i += 1; telemetry.status_file = Some(args[i].clone()); }
+                    "--status-http" => {
+                        i += 1;
+                        telemetry.status_http = Some(args[i].parse().unwrap_or_else(|_| {
+                            eprintln!("Invalid --status-http address: {} (expected IP:PORT, e.g. 127.0.0.1:19644)", args[i]);
+                            process::exit(2);
+                        }));
+                    }
+                    "--status-interval" => { i += 1; telemetry.status_interval_secs = args[i].parse().unwrap(); }
                     other => { eprintln!("Unknown flag: {}", other); usage(); }
                 }
                 i += 1;
@@ -723,6 +746,7 @@ fn main() {
                 idle_timeout_secs,
                 stats_interval_secs,
                 wire_audit_file,
+                telemetry,
                 quiet: false,
                 stop: Some(stop),
             }) {

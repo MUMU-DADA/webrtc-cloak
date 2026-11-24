@@ -25,6 +25,7 @@ use crate::protocol::{
     STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS,
 };
 use crate::server::{run_server, ServerConfig};
+use crate::telemetry::TelemetryConfig;
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
@@ -631,6 +632,7 @@ impl ManagedServer {
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(stop_c),
             });
@@ -696,6 +698,7 @@ impl ManagedClient {
                 keepalive_secs,
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(stop_c),
             });

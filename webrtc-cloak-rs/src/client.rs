@@ -20,6 +20,7 @@ use crate::protocol::{
     DtlsMinVersion, PacketKind, RollingByteWindow, SessionIceParams, SrtpCloakCipher, SrtpFrame,
     MAX_INNER_UDP_LEN, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS,
 };
+use crate::telemetry::{TelemetryConfig, TelemetryHub, WorkerSnapshot};
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -81,6 +82,7 @@ pub struct ClientConfig {
     pub keepalive_secs: u64,
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
+    pub telemetry: TelemetryConfig,
     pub quiet: bool,
     pub stop: Option<Arc<AtomicBool>>,
 }
@@ -147,6 +149,7 @@ struct ClientSession {
     ka_retries: u8,
     ka_max_retries: u8,
     ka_rto_at: Option<Instant>,
+    ka_sent_at: Option<Instant>,
     /// V4 1-RTT ICE path migration state & loss-resilient 0xFFFD response echo
     mig_txid: Option<[u8; 12]>,
     mig_retries: u8,
@@ -489,6 +492,14 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
     let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, true, cfg.wan_mtu);
+    let telemetry = TelemetryHub::start(
+        "client",
+        &cfg.telemetry,
+        workers,
+        cfg.wan_mtu,
+        cfg.quiet,
+        cfg.stop.clone(),
+    );
     if !cfg.quiet {
         println!(
             "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs)",
@@ -505,22 +516,30 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     }
 
     if workers == 1 {
-        return run_client_worker(0, cfg, false, dtls_pool);
+        let res = run_client_worker(0, cfg, false, dtls_pool, telemetry.clone());
+        if let Some(ref th) = telemetry {
+            th.shutdown();
+        }
+        return res;
     }
 
     let mut handles = Vec::with_capacity(workers - 1);
     for wid in 1..workers {
         let c = cfg.clone();
         let dp = dtls_pool.clone();
+        let tel = telemetry.clone();
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_client_worker(wid, c, true, dp) {
+            if let Err(e) = run_client_worker(wid, c, true, dp, tel) {
                 eprintln!("[client-rs#{}] error: {}", wid, e);
             }
         }));
     }
-    let res = run_client_worker(0, cfg, true, dtls_pool);
+    let res = run_client_worker(0, cfg, true, dtls_pool, telemetry.clone());
     for h in handles {
         let _ = h.join();
+    }
+    if let Some(ref th) = telemetry {
+        th.shutdown();
     }
     res
 }
@@ -677,6 +696,7 @@ fn spawn_client_session(
         ka_retries: 0,
         ka_max_retries,
         ka_rto_at: None,
+        ka_sent_at: None,
         mig_txid: None,
         mig_retries: 0,
         mig_retry_at: None,
@@ -725,6 +745,7 @@ fn run_client_worker(
     cfg: ClientConfig,
     reuse_port: bool,
     dtls_pool: DtlsConfigPool,
+    telemetry: Option<Arc<TelemetryHub>>,
 ) -> std::io::Result<()> {
     CLIENT_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
@@ -772,6 +793,16 @@ fn run_client_worker(
     let idle_dur = Duration::from_secs(cfg.idle_timeout_secs);
     let stats_dur = Duration::from_secs(cfg.stats_interval_secs);
     let mut last_stats = Instant::now();
+    let telemetry_dur = telemetry
+        .as_ref()
+        .map(|th| th.interval())
+        .unwrap_or(Duration::from_secs(5));
+    let mut last_telemetry = Instant::now();
+    let mut closed_tx_bytes: u64 = 0;
+    let mut closed_rx_bytes: u64 = 0;
+    let mut closed_tx_pkts: u64 = 0;
+    let mut closed_rx_pkts: u64 = 0;
+    let mut closed_auth_drops: u64 = 0;
 
     loop {
         if let Some(ref s) = cfg.stop {
@@ -1232,6 +1263,7 @@ fn run_client_worker(
                                         // Retransmit the EXACT same STUN transaction (same txid) with
                                         // jittered exponential RTO backoff matching RFC 5389 / libwebrtc.
                                         let _ = sess.upstream.send(&sess.ka_pkt);
+                                        sess.ka_sent_at = Some(now);
                                         let next_rto = if sess.ka_retries == 1 {
                                             rand_duration_range_ms(1400, 1800)
                                         } else {
@@ -1239,6 +1271,12 @@ fn run_client_worker(
                                         };
                                         sess.ka_rto_at = Some(now + next_rto);
                                     } else {
+                                        if let Some(ref th) = telemetry {
+                                            th.record_blackhole(
+                                                sess.ka_max_retries + 1,
+                                                format!("up_sport={}", sess.local_port),
+                                            );
+                                        }
                                         let active_recently = now.duration_since(sess.last_data_active)
                                             <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                         if active_recently
@@ -1306,6 +1344,7 @@ fn run_client_worker(
                             sess.ka_txid = Some(txid);
                             sess.ka_pkt = pkt;
                             sess.ka_retries = 0;
+                            sess.ka_sent_at = Some(now);
                             sess.ka_rto_at = Some(now + rand_duration_range_ms(950, 1250));
                         } else {
                             let rem = sess.next_keepalive_at.saturating_duration_since(now);
@@ -1546,6 +1585,11 @@ fn run_client_worker(
 
         for (tok, reason) in to_close {
             if let Some(mut sess) = sessions_by_token.remove(&tok) {
+                closed_tx_bytes = closed_tx_bytes.saturating_add(sess.tx_bytes);
+                closed_rx_bytes = closed_rx_bytes.saturating_add(sess.rx_bytes);
+                closed_tx_pkts = closed_tx_pkts.saturating_add(sess.tx_pkts);
+                closed_rx_pkts = closed_rx_pkts.saturating_add(sess.rx_pkts);
+                closed_auth_drops = closed_auth_drops.saturating_add(sess.auth_drops);
                 let _ = poll.registry().deregister(&mut sess.upstream);
                 // P2-1: Shrink any remaining old_path_drains owned by a normally closed session to free 2MB socket FDs promptly
                 let drain_cap = now + Duration::from_millis(CLOSING_DRAIN_MS);
@@ -1591,6 +1635,9 @@ fn run_client_worker(
             }
         }
 
+        if telemetry.is_some() && wait > telemetry_dur {
+            wait = telemetry_dur;
+        }
         if cfg.stop.is_some() && cfg.quiet && wait > Duration::from_millis(20) {
             wait = Duration::from_millis(20);
         }
@@ -1823,6 +1870,13 @@ fn run_client_worker(
                                 if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
                                     if sess.state == HandshakeState::StunWait && parsed.txid == sess.stun_txid {
                                         let rtt_ms = sess.created_at.elapsed().as_secs_f64() * 1000.0;
+                                        if let Some(ref th) = telemetry {
+                                            th.record_stun_ok(
+                                                rtt_ms,
+                                                sess.retries.min(255) as u8,
+                                                parsed.xor_mapped.map(SocketAddr::V4),
+                                            );
+                                        }
                                         let uname = sess.ice.username();
                                         let (stun_key, s_c2s, s_s2c) =
                                             derive_stun_material(&cfg.psk, &sess.stun_txid, &uname);
@@ -1921,10 +1975,22 @@ fn run_client_worker(
                                     } else if sess.state == HandshakeState::Ready
                                         && sess.ka_txid == Some(parsed.txid)
                                     {
+                                        if let Some(ref th) = telemetry {
+                                            let ka_rtt = sess
+                                                .ka_sent_at
+                                                .map(|t| now.saturating_duration_since(t).as_secs_f64() * 1000.0)
+                                                .unwrap_or(0.0);
+                                            th.record_stun_ok(
+                                                ka_rtt,
+                                                sess.ka_retries,
+                                                parsed.xor_mapped.map(SocketAddr::V4),
+                                            );
+                                        }
                                         sess.keepalives_ok += 1;
                                         sess.ka_txid = None;
                                         sess.ka_pkt.clear();
                                         sess.ka_retries = 0;
+                                        sess.ka_sent_at = None;
                                         sess.ka_rto_at = None;
                                         let in_trickle = is_client_in_trickle(sess, now);
                                         sess.next_keepalive_at = now
@@ -2193,6 +2259,12 @@ fn run_client_worker(
                                                             sess.local_port, flushed
                                                         ),
                                                     );
+                                                    if let Some(ref th) = telemetry {
+                                                        th.record_migration_1rtt(format!(
+                                                            "up_sport={} flushed={}",
+                                                            sess.local_port, flushed
+                                                        ));
+                                                    }
                                                 }
                                             }
                                         } else if pn >= 9 && wbuf[0] == 0x03 {
@@ -2361,6 +2433,12 @@ fn run_client_worker(
                                     bye_delay.as_secs_f64()
                                 ),
                             );
+                            if let Some(ref th) = telemetry {
+                                th.record_mbb_rotation(format!(
+                                    "{}->{}",
+                                    old_sess.local_port, new_port
+                                ));
+                            }
                             old_sess.ka_txid = None;
                             old_sess.ka_pkt.clear();
                             old_sess.ka_retries = 0;
@@ -2393,6 +2471,9 @@ fn run_client_worker(
                         jitter.as_millis()
                     ),
                 );
+                if let Some(ref th) = telemetry {
+                    th.record_graceful_reconnect(format!("jitter_ms={}", jitter.as_millis()));
+                }
                 pending_reconnects
                     .entry(client_addr)
                     .or_insert_with(|| PendingReconnect {
@@ -2400,6 +2481,72 @@ fn run_client_worker(
                         pending: VecDeque::with_capacity(32),
                         pending_bytes: 0,
                     });
+            }
+        }
+
+        if let Some(ref th) = telemetry {
+            if now.duration_since(last_telemetry) >= telemetry_dur {
+                last_telemetry = now;
+                let mut snap = WorkerSnapshot {
+                    tx_bytes_total: closed_tx_bytes,
+                    rx_bytes_total: closed_rx_bytes,
+                    tx_pkts_total: closed_tx_pkts,
+                    rx_pkts_total: closed_rx_pkts,
+                    auth_drops_total: closed_auth_drops,
+                    dtls_version: "none",
+                    cipher: "none",
+                    ..Default::default()
+                };
+                for sess in sessions_by_token.values() {
+                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+                    match sess.state {
+                        HandshakeState::Ready if !sess.is_standby => {
+                            snap.active_sessions += 1;
+                            if snap.active_up_sport == 0 {
+                                snap.active_up_sport = sess.local_port;
+                            }
+                            if snap.cipher == "none" {
+                                if let Some(c) = sess.active_cipher {
+                                    snap.cipher = c.name();
+                                }
+                            }
+                            if snap.dtls_version == "none" {
+                                snap.dtls_version = match sess
+                                    .dtls
+                                    .as_ref()
+                                    .and_then(|d| d.protocol_version())
+                                {
+                                    Some(ProtocolVersion::DTLS1_3) => {
+                                        snap.dual_ssrc = true;
+                                        "1.3"
+                                    }
+                                    Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                    _ if cfg.dtls_decoy => "1.3",
+                                    _ => "none",
+                                };
+                            }
+                        }
+                        HandshakeState::Migrating => {
+                            snap.migrating_sessions += 1;
+                            if snap.active_up_sport == 0 {
+                                snap.active_up_sport = sess.local_port;
+                            }
+                        }
+                        HandshakeState::StunWait
+                        | HandshakeState::DtlsHandshake
+                        | HandshakeState::HandoverWait
+                            if !sess.is_standby =>
+                        {
+                            snap.handshaking_sessions += 1;
+                        }
+                        _ => {}
+                    }
+                }
+                th.update_worker(worker_id, snap);
             }
         }
 
@@ -2442,8 +2589,20 @@ mod tests {
     use std::thread;
 
     fn reserve_free_port() -> u16 {
-        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
-        s.local_addr().unwrap().port()
+        use std::collections::HashSet;
+        use std::sync::{Mutex, OnceLock};
+        static USED: OnceLock<Mutex<HashSet<u16>>> = OnceLock::new();
+        let used = USED.get_or_init(|| Mutex::new(HashSet::new()));
+        let mut guard = used.lock().unwrap();
+        let mut held = Vec::new();
+        loop {
+            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let p = s.local_addr().unwrap().port();
+            if guard.insert(p) {
+                return p;
+            }
+            held.push(s);
+        }
     }
 
     #[test]
@@ -2481,6 +2640,7 @@ mod tests {
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: false,
                 stop: None,
             });
@@ -2602,6 +2762,7 @@ mod tests {
                 keepalive_secs: 1,
                 idle_timeout_secs: 120,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: false,
                 stop: None,
             });
@@ -2722,6 +2883,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -2781,6 +2943,7 @@ mod tests {
                 keepalive_secs: 5,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -2851,6 +3014,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(stop1_c),
             });
@@ -2909,6 +3073,7 @@ mod tests {
                 keepalive_secs: 30,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -2956,6 +3121,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3014,6 +3180,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3071,6 +3238,7 @@ mod tests {
                 keepalive_secs: 30,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3176,6 +3344,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3249,6 +3418,7 @@ mod tests {
                 keepalive_secs: 30,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3386,6 +3556,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3443,6 +3614,7 @@ mod tests {
                 keepalive_secs: 30,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3556,6 +3728,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3622,6 +3795,7 @@ mod tests {
                 keepalive_secs: 1,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: None,
             });
@@ -3783,6 +3957,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(s_stop),
             });
@@ -3879,6 +4054,7 @@ mod tests {
                 keepalive_secs: 1,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(c_stop),
             });
@@ -4071,6 +4247,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(s_stop),
             });
@@ -4190,6 +4367,7 @@ mod tests {
                 keepalive_secs: 5,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(c_stop),
             });
@@ -4323,6 +4501,7 @@ mod tests {
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(s_stop),
             });
@@ -4385,6 +4564,7 @@ mod tests {
                 keepalive_secs: 1,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(c_stop),
             });
@@ -4511,6 +4691,7 @@ mod tests {
                     idle_timeout_secs: 60,
                     stats_interval_secs: 3600,
                     wire_audit_file: None,
+                    telemetry: TelemetryConfig::default(),
                     quiet: true,
                     stop: Some(s_stop),
                 });
@@ -4610,6 +4791,7 @@ mod tests {
                     keepalive_secs: 1,
                     idle_timeout_secs: 60,
                     stats_interval_secs: 3600,
+                    telemetry: TelemetryConfig::default(),
                     quiet: true,
                     stop: Some(c_stop),
                 });
@@ -4709,6 +4891,7 @@ mod tests {
                     idle_timeout_secs: 60,
                     stats_interval_secs: 3600,
                     wire_audit_file: None,
+                    telemetry: TelemetryConfig::default(),
                     quiet: true,
                     stop: Some(s_stop),
                 });
@@ -4792,6 +4975,7 @@ mod tests {
                     keepalive_secs: 1,
                     idle_timeout_secs: 60,
                     stats_interval_secs: 3600,
+                    telemetry: TelemetryConfig::default(),
                     quiet: true,
                     stop: Some(c_stop),
                 });
@@ -4852,5 +5036,239 @@ mod tests {
                 "P0-5: app packet buffered during Migrating MUST survive fallback to fresh DTLS session!"
             );
         }
+    }
+
+    /// v0.4.1 End-to-End Outer Health Telemetry Test:
+    /// Verifies BOTH `--status-file` (atomic serde_json) AND `--status-http` (`/status`, `/metrics`)
+    /// on BOTH `client` and `server` across live SRTP traffic, an active-probe unauth drop on server,
+    /// and a live asymmetric uplink blackhole -> 1-RTT ICE path migration!
+    #[test]
+    fn v41_outer_health_telemetry_file_and_http_live_migration() {
+        use std::io::{Read, Write};
+        use std::net::{TcpListener, TcpStream};
+
+        let psk = b"v041-outer-health-telemetry-e2e-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let reserve_tcp = || {
+            let l = TcpListener::bind("127.0.0.1:0").unwrap();
+            l.local_addr().unwrap()
+        };
+        let cli_http_addr = reserve_tcp();
+        let srv_http_addr = reserve_tcp();
+        let cli_status_file = std::env::temp_dir()
+            .join(format!("wc_e2e_cli_status_{}.json", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+        let srv_status_file = std::env::temp_dir()
+            .join(format!("wc_e2e_srv_status_{}.json", std::process::id()))
+            .to_string_lossy()
+            .to_string();
+
+        let stop_all = Arc::new(AtomicBool::new(false));
+        let b_stop = Arc::clone(&stop_all);
+        let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        echo_sock
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            while !b_stop.load(Ordering::Relaxed) {
+                if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                    let _ = echo_sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        let s_stop = Arc::clone(&stop_all);
+        let s_file = srv_status_file.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                telemetry: TelemetryConfig {
+                    status_file: Some(s_file),
+                    status_http: Some(srv_http_addr),
+                    status_interval_secs: 1,
+                },
+                quiet: true,
+                stop: Some(s_stop),
+            });
+        });
+
+        let blackhole_port = Arc::new(AtomicU16::new(0));
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let r_bh = Arc::clone(&blackhole_port);
+        let r_latest = Arc::clone(&latest_port);
+        let r_stop = Arc::clone(&stop_all);
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            while !r_stop.load(Ordering::Relaxed) {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let bh = r_bh.load(Ordering::SeqCst);
+                    if bh != 0 && cport == bh {
+                        continue;
+                    }
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(&buf[..n]);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        let c_stop = Arc::clone(&stop_all);
+        let c_file = cli_status_file.clone();
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 0,
+                rotate_cooldown_secs: 60,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 1,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                telemetry: TelemetryConfig {
+                    status_file: Some(c_file),
+                    status_http: Some(cli_http_addr),
+                    status_interval_secs: 1,
+                },
+                quiet: true,
+                stop: Some(c_stop),
+            });
+        });
+
+        let http_get_body = |addr: SocketAddr, path: &str| -> String {
+            let mut s = TcpStream::connect(addr).unwrap();
+            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+            s.write_all(req.as_bytes()).unwrap();
+            let mut raw = String::new();
+            let _ = s.read_to_string(&mut raw);
+            raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+        };
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+        let mut rbuf = [0u8; 512];
+        let mut ready = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"TEL_PING_INIT");
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"TEL_PING_INIT" => {
+                    ready = true;
+                    break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => thread::sleep(Duration::from_millis(30)),
+            }
+        }
+        assert!(ready, "tunnel must come up");
+
+        // Send 2 unauthenticated junk probes directly to server so server telemetry counts them
+        let junk = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let _ = junk.send_to(b"HOSTILE_PROBE_1", ("127.0.0.1", server_port));
+        let _ = junk.send_to(b"HOSTILE_PROBE_2", ("127.0.0.1", server_port));
+
+        // Wait >=1.2s for 1s telemetry flush & healthy state
+        thread::sleep(Duration::from_millis(1200));
+        let cj: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cli_status_file).unwrap()).unwrap();
+        assert_eq!(cj["role"], "client");
+        assert_eq!(cj["health"], "good");
+        assert_eq!(cj["dtls_version"], "1.3");
+        assert!(cj["link"]["stun_rtt_ms"].as_f64().is_some());
+        assert!(cj["link"]["tx_bytes_total"].as_u64().unwrap() >= 13);
+
+        // Trigger uplink blackhole -> 1-RTT ICE migration!
+        let port1 = latest_port.load(Ordering::SeqCst);
+        blackhole_port.store(port1, Ordering::SeqCst);
+        let mut healed = false;
+        let t_bh = Instant::now();
+        while t_bh.elapsed() < Duration::from_secs(9) {
+            let _ = app.send(b"TEL_AFTER_BH");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"TEL_AFTER_BH" && latest_port.load(Ordering::SeqCst) != port1 {
+                    healed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(60));
+        }
+        assert!(healed, "tunnel must heal via 1-RTT migration");
+        thread::sleep(Duration::from_millis(1150));
+
+        // Verify client & server HTTP JSON + Prometheus endpoints reflect exact outer events!
+        let cli_http_json: serde_json::Value =
+            serde_json::from_str(&http_get_body(cli_http_addr, "/status")).unwrap();
+        assert!(cli_http_json["events"]["blackholes_total"].as_u64().unwrap() >= 1);
+        assert!(cli_http_json["events"]["migrations_1rtt_total"].as_u64().unwrap() >= 1);
+        assert_eq!(cli_http_json["events"]["blackholes_last_10m"].as_u64().unwrap(), 1);
+        assert!(cli_http_json["link"]["stun_loss_pct"].as_f64().unwrap() > 0.0);
+        assert!(matches!(
+            cli_http_json["health"].as_str(),
+            Some("degraded" | "critical")
+        ));
+
+        let cli_prom = http_get_body(cli_http_addr, "/metrics");
+        assert!(cli_prom.contains("webrtc_cloak_blackholes_total{role=\"client\"} 1"));
+        assert!(cli_prom.contains("webrtc_cloak_migrations_1rtt_total{role=\"client\"} 1"));
+
+        let srv_http_json: serde_json::Value =
+            serde_json::from_str(&http_get_body(srv_http_addr, "/status")).unwrap();
+        assert_eq!(srv_http_json["role"], "server");
+        assert!(srv_http_json["events"]["migrations_1rtt_total"].as_u64().unwrap() >= 1);
+        assert!(srv_http_json["sessions"]["unauth_silent_drops_total"].as_u64().unwrap() >= 2);
+        assert!(srv_http_json["sessions"]["backend_sport"].as_u64().unwrap() > 0);
+        let srv_file_json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&srv_status_file).unwrap()).unwrap();
+        assert_eq!(srv_file_json["role"], "server");
+
+        stop_all.store(true, Ordering::SeqCst);
+        thread::sleep(Duration::from_millis(100));
+        let _ = std::fs::remove_file(&cli_status_file);
+        let _ = std::fs::remove_file(&srv_status_file);
     }
 }

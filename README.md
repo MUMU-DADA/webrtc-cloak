@@ -162,6 +162,9 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE` + DTLS `close_notify` 优雅退出 |
 | `--max-sessions <N>` | `4096` | 单 worker 最大并发 UDP 会话数 |
 | `--mtu <BYTES>` | `1488` | 外层 IPv4 WAN MTU 上限（默认 `1488 < 1492` PPPoE，自动引导内层 QUIC/Hysteria 2 收敛至零分片；`0` 表示不限制） |
+| `--status-file <PATH>` | 关闭 | 可选外层健康状态原子 JSON 快照文件（经临时文件 `rename` 原子落盘，支持 `/tmp` 内存盘零闪存磨损，供外部脚本/内层协议自适应读取） |
+| `--status-http <IP:PORT>` | 关闭 | 可选本地只读 HTTP 遥测端点（推荐 `127.0.0.1:PORT`；提供 `/status` / `/health` JSON、`/healthz` 探活与 `/metrics` Prometheus 指标） |
+| `--status-interval <SECS>` | `5` | 外层健康遥测快照刷新周期（`1..=60s`；发生黑洞/迁移/轮换等关键事件时额外即时刷新） |
 
 ### 5. 内置自测套件与基准诊断
 

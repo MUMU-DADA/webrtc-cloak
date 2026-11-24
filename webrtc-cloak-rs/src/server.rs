@@ -23,6 +23,7 @@ use crate::protocol::{
     SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC,
     STUN_BINDING_REQUEST,
 };
+use crate::telemetry::{TelemetryConfig, TelemetryHub, WorkerSnapshot};
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token, Waker};
@@ -352,6 +353,7 @@ pub struct ServerConfig {
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
     pub wire_audit_file: Option<String>,
+    pub telemetry: TelemetryConfig,
     pub quiet: bool,
     pub stop: Option<Arc<AtomicBool>>,
 }
@@ -904,6 +906,7 @@ fn process_ready_srtp<F>(
     listen_sock: &MioUdpSocket,
     cfg: &ServerConfig,
     registry: &SharedV4Registry,
+    telemetry: Option<&Arc<TelemetryHub>>,
     wbuf: &mut [u8],
     now: Instant,
     audit_pkt: &mut F,
@@ -1029,6 +1032,12 @@ fn process_ready_srtp<F>(
                                 sess.username, old_peer, from_peer, sess.path_epoch, sess.backend_lport
                             ),
                         );
+                        if let Some(th) = telemetry {
+                            th.record_migration_1rtt(format!(
+                                "ufrag={} backend_sport={}",
+                                sess.username, sess.backend_lport
+                            ));
+                        }
                         return;
                     }
                     // Duplicate response after migration already completed -> idempotently re-confirm
@@ -1147,6 +1156,12 @@ fn process_ready_srtp<F>(
                                                 old_ufrag, new_ufrag, lport
                                             ),
                                         );
+                                        if let Some(th) = telemetry {
+                                            th.record_mbb_rotation(format!(
+                                                "{}->{} backend_sport={}",
+                                                old_ufrag, new_ufrag, lport
+                                            ));
+                                        }
                                     }
                                 }
                                 send_encrypted_handover_ack(new_s, true, listen_sock, audit_pkt);
@@ -1188,6 +1203,14 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, false, cfg.wan_mtu);
     let seen_txids = Arc::new(Mutex::new(SeenTxidCache::new()));
     let registry = Arc::new(SharedV4Registry::new(workers));
+    let telemetry = TelemetryHub::start(
+        "server",
+        &cfg.telemetry,
+        workers,
+        cfg.wan_mtu,
+        cfg.quiet,
+        cfg.stop.clone(),
+    );
     if !cfg.quiet {
         println!(
             "[server-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,cookie,pfs) silent_drop=true",
@@ -1204,7 +1227,11 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     }
 
     if workers == 1 {
-        return run_server_worker(0, cfg, false, dtls_pool, seen_txids, registry);
+        let res = run_server_worker(0, cfg, false, dtls_pool, seen_txids, registry, telemetry.clone());
+        if let Some(ref th) = telemetry {
+            th.shutdown();
+        }
+        return res;
     }
 
     let mut handles = Vec::with_capacity(workers - 1);
@@ -1214,15 +1241,19 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
         let dp = dtls_pool.clone();
         let cache = Arc::clone(&seen_txids);
         let reg = Arc::clone(&registry);
+        let tel = telemetry.clone();
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_server_worker(wid, c, true, dp, cache, reg) {
+            if let Err(e) = run_server_worker(wid, c, true, dp, cache, reg, tel) {
                 eprintln!("[server-rs#{}] error: {}", wid, e);
             }
         }));
     }
-    let res = run_server_worker(0, cfg, true, dtls_pool, seen_txids, registry);
+    let res = run_server_worker(0, cfg, true, dtls_pool, seen_txids, registry, telemetry.clone());
     for h in handles {
         let _ = h.join();
+    }
+    if let Some(ref th) = telemetry {
+        th.shutdown();
     }
     res
 }
@@ -1234,6 +1265,7 @@ fn run_server_worker(
     dtls_pool: DtlsConfigPool,
     seen_txids: Arc<Mutex<SeenTxidCache>>,
     registry: Arc<SharedV4Registry>,
+    telemetry: Option<Arc<TelemetryHub>>,
 ) -> std::io::Result<()> {
     SERVER_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
@@ -1275,6 +1307,11 @@ fn run_server_worker(
         .transpose()?;
     let mut audit_count: usize = 0;
     let mut unauth_drops: u64 = 0;
+    let mut closed_tx_bytes: u64 = 0;
+    let mut closed_rx_bytes: u64 = 0;
+    let mut closed_tx_pkts: u64 = 0;
+    let mut closed_rx_pkts: u64 = 0;
+    let mut closed_auth_drops: u64 = 0;
 
     let mut rbuf = vec![0u8; 65536];
     let mut wbuf = vec![0u8; 65536 + 128];
@@ -1292,6 +1329,11 @@ fn run_server_worker(
     let idle_dur = Duration::from_secs(cfg.idle_timeout_secs);
     let stats_dur = Duration::from_secs(cfg.stats_interval_secs);
     let mut last_stats = Instant::now();
+    let telemetry_dur = telemetry
+        .as_ref()
+        .map(|th| th.interval())
+        .unwrap_or(Duration::from_secs(5));
+    let mut last_telemetry = Instant::now();
 
     let mut audit_pkt = |d_code: u8, payload: &[u8]| {
         if let Some(ref mut f) = audit_fp {
@@ -1520,6 +1562,12 @@ fn run_server_worker(
                                     worker_id, cand_worker, sess.username, sess.peer_addr, sess.path_epoch, sess.backend_lport
                                 ),
                             );
+                            if let Some(ref th) = telemetry {
+                                th.record_migration_1rtt(format!(
+                                    "ufrag={} cross_worker={}->{} backend_sport={}",
+                                    sess.username, worker_id, cand_worker, sess.backend_lport
+                                ));
+                            }
                             registry.send_cmd(
                                 cand_worker,
                                 WorkerCmd::MigrateInstall {
@@ -1623,6 +1671,12 @@ fn run_server_worker(
                                             new_ufrag, backend_lport
                                         ),
                                     );
+                                    if let Some(ref th) = telemetry {
+                                        th.record_mbb_rotation(format!(
+                                            "cross_worker->{} backend_sport={}",
+                                            new_ufrag, backend_lport
+                                        ));
+                                    }
                                     send_encrypted_handover_ack(
                                         new_s,
                                         true,
@@ -1687,6 +1741,7 @@ fn run_server_worker(
                             &listen_sock,
                             &cfg,
                             &registry,
+                            telemetry.as_ref(),
                             &mut wbuf,
                             now,
                             &mut audit_pkt,
@@ -1863,6 +1918,7 @@ fn run_server_worker(
                     &listen_sock,
                     &cfg,
                     &registry,
+                    telemetry.as_ref(),
                     &mut wbuf,
                     now,
                     &mut audit_pkt,
@@ -1872,6 +1928,11 @@ fn run_server_worker(
 
         for (tok, reason) in to_close {
             if let Some(mut sess) = sessions_by_token.remove(&tok) {
+                closed_tx_bytes = closed_tx_bytes.saturating_add(sess.tx_bytes);
+                closed_rx_bytes = closed_rx_bytes.saturating_add(sess.rx_bytes);
+                closed_tx_pkts = closed_tx_pkts.saturating_add(sess.tx_pkts);
+                closed_rx_pkts = closed_rx_pkts.saturating_add(sess.rx_pkts);
+                closed_auth_drops = closed_auth_drops.saturating_add(sess.auth_drops);
                 cleanup_session_routes(
                     worker_id,
                     tok,
@@ -1893,6 +1954,9 @@ fn run_server_worker(
             }
         }
 
+        if telemetry.is_some() && wait > telemetry_dur {
+            wait = telemetry_dur;
+        }
         if cfg.stop.is_some() && cfg.quiet && wait > Duration::from_millis(20) {
             wait = Duration::from_millis(20);
         }
@@ -2191,6 +2255,11 @@ fn run_server_worker(
                                     .unwrap_or(false);
                                 if is_exact_primary_peer {
                                     if let Some(mut old) = sessions_by_token.remove(&old_tok) {
+                                        closed_tx_bytes = closed_tx_bytes.saturating_add(old.tx_bytes);
+                                        closed_rx_bytes = closed_rx_bytes.saturating_add(old.rx_bytes);
+                                        closed_tx_pkts = closed_tx_pkts.saturating_add(old.tx_pkts);
+                                        closed_rx_pkts = closed_rx_pkts.saturating_add(old.rx_pkts);
+                                        closed_auth_drops = closed_auth_drops.saturating_add(old.auth_drops);
                                         cleanup_session_routes(
                                             worker_id,
                                             old_tok,
@@ -2230,6 +2299,11 @@ fn run_server_worker(
                                     .collect();
                                 for t in expired {
                                     if let Some(mut s) = sessions_by_token.remove(&t) {
+                                        closed_tx_bytes = closed_tx_bytes.saturating_add(s.tx_bytes);
+                                        closed_rx_bytes = closed_rx_bytes.saturating_add(s.rx_bytes);
+                                        closed_tx_pkts = closed_tx_pkts.saturating_add(s.tx_pkts);
+                                        closed_rx_pkts = closed_rx_pkts.saturating_add(s.rx_pkts);
+                                        closed_auth_drops = closed_auth_drops.saturating_add(s.auth_drops);
                                         graceful_teardown_server(&mut s, &listen_sock, &mut dtls_buf, &mut audit_pkt);
                                         cleanup_session_routes(
                                             worker_id,
@@ -2447,6 +2521,7 @@ fn run_server_worker(
                                             &listen_sock,
                                             &cfg,
                                             &registry,
+                                            telemetry.as_ref(),
                                             &mut wbuf,
                                             now,
                                             &mut audit_pkt,
@@ -2502,6 +2577,7 @@ fn run_server_worker(
                                             &listen_sock,
                                             &cfg,
                                             &registry,
+                                            telemetry.as_ref(),
                                             &mut wbuf,
                                             now,
                                             &mut audit_pkt,
@@ -2537,6 +2613,7 @@ fn run_server_worker(
                                         &listen_sock,
                                         &cfg,
                                         &registry,
+                                        telemetry.as_ref(),
                                         &mut wbuf,
                                         now,
                                         &mut audit_pkt,
@@ -2607,6 +2684,63 @@ fn run_server_worker(
                         record_server_media_bytes(sess, now, sent_bytes);
                     }
                 }
+            }
+        }
+
+        if let Some(ref th) = telemetry {
+            if now.duration_since(last_telemetry) >= telemetry_dur {
+                last_telemetry = now;
+                let mut snap = WorkerSnapshot {
+                    tx_bytes_total: closed_tx_bytes,
+                    rx_bytes_total: closed_rx_bytes,
+                    tx_pkts_total: closed_tx_pkts,
+                    rx_pkts_total: closed_rx_pkts,
+                    auth_drops_total: closed_auth_drops,
+                    unauth_drops_total: unauth_drops,
+                    dtls_version: "none",
+                    cipher: "none",
+                    ..Default::default()
+                };
+                for sess in sessions_by_token.values() {
+                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+                    match sess.state {
+                        ServerState::Ready => {
+                            snap.active_sessions += 1;
+                            if snap.active_backend_sport == 0 && sess.backend_lport != 0 {
+                                snap.active_backend_sport = sess.backend_lport;
+                            }
+                            if snap.cipher == "none" {
+                                if let Some(c) = sess.negotiated_cipher {
+                                    snap.cipher = c.name();
+                                }
+                            }
+                            if snap.dtls_version == "none" {
+                                snap.dtls_version = match sess
+                                    .dtls
+                                    .as_ref()
+                                    .and_then(|d| d.protocol_version())
+                                {
+                                    Some(ProtocolVersion::DTLS1_3) => {
+                                        snap.dual_ssrc = true;
+                                        "1.3"
+                                    }
+                                    Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                    _ if cfg.dtls_required => "1.3",
+                                    _ => "none",
+                                };
+                            }
+                        }
+                        ServerState::DtlsHandshake => {
+                            snap.handshaking_sessions += 1;
+                        }
+                        ServerState::Closing(_, _) => {}
+                    }
+                }
+                th.update_worker(worker_id, snap);
             }
         }
 
