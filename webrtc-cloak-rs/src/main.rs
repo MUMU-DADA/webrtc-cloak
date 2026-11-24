@@ -5,8 +5,9 @@ mod server;
 
 use crate::client::{run_client, ClientConfig};
 use crate::protocol::{
-    combine_session_key, derive_stun_material, detect_cpu_accel, fill_random, CipherPref,
-    CipherSuite, DtlsMinVersion, SrtpCloakCipher, DEFAULT_WAN_MTU,
+    combine_session_key, derive_stun_material, detect_cpu_accel, fill_random,
+    trigger_shutdown_wakers, CipherPref, CipherSuite, DtlsMinVersion, SrtpCloakCipher,
+    DEFAULT_WAN_MTU,
 };
 use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
@@ -22,6 +23,7 @@ fn install_shutdown_handler() -> Arc<AtomicBool> {
     let flag = Arc::clone(&stop);
     let _ = ctrlc::set_handler(move || {
         flag.store(true, Ordering::SeqCst);
+        trigger_shutdown_wakers();
     });
     stop
 }
@@ -72,7 +74,7 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
@@ -589,6 +591,7 @@ fn main() {
             let mut dtls_decoy = true;
             let mut dtls_min_version = DtlsMinVersion::Auto;
             let mut rotate_interval_secs: u64 = 0;
+            let mut rotate_bytes_mb: Option<u64> = None;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
             let mut wan_mtu: usize = DEFAULT_WAN_MTU;
@@ -610,6 +613,7 @@ fn main() {
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
                     "--dtls-min-version" => { i += 1; dtls_min_version = parse_dtls_min_version(&args[i]); }
                     "--rotate-interval" => { i += 1; rotate_interval_secs = args[i].parse().unwrap(); }
+                    "--rotate-bytes" => { i += 1; rotate_bytes_mb = Some(args[i].parse().unwrap()); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
                     "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
@@ -626,6 +630,11 @@ fn main() {
             if server_host.is_empty() {
                 usage();
             }
+            let rotate_max_bytes = match rotate_bytes_mb {
+                Some(mb) => mb.saturating_mul(1024 * 1024),
+                None if rotate_interval_secs > 0 => 1200u64 * 1024 * 1024, // 600..2220 MiB random budget
+                None => 0,
+            };
             let psk_bytes = resolve_psk(psk, psk_file);
             let listen_addr: SocketAddr = format!("{}:{}", listen_host, listen_port).parse().unwrap();
             let server_addr: SocketAddr = format!("{}:{}", server_host, server_port).parse().unwrap();
@@ -638,6 +647,8 @@ fn main() {
                 dtls_decoy,
                 dtls_min_version,
                 rotate_interval_secs,
+                rotate_max_bytes,
+                rotate_cooldown_secs: 60,
                 workers,
                 max_sessions,
                 wan_mtu,

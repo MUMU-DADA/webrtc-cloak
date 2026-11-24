@@ -33,9 +33,30 @@ use p256::pkcs8::EncodePrivateKey;
 use sha1::Sha1;
 use sha2::Sha256;
 use std::net::{Ipv4Addr, SocketAddrV4};
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use subtle::ConstantTimeEq;
+
+static SHUTDOWN_WAKERS: OnceLock<Mutex<Vec<Arc<mio::Waker>>>> = OnceLock::new();
+
+/// Register a worker `mio::Waker` to be notified immediately upon `SIGTERM`/`SIGINT`.
+pub fn register_shutdown_waker(waker: Arc<mio::Waker>) {
+    let lock = SHUTDOWN_WAKERS.get_or_init(|| Mutex::new(Vec::new()));
+    if let Ok(mut guard) = lock.lock() {
+        guard.push(waker);
+    }
+}
+
+/// Wake all registered production workers immediately so graceful shutdown needs zero poll lag.
+pub fn trigger_shutdown_wakers() {
+    if let Some(lock) = SHUTDOWN_WAKERS.get() {
+        if let Ok(guard) = lock.lock() {
+            for w in guard.iter() {
+                let _ = w.wake();
+            }
+        }
+    }
+}
 
 pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 pub const STUN_BINDING_REQUEST: u16 = 0x0001;
@@ -324,6 +345,93 @@ pub fn rand_duration_range_ms(min_ms: u64, max_ms: u64) -> Duration {
     }
     let span = (max_ms - min_ms) + 1;
     Duration::from_millis(min_ms + ((rand_u32() as u64) % span))
+}
+
+/// Smooth right-skewed log-normal multiplier via Irwin-Hall (sum of 6 uniforms -> Z ~ N(0, 1)).
+/// Breaks rectangular `[0.8R, 1.2R]` box-edge fingerprints on long-running session lifetimes.
+fn lognormal_factor(sigma: f64, min_factor: f64, max_factor: f64) -> f64 {
+    let mut raw = [0u8; 24];
+    fill_random(&mut raw);
+    let mut sum6 = 0.0f64;
+    for chunk in raw.chunks_exact(4) {
+        let u = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
+            / (u32::MAX as f64 + 1.0);
+        sum6 += u;
+    }
+    // Mean of 6 U(0,1) is 3.0, variance is 6/12 = 0.5 -> std = 1/sqrt(2)
+    let z = (sum6 - 3.0) * std::f64::consts::SQRT_2;
+    (sigma * z).exp().clamp(min_factor, max_factor)
+}
+
+/// Log-normal wide-distribution duration around `median_ms` (spanning `[0.35x, 2.80x]`, heavy right tail).
+pub fn lognormal_duration_ms(median_ms: u64) -> Duration {
+    if median_ms == 0 {
+        return Duration::from_millis(0);
+    }
+    let f = lognormal_factor(0.45, 0.35, 2.80);
+    let ms = ((median_ms as f64) * f).round().max(1.0) as u64;
+    Duration::from_millis(ms)
+}
+
+/// Log-normal randomized byte budget around `base_bytes` (spanning `[0.50x, 1.85x]`).
+/// For default `1200 MiB`, produces smooth natural per-session budgets in `600 MiB .. 2220 MiB`.
+pub fn rand_byte_budget(base_bytes: u64) -> u64 {
+    if base_bytes == 0 {
+        return 0;
+    }
+    let f = lognormal_factor(0.35, 0.50, 1.85);
+    ((base_bytes as f64) * f).round().max(1.0) as u64
+}
+
+/// O(1), zero-allocation two-bucket sliding byte window (Cloudflare weighted moving window).
+/// Accurately tracks rolling byte volume over `window` without bucket-boundary cliffs.
+#[derive(Clone, Copy)]
+pub struct RollingByteWindow {
+    window: Duration,
+    bucket_start: Instant,
+    prev_bytes: u64,
+    cur_bytes: u64,
+}
+
+impl RollingByteWindow {
+    pub fn new(now: Instant, window: Duration) -> Self {
+        Self {
+            window: window.max(Duration::from_millis(1)),
+            bucket_start: now,
+            prev_bytes: 0,
+            cur_bytes: 0,
+        }
+    }
+
+    #[inline]
+    fn advance(&mut self, now: Instant) {
+        let elapsed = now.saturating_duration_since(self.bucket_start);
+        if elapsed >= self.window.saturating_mul(2) {
+            self.prev_bytes = 0;
+            self.cur_bytes = 0;
+            self.bucket_start = now;
+        } else if elapsed >= self.window {
+            self.prev_bytes = self.cur_bytes;
+            self.cur_bytes = 0;
+            self.bucket_start += self.window;
+        }
+    }
+
+    #[inline]
+    pub fn record(&mut self, now: Instant, bytes: u64) {
+        self.advance(now);
+        self.cur_bytes = self.cur_bytes.saturating_add(bytes);
+    }
+
+    #[inline]
+    pub fn bytes_in_window(&mut self, now: Instant) -> u64 {
+        self.advance(now);
+        let elapsed = now.saturating_duration_since(self.bucket_start);
+        let rem_frac =
+            1.0 - (elapsed.as_secs_f64() / self.window.as_secs_f64()).clamp(0.0, 1.0);
+        let weighted_prev = ((self.prev_bytes as f64) * rem_frac) as u64;
+        weighted_prev.saturating_add(self.cur_bytes)
+    }
 }
 
 /// Chrome/libwebrtc 4-char ICE ufrag from the 64-char Base64 alphabet (zero modulo bias).
@@ -1537,8 +1645,10 @@ impl SrtpCloakCipher {
         body.extend_from_slice(&self.cname);
         body.push(0); // RFC 3550 §6.5 END item (32-bit aligned at 24B)
 
-        // Optional Subpacket 3: Transport-CC (205) / PSFB (206) smooth randomized length (~87.5% when not BYE)
-        if !include_bye && (self.next_rng() & 7) != 0 {
+        // Optional Subpacket 3: Transport-CC (205) / PSFB (206) smooth randomized length (~87.5%)
+        // ONLY when media was actually received since the last RTCP (`has_rx_media`) and not BYE!
+        // Prevents RFC 3550 semantic violation of emitting TWCC/PSFB feedback on zero-media RR intervals.
+        if !include_bye && has_rx_media && (self.next_rng() & 7) != 0 {
             let fb_pt: u8 = if (self.next_rng() & 1) == 0 { 205 } else { 206 };
             let fb_words: u16 = 2 + ((self.next_rng() as u16) % 11); // 12..52B
             body.extend_from_slice(&[0x8F, fb_pt]);
@@ -2668,5 +2778,77 @@ mod tests {
         assert_eq!(&rtcp[rtcp.len() - 4..], &0x8000_0000u32.to_be_bytes()); // 0-based SRTCP index!
         assert_eq!(srv2.verify_srtcp(&rtcp), Some(false));
         assert_eq!(srv2.verify_srtcp(&rtcp), None); // replay blocked!
+    }
+
+    #[test]
+    fn v38_zero_media_srtcp_no_fake_fb_and_lognormal_distributions() {
+        let key = [0x99u8; 32];
+        let mut cli = SrtpCloakCipher::new(&key, 0x1122_3344, 0x5566_7788, true, CipherSuite::Aes128Gcm);
+        let mut srv = SrtpCloakCipher::new(&key, 0x5566_7788, 0x1122_3344, false, CipherSuite::Aes128Gcm);
+        cli.set_dual_ssrc(true);
+        srv.set_dual_ssrc(true);
+
+        // 1. Zero-media RR MUST NEVER attach fake PT=205/206 feedback (always exact minimal 52B: 8B hdr + 24B SDES + 16B tag + 4B idx)
+        for _ in 0..64 {
+            let pkt = cli.build_srtcp(false, false, false);
+            assert_eq!(pkt[0], 0x80); // RC=0
+            assert_eq!(pkt[1], 201);  // RR
+            assert_eq!(
+                pkt.len(),
+                52,
+                "zero-media RR MUST omit PT=205/206 feedback subpackets (expected 52B, got {}B)",
+                pkt.len()
+            );
+            assert_eq!(srv.verify_srtcp(&pkt), Some(false));
+        }
+
+        // 2. When rx media IS present (has_rx_media=true), FB subpackets (PT=205/206) still attach smoothly (~87.5%)
+        let mut fb_seen = 0usize;
+        for _ in 0..32 {
+            let pkt = cli.build_srtcp(true, false, false);
+            assert_eq!(pkt[0], 0x81); // RC=1
+            if pkt.len() > 76 {
+                fb_seen += 1;
+            }
+            assert_eq!(srv.verify_srtcp(&pkt), Some(false));
+        }
+        assert!(fb_seen >= 15, "active-rx RR should still emit PT=205/206 feedback (got {}/32)", fb_seen);
+
+        // 3. Log-normal MBB duration breaks rectangular [0.8R, 1.2R] box edges
+        let mut below_80 = 0usize;
+        let mut above_120 = 0usize;
+        for _ in 0..200 {
+            let d = lognormal_duration_ms(10_000).as_millis() as u64;
+            assert!(d >= 3_500 && d <= 28_000, "lognormal out of bounds: {}ms", d);
+            if d < 8_000 {
+                below_80 += 1;
+            }
+            if d > 12_000 {
+                above_120 += 1;
+            }
+        }
+        assert!(below_80 >= 10 && above_120 >= 10, "lognormal must extend beyond [0.8R, 1.2R] (below={} above={})", below_80, above_120);
+
+        // 4. Random byte budget spans [0.50x, 1.85x] smoothly
+        let base = 1200u64 * 1024 * 1024;
+        let mut min_b = u64::MAX;
+        let mut max_b = 0u64;
+        for _ in 0..100 {
+            let b = rand_byte_budget(base);
+            assert!(b >= 600 * 1024 * 1024 && b <= 2220 * 1024 * 1024, "budget out of range: {}", b);
+            min_b = min_b.min(b);
+            max_b = max_b.max(b);
+        }
+        assert!(max_b - min_b > 200 * 1024 * 1024, "byte budgets should have meaningful variance");
+
+        // 5. RollingByteWindow accumulates and decays smoothly without cliffs
+        let t0 = Instant::now();
+        let mut win = RollingByteWindow::new(t0, Duration::from_secs(10));
+        win.record(t0, 10_000);
+        assert_eq!(win.bytes_in_window(t0), 10_000);
+        assert_eq!(win.bytes_in_window(t0 + Duration::from_secs(10)), 10_000);
+        let mid = win.bytes_in_window(t0 + Duration::from_secs(15));
+        assert!(mid >= 4_500 && mid <= 5_500, "half-decayed window should be ~5000 (got {})", mid);
+        assert_eq!(win.bytes_in_window(t0 + Duration::from_secs(21)), 0);
     }
 }

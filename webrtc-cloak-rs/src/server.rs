@@ -9,13 +9,14 @@
 use crate::protocol::{
     build_dimpl_config_pool, build_stun_success_response, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, new_dtls_instance,
-    parse_stun_with_key, rand_duration_range_ms, resolve_srtp_suite, stun_hmac_key,
-    validate_dtls_datagram, CertCache, CipherPref, CipherSuite, DtlsConfigPool, DtlsMinVersion,
-    PacketKind, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN, STUN_BINDING_REQUEST,
+    parse_stun_with_key, rand_duration_range_ms, register_shutdown_waker, resolve_srtp_suite,
+    stun_hmac_key, validate_dtls_datagram, CertCache, CipherPref, CipherSuite, DtlsConfigPool,
+    DtlsMinVersion, PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN,
+    STUN_BINDING_REQUEST,
 };
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
-use mio::{Events, Interest, Poll, Token};
+use mio::{Events, Interest, Poll, Token, Waker};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
@@ -31,6 +32,7 @@ thread_local! {
 }
 
 const LISTEN_TOKEN: Token = Token(0);
+const WAKE_TOKEN: Token = Token(usize::MAX);
 const SEEN_TXID_TTL: Duration = Duration::from_secs(90);
 const RETRANSMIT_WINDOW: Duration = Duration::from_secs(8);
 const MAX_STUN_RETRANSMITS: u8 = 6;
@@ -38,9 +40,12 @@ const SEEN_TXID_CAP: usize = 65_536;
 const EARLY_SRTP_CAP: usize = 32;
 const MAX_DTLS_RESETS: u8 = 3;
 const CLOSING_DRAIN_MS: u64 = 250;
-/// RFC 7675 §5.1 consent lifetime: stop transmitting and silently release session after 30s
+/// RFC 7675 §5.1 consent lifetime: stop transmitting and silently release session after 45s
 /// with zero authenticated packets (STUN/SRTP/SRTCP/DTLS) received from peer.
-const PEER_CONSENT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Widened from 30s to 45s in v0.3.8 to give conservative 10–14s trickle STUN backoff >=25s headroom.
+const PEER_CONSENT_TIMEOUT: Duration = Duration::from_secs(45);
+/// Rolling 15-second media byte threshold below which a session enters quiet trickle backoff (~270 B/s).
+const TRICKLE_RATE_15S_BYTES: u64 = 4 * 1024;
 
 enum TxidCheck {
     Fresh,
@@ -161,7 +166,11 @@ pub struct ServerConfig {
 enum ServerState {
     DtlsHandshake,
     Ready,
-    Closing(Instant),
+    /// Closing(deadline, allow_downlink_flush):
+    /// When entered due to peer BYE/close_notify, `allow_downlink_flush = true` still delivers
+    /// slow in-flight backend replies during the brief 250ms Closing window to the peer's
+    /// receive-only drain socket instead of silently dropping them.
+    Closing(Instant, bool),
 }
 
 struct ServerSession {
@@ -185,8 +194,11 @@ struct ServerSession {
     early_srtp: VecDeque<Vec<u8>>,
     last_data_active: Instant,
     last_peer_rx: Instant,
+    last_active_burst: Instant,
     next_srtcp_at: Instant,
+    rate_15s: RollingByteWindow,
     rx_pkts: u64,
+    rx_pkts_at_last_rtcp: u64,
     rx_bytes: u64,
     tx_pkts: u64,
     tx_pkts_at_last_rtcp: u64,
@@ -195,6 +207,17 @@ struct ServerSession {
     srtcp_tx: u64,
     srtcp_rx: u64,
     auth_drops: u64,
+}
+
+#[inline]
+fn record_server_media_bytes(sess: &mut ServerSession, now: Instant, bytes: u64) {
+    sess.rate_15s.record(now, bytes);
+    if sess.rate_15s.bytes_in_window(now) >= TRICKLE_RATE_15S_BYTES {
+        sess.last_active_burst = now;
+        if sess.next_srtcp_at > now + Duration::from_millis(1950) {
+            sess.next_srtcp_at = now + rand_duration_range_ms(950, 1950);
+        }
+    }
 }
 
 fn make_udp_socket(
@@ -309,10 +332,14 @@ where
         sess.ready_at = Some(now);
         sess.last_data_active = now;
         sess.last_peer_rx = now;
+        sess.last_active_burst = now;
+        sess.rate_15s = RollingByteWindow::new(now, Duration::from_secs(15));
+        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
         sess.next_srtcp_at = now + rand_duration_range_ms(300, 750);
 
         // V3-M-03 + L-03: flush any reordered early SRTP (Data or in-band 0xFFFE Probe) arriving ahead of Flight 5!
         let mut early_flushed = 0usize;
+        let mut early_bytes = 0u64;
         if let Some(ref mut cipher) = sess.cipher {
             while let Some(raw_srtp) = sess.early_srtp.pop_front() {
                 match cipher.unwrap_into_ex(&raw_srtp, wbuf) {
@@ -320,6 +347,7 @@ where
                         if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
                             sess.rx_pkts += 1;
                             sess.rx_bytes += pn as u64;
+                            early_bytes = early_bytes.saturating_add(pn as u64);
                             early_flushed += 1;
                         }
                     }
@@ -330,6 +358,7 @@ where
                             if listen_sock.send_to(&pbuf[..wn], sess.peer_addr).is_ok() {
                                 sess.rx_pkts += 1;
                                 sess.tx_pkts += 1;
+                                early_bytes = early_bytes.saturating_add((pn as u64) * 2);
                                 early_flushed += 1;
                             }
                         }
@@ -339,6 +368,9 @@ where
                     }
                 }
             }
+        }
+        if early_bytes > 0 {
+            record_server_media_bytes(sess, now, early_bytes);
         }
         log(
             worker_id,
@@ -366,7 +398,7 @@ fn graceful_teardown_server<F>(
     F: FnMut(u8, &[u8]),
 {
     if sess.state == ServerState::Ready {
-        let has_rx = sess.rx_pkts > 0;
+        let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
         let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
         if let Some(ref mut cipher) = sess.cipher {
             let bye = cipher.build_srtcp(has_rx, is_sender, true);
@@ -444,6 +476,11 @@ fn run_server_worker(
     SERVER_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(256);
+    if !cfg.quiet && cfg.stop.is_some() {
+        if let Ok(waker) = Waker::new(poll.registry(), WAKE_TOKEN) {
+            register_shutdown_waker(Arc::new(waker));
+        }
+    }
 
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, 8 * 1024 * 1024)?;
     poll.registry()
@@ -520,7 +557,11 @@ fn run_server_worker(
             }
         }
         let now = Instant::now();
-        let mut wait = Duration::from_millis(150);
+        let mut wait = if sessions_by_token.is_empty() {
+            Duration::from_secs(5)
+        } else {
+            Duration::from_secs(1)
+        };
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
 
         for (&tok, sess) in sessions_by_token.iter_mut() {
@@ -552,7 +593,10 @@ fn run_server_worker(
                                 now,
                                 &mut audit_pkt,
                             ) {
-                                sess.state = ServerState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+                                sess.state = ServerState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                    false,
+                                );
                             }
                         } else {
                             let rem = t.saturating_duration_since(now);
@@ -564,7 +608,7 @@ fn run_server_worker(
                 }
                 ServerState::Ready => {
                     if now.duration_since(sess.last_peer_rx) > PEER_CONSENT_TIMEOUT {
-                        // RFC 7675 §5.1: consent expired (30s with zero authenticated peer packets) ->
+                        // RFC 7675 §5.1: consent expired (45s with zero authenticated peer packets) ->
                         // cease transmitting immediately (silent close, zero ICMP bounce).
                         to_close.push((tok, "consent_timeout"));
                         continue;
@@ -576,29 +620,55 @@ fn run_server_worker(
                         .unwrap_or(false);
                     if seq_exhausted || now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_server(sess, &listen_sock, &mut dtls_buf, &mut audit_pkt);
-                        sess.state = ServerState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+                        sess.state = ServerState::Closing(
+                            now + Duration::from_millis(CLOSING_DRAIN_MS),
+                            false,
+                        );
                         continue;
                     }
                     if now >= sess.next_srtcp_at {
-                        let is_active_media = now.duration_since(sess.last_data_active) <= Duration::from_secs(3);
-                        let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
-                        let has_rx = sess.rx_pkts > 0;
-                        sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
-                        if let Some(ref mut cipher) = sess.cipher {
-                            let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
-                            audit_pkt(1, &rtcp);
-                            if listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
-                                sess.srtcp_tx += 1;
-                            }
-                        }
-                        sess.next_srtcp_at = now + if is_active_media {
-                            rand_duration_range_ms(950, 1950)
+                        let age_ge_15s = sess
+                            .ready_at
+                            .map_or(false, |r| now.duration_since(r) >= Duration::from_secs(15));
+                        let in_trickle = age_ge_15s
+                            && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES;
+                        let long_trickle = in_trickle
+                            && now.duration_since(sess.last_active_burst) >= Duration::from_secs(60);
+                        if long_trickle {
+                            // Quiet trickle mode (>60s idle/keepalive-only): suppress unsolicited server SRTCP
+                            // until real data resumes, eliminating empty-room control-plane chatter.
+                            sess.next_srtcp_at = now + Duration::from_secs(10);
                         } else {
-                            rand_duration_range_ms(3500, 6500)
-                        };
+                            let is_active_media = !in_trickle
+                                && now.duration_since(sess.last_data_active) <= Duration::from_secs(3);
+                            let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
+                            let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
+                            sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
+                            sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
+                            if let Some(ref mut cipher) = sess.cipher {
+                                let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
+                                audit_pkt(1, &rtcp);
+                                if listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
+                                    sess.srtcp_tx += 1;
+                                }
+                            }
+                            sess.next_srtcp_at = now
+                                + if is_active_media {
+                                    rand_duration_range_ms(950, 1950)
+                                } else if !in_trickle {
+                                    rand_duration_range_ms(3500, 6500)
+                                } else {
+                                    rand_duration_range_ms(20_000, 40_000)
+                                };
+                        }
+                    } else {
+                        let rem = sess.next_srtcp_at.saturating_duration_since(now);
+                        if rem < wait {
+                            wait = rem.max(Duration::from_millis(10));
+                        }
                     }
                 }
-                ServerState::Closing(deadline) => {
+                ServerState::Closing(deadline, _) => {
                     if now >= deadline {
                         to_close.push((tok, "graceful_close"));
                     } else {
@@ -640,6 +710,9 @@ fn run_server_worker(
 
         let now = Instant::now();
         for ev in events.iter() {
+            if ev.token() == WAKE_TOKEN {
+                continue;
+            }
             if ev.token() == LISTEN_TOKEN {
                 loop {
                     let (n, peer_addr) = match listen_sock.recv_from(&mut rbuf) {
@@ -670,7 +743,7 @@ fn run_server_worker(
                             let same_active = token_by_peer
                                 .get(&peer_addr)
                                 .and_then(|tok| sessions_by_token.get(tok))
-                                .map(|s| s.username == uname && !matches!(s.state, ServerState::Closing(_)))
+                                .map(|s| s.username == uname && !matches!(s.state, ServerState::Closing(_, _)))
                                 .unwrap_or(false);
 
                             let txid_status = {
@@ -741,7 +814,7 @@ fn run_server_worker(
                                 let expired: Vec<Token> = sessions_by_token
                                     .iter()
                                     .filter(|(_, s)| {
-                                        matches!(s.state, ServerState::Closing(_))
+                                        matches!(s.state, ServerState::Closing(_, _))
                                             || now.duration_since(s.last_data_active) > idle_dur
                                     })
                                     .map(|(&t, _)| t)
@@ -777,7 +850,7 @@ fn run_server_worker(
                             let blport = bs.local_addr().map(|a| a.port()).unwrap_or(0);
                             let tok = Token(next_token_id);
                             next_token_id = next_token_id.wrapping_add(1);
-                            if next_token_id == 0 {
+                            if next_token_id == 0 || next_token_id == usize::MAX {
                                 next_token_id = 1;
                             }
                             if poll.registry().register(&mut bs, tok, Interest::READABLE).is_err() {
@@ -836,8 +909,11 @@ fn run_server_worker(
                                 early_srtp: VecDeque::new(),
                                 last_data_active: now,
                                 last_peer_rx: now,
+                                last_active_burst: now,
                                 next_srtcp_at: now + rand_duration_range_ms(300, 750),
+                                rate_15s: RollingByteWindow::new(now, Duration::from_secs(15)),
                                 rx_pkts: 0,
+                                rx_pkts_at_last_rtcp: 0,
                                 rx_bytes: 0,
                                 tx_pkts: 0,
                                 tx_pkts_at_last_rtcp: 0,
@@ -856,7 +932,7 @@ fn run_server_worker(
                         PacketKind::Dtls => {
                             if let Some(&tok) = token_by_peer.get(&peer_addr) {
                                 if let Some(sess) = sessions_by_token.get_mut(&tok) {
-                                    if matches!(sess.state, ServerState::Closing(_)) {
+                                    if matches!(sess.state, ServerState::Closing(_, _)) {
                                         continue;
                                     }
                                     // V3-H-01 fix: strict DTLS pre-validation + Ready gating + NEVER kill on Err!
@@ -925,6 +1001,7 @@ fn run_server_worker(
                                     ) {
                                         sess.state = ServerState::Closing(
                                             now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                            true,
                                         );
                                     }
                                 }
@@ -943,13 +1020,14 @@ fn run_server_worker(
                                                 if has_bye {
                                                     sess.state = ServerState::Closing(
                                                         now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                                        true,
                                                     );
                                                 }
                                             } else {
                                                 sess.auth_drops += 1;
                                             }
                                         }
-                                    } else if !matches!(sess.state, ServerState::Closing(_)) {
+                                    } else if !matches!(sess.state, ServerState::Closing(_, _)) {
                                         sess.auth_drops += 1;
                                     }
                                 }
@@ -962,6 +1040,7 @@ fn run_server_worker(
                                 if let Some(sess) = sessions_by_token.get_mut(&tok) {
                                     match sess.state {
                                         ServerState::Ready => {
+                                            let mut rx_media_bytes = 0u64;
                                             if let Some(ref mut cipher) = sess.cipher {
                                                 match cipher.unwrap_into_ex(pkt, &mut wbuf) {
                                                     Some(SrtpFrame::Data(pn)) => {
@@ -970,6 +1049,7 @@ fn run_server_worker(
                                                         if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
                                                             sess.rx_pkts += 1;
                                                             sess.rx_bytes += pn as u64;
+                                                            rx_media_bytes = pn as u64;
                                                         }
                                                     }
                                                     Some(SrtpFrame::Probe(pn)) => {
@@ -983,6 +1063,7 @@ fn run_server_worker(
                                                             if listen_sock.send_to(&pbuf[..wn], sess.peer_addr).is_ok() {
                                                                 sess.rx_pkts += 1;
                                                                 sess.tx_pkts += 1;
+                                                                rx_media_bytes = (pn as u64) * 2;
                                                             }
                                                         }
                                                     }
@@ -990,6 +1071,9 @@ fn run_server_worker(
                                                         sess.auth_drops += 1;
                                                     }
                                                 }
+                                            }
+                                            if rx_media_bytes > 0 {
+                                                record_server_media_bytes(sess, now, rx_media_bytes);
                                             }
                                         }
                                         ServerState::DtlsHandshake => {
@@ -1001,7 +1085,7 @@ fn run_server_worker(
                                                 sess.early_srtp.push_back(pkt.to_vec());
                                             }
                                         }
-                                        ServerState::Closing(_) => {}
+                                        ServerState::Closing(_, _) => {}
                                     }
                                 }
                             } else {
@@ -1020,18 +1104,29 @@ fn run_server_worker(
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => break,
                     };
-                    if sess.state != ServerState::Ready || n > MAX_INNER_UDP_LEN {
+                    let can_tx_downlink = matches!(
+                        sess.state,
+                        ServerState::Ready | ServerState::Closing(_, true)
+                    );
+                    if !can_tx_downlink || n > MAX_INNER_UDP_LEN {
                         continue;
                     }
+                    let mut sent_bytes = 0u64;
                     if let Some(ref mut cipher) = sess.cipher {
-                        sess.last_data_active = now;
+                        if sess.state == ServerState::Ready {
+                            sess.last_data_active = now;
+                        }
                         if let Some(wn) = cipher.wrap_into(&rbuf[..n], &mut wbuf) {
                             audit_pkt(1, &wbuf[..wn]);
                             if listen_sock.send_to(&wbuf[..wn], sess.peer_addr).is_ok() {
                                 sess.tx_pkts += 1;
                                 sess.tx_bytes += n as u64;
+                                sent_bytes = n as u64;
                             }
                         }
+                    }
+                    if sent_bytes > 0 && sess.state == ServerState::Ready {
+                        record_server_media_bytes(sess, now, sent_bytes);
                     }
                 }
             }
@@ -1040,7 +1135,7 @@ fn run_server_worker(
         if now.duration_since(last_stats) >= stats_dur {
             last_stats = now;
             for sess in sessions_by_token.values() {
-                if matches!(sess.state, ServerState::Closing(_)) {
+                if matches!(sess.state, ServerState::Closing(_, _)) {
                     continue;
                 }
                 log(

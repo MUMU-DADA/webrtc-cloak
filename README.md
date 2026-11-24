@@ -36,7 +36,7 @@
 │   └── pages.yml                          # 自动部署交互原理演示页至 GitHub Pages
 ├── LICENSE                                # MIT 开源许可证
 ├── README.md                              # 项目说明、协议架构与构建文档
-├── SPEC.md                                # V3.2 / v0.3.7 线格式、密码学与状态机协议规范
+├── SPEC.md                                # V3.2 / v0.3.8 线格式、密码学与状态机协议规范
 ├── .gitignore                             # 忽略构建产物、密钥文件与抓包日志
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线/Pages 双用）
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
@@ -82,7 +82,7 @@ flowchart LR
 - **严谨的状态机边界防护**：
   - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；`parse_stun` 鉴权前零堆分配；会话退出进入 `Closing` 吸收在途尾包（客户端排空期仍 Make-Before-Break 解密投递合法下行 SRTP 且零公网回包），避免触发 `ICMP Port Unreachable`。
   - **入口预校验与抗注入**：`validate_dtls_datagram` 同时覆盖 DTLS 1.2 与 RFC 9147 DTLS 1.3（`C=0`、`≥18B`），拒绝 `Epoch=0` 明文 Alert 及 `Ready` 态明文 `ct=26`；服务端 `Ready` 态绝不被伪造 DTLS 垃圾包误续命 Consent；客户端在 `Ready` 态持续驱动 DTLS 1.3 Flight 5 重传定时器防单包丢包黑洞；`extract_dtls_server_hello_suite` 严格校检帧长与扩展边界并过滤 `TLS13_HRR_RANDOM`；SRTP 双流各自维护独立 **2048 包 RFC 6479 滑动防重放环**，SRTCP 内置 64-bit 滑动防重放窗口。
-  - **单向上行黑洞与服务端重启自愈**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并按 RFC 7675 §5.1 在 30s 无认证对端报文时静默回收旧会话；客户端仅凭双向 STUN Consent 应答判定上行活性，丢失应答时按 RFC 5389 §7.2.1 同 `txid` 指数退避重传（频繁换口时自动自适应退避防震荡），确认黑洞后旧端口转入 35s 静默接收态并立即在新端口完成亚秒级重握自愈。
+  - **单向上行黑洞、静默退避与无感轮换自愈（`v0.3.8`）**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并在 `45s` 无认证对端报文时静默回收；空闲/微流态自动关闭空载假 `PT=205/206` 反馈，双端 SRTCP 退避至 `20–40s`（服务端持续微流 `>60s` 后静默暂停），STUN 保活温和退避至 `10–14s` 且来包秒切回 `5s`；主动 MBB 轮换结合对数正态宽分布时长 + 随机字节预算（`600MB–2.2GB`）+ 夜间微流自动挂起 + `2–10s` 随机延迟旧流 `BYE` 排空，服务端 `SIGTERM` 优雅退服后客户端抖动 `80–350ms` 快重连避免明文 `ICMP Port Unreachable`。
 - **内置双模式 12 项自测与算力体检（`v0.3.5+`）**：`webrtc-cloak selftest` 支持**真实线上远程隧道直测**（`--server-host <IP> --server-port 19643 --psk-file <PATH>`，通过加密带内 `0xFFFE` SRTP 回显探针在不影响线上业务后端的前提下实测真实公网 NAT 映射、DTLS 1.3/1.2 握手、WAN 延迟/抖动/丢包、公网 Path MTU 边界、多端口 NAT 轮换与 7 类主动探测 Silent-Drop 验真，并兼容 `< v0.3.5` 服务端自动降级 `[SKIP]`）以及**离线本地故障注入沙箱**（`--local`），同时内置本机单核/全核加解密与 P-256 证书签发算力体检。
 - **AEAD 密文内层随机填充**：线上传输首字节固定为 `0x90 (P=0)`，`[inner_len: u16 BE] || plaintext || [0..=31B random pad]` 全部位于 AEAD 密文内，大包（`>= 1340B`）自动收窄填充至 `0..=7B` 以适配 `1492B` PPPoE MTU 避免 IP 分片。
 - **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书（DTLS 1.3 模式下证书在公网 100% 加密不可见）；客户端全平台完整宣告 6 个 DTLS 1.3/1.2 AEAD 套件，并通过多 MTU 预构建配置池打散 ClientHello 长度。
@@ -152,7 +152,8 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
 | `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 | 预置共享密钥（推荐文件或环境变量，避免 `ps` 泄露） |
 | `--cipher <auto\|aes-gcm\|chacha20\|blake2b>` | `auto` | 加密套件；`auto` 经 DTLS 握手按两端 CPU 指令集自动协商 |
 | `--dtls-min-version <auto\|1.2\|1.3>` | `auto` | DTLS 最低版本；`auto`/`1.2` 优先 DTLS 1.3 并无缝兼容旧版 1.2 滚动升级，双端升完后可设为 `1.3` 彻底锁定防降级 |
-| `--rotate-interval <SECS>` | `0`（关闭） | 客户端可选定时 Make-Before-Break 无感五元组滚动轮换间隔（加 `±20%` 抖动，后台预握新五元组并 0ms 零丢包切换，刷新 PFS 密钥；适合 Hysteria 2 / WireGuard 等支持源端口迁移的上层协议） |
+| `--rotate-interval <SECS>` | `0`（关闭） | 客户端可选定时 Make-Before-Break 无感五元组滚动轮换中位间隔（对数正态 `[0.35x, 2.80x]` 宽分布，后台微流 `<64KB/5m` 自动挂起，切流后旧口延迟 `2–10s` 发 `BYE` 排空慢回包，刷新 PFS 密钥；适合 Hysteria 2 / WireGuard 等支持源端口迁移的上层协议） |
+| `--rotate-bytes <MB>` | 随 `--rotate-interval` 自动启用 `1200`（`0` 关闭） | 客户端可选单流字节预算 MBB 轮换基线（每会话按对数正态在 `[0.50x, 1.85x]` 随机抽取，如 `600MB–2.2GB`，带 60s 防震荡冷却锁） |
 | `--workers <1\|N\|auto>` | `1` | 工作线程数；默认 `1` 为单线程模式，Linux 可选多核 `SO_REUSEPORT` |
 | `--keepalive <SECS>` | `5` | RFC 7675 STUN Consent 保活间隔（自动加 `±20%` 抖动；无应答时按 RFC 5389 §7.2.1 同 `txid` 重传 2 次，约 `4.7s` 确认黑洞并自动换口） |
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE` + DTLS `close_notify` 优雅退出 |
