@@ -1,4 +1,4 @@
-# WebRTC-Cloak Protocol Specification (`V3.2` / `v0.3.8`)
+# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.4.0`)
 
 This document specifies the wire format, cryptographic schedule, state machine, and security boundaries of `webrtc-cloak-rs`.
 
@@ -84,6 +84,8 @@ iv[8..12] = ext_seq[31:0]
 - `inner_frame`:
   - Normal UDP Data: `[inner_len: u16 BE (<= 65400)] || [udp_payload]`
   - In-Band Selftest Probe: `[0xFFFE: u16 BE] || [probe_len: u16 BE (<= 1460)] || [probe_payload]` (echoed 1:1 by Ready server; never forwarded to backend).
+  - V4 In-Band 1-RTT Path Challenge/Response/Confirm: `[0xFFFD: u16 BE] || [len] || [0x01|0x02|0x03 || nonce(8B) || optional epoch_be(8B)]`.
+  - V4 In-Band MBB Atomic Backend Handover: `[0xFFFC: u16 BE] || [len] || [0x01 || old_ufrag_len || old_ufrag || HKDF-SHA256(old_skey, new_skey, "handover-v4")]` (and server ack `[0x02 || 0x01|0x00]`).
 - **Dual-SSRC Routing** (enabled automatically when DTLS 1.3 is negotiated):
   - `PT=111` (Opus 48 kHz, 960 ticks/20ms): packets smaller than jittered threshold `180..=307B`, strictly capped to **at most 1 packet per 20ms frame (`<= 50 pps`)**; talkspurt `M=1` after `>=200ms` silence.
   - `PT=96` (Video 90 kHz): all remaining and overflow packets; strict RFC 3550 `M=1` causality guarantees no packet ever reuses a closed frame's timestamp after `M=1`.
@@ -105,14 +107,16 @@ iv[8..12] = ext_seq[31:0]
 
 ## 6. Lifecycle, Resilience & Zero-Downtime Rolling Mechanisms
 
-1. **Asymmetric Uplink Blackhole Self-Healing & Trickle Control-Plane Backoff (`v0.3.8`)**:
+1. **Asymmetric Uplink Blackhole 1-RTT ICE Path Migration & Trickle Control-Plane Backoff (`V4.0`)**:
    - Client validates uplink solely via RFC 7675 STUN Binding Success (`5s ± 20%` during active traffic, conservatively backed off to `10–14s` during idle/trickle `< 4 KB / 15s`, snapping back immediately on data burst).
-   - Missed replies retransmit the exact same `txid` (`1.1s -> 1.6s -> 2.0s`; damped to 4 retries if rotated within 60s). Confirmed blackholes move the old socket to a **50s** receive-only `Closing` drain (Make-Before-Break downlink SRTP delivery, zero WAN TX, zero ICMP bounce) while opening a fresh 5-tuple; server silently reaps old sessions after **45s** (`PEER_CONSENT_TIMEOUT`).
-   - During idle/trickle (`< 4 KB / 15s`), client SRTCP backs off to `20–40s`, and server SRTCP backs off to `20–40s` before pausing unsolicited reports after 60s of pure trickle (eliminating empty-room control-plane chatter while remaining 100% rolling-upgrade compatible with `v0.3.7`).
+   - Missed replies retransmit the exact same `txid` (`1.1s -> 1.6s -> 2.0s`; damped to 4 retries if rotated within 60s).
+   - On confirmed blackhole, client preserves its DTLS-PFS `session_key`, `SrtpCloakCipher` monotonic sequence state, and `ufrag`, moves the old socket into a **50s** silent receive-only drain pool (`old_path_drains`, zero ICMP bounce), and performs **1-RTT RFC 8445 ICE path migration** on a fresh 5-tuple using a standard `STUN Binding Request (USE-CANDIDATE)` signed with per-session `mi_key_mig = HKDF-SHA256("webrtc-cloak-v4-salt", session_key, "ice-pwd-v4")` (blocking global-PSK hijacking).
+   - Server validates `mi_key_mig` + 64-bit `tie_breaker` + `SeenTxidCache` (capped at `<= 4` challenges/sec per session, bounded 4-slot per-session candidate table reusing `(nonce, epoch)` idempotently for reordered STUNs) and replies with `64B STUN Success` + unpadded encrypted `57B 0xFFFD` Challenge (`121B <= 1.32x` anti-reflection bound) **without touching `token_by_peer`, switching downlink, or moving multi-worker ownership until the candidate echoes the encrypted `0xFFFD` Response**. Once verified, server atomically updates `peer_addr` (keeping the exact same `backend_sock` / `backend_lport`, even across Linux `SO_REUSEPORT` workers via bounded `4096`-cap cross-worker queues!) and drains old-path ECMP-reordered uplink for 5s without rolling back `path_epoch`. Automatic fallback to fresh STUN+DTLS preserves both rolling-upgrade compatibility with `v0.3.8` servers and buffered `pending` app packets.
+   - During idle/trickle (`< 4 KB / 15s`), client SRTCP backs off to `20–40s`, and server SRTCP backs off to `20–40s` before pausing unsolicited reports after 60s of pure trickle.
 2. **Graceful Shutdown (`SIGTERM`/`SIGINT`, `v0.3.7` / hardened `v0.3.8`)**: Server and client register `mio::Waker` handles for sub-millisecond `SIGTERM` wakeup and broadcast encrypted `SRTCP BYE + DTLS close_notify` to all active sessions before exiting. Active clients defer reconnect by a jittered **`80–350ms`** (buffering arriving app packets) to clear `systemd` restart bind gaps without triggering plaintext `ICMP Port Unreachable`.
-3. **Proactive Make-Before-Break Scheduled Rotation (`--rotate-interval` / `--rotate-bytes`, `v0.3.8`)**:
-   - Supports dual triggers: right-skewed **log-normal duration** (`[0.35x, 2.80x]` around `--rotate-interval`, breaking `[0.8R, 1.2R]` rectangular fingerprints) AND randomized **single-session byte-volume budget** (`--rotate-bytes`, default `1200 MiB` → `600–2220 MiB` when `--rotate-interval > 0`, protected by a 60s cooldown lock).
-   - Automatically **suspends** proactive duration-based MBB churn during overnight background trickle (`< 64 KB / 5 min`), waking when real traffic resumes or at a 5–8h fallback cap.
-   - Tracks explicit `standby_for_primary` ownership and cleans up orphan standbys on primary failure/restart/close.
-   - On 0ms cutover, keeps the old session silently receiving (`DrainingBeforeBye`) for a randomized **2–10s** before sending encrypted `SRTCP BYE + DTLS close_notify` (followed by a 1s post-BYE client drain and 250ms server `Closing` downlink flush) — eliminating `<1ms` new-Ready → old-BYE fingerprints and delivering slow backend replies / ECMP-reordered packets with zero loss.
+3. **Proactive Make-Before-Break Scheduled Rotation with Encrypted `0xFFFC` Backend Handover (`--rotate-interval` / `--rotate-bytes`, `V4.0`)**:
+   - Uses a **complete fresh DTLS 1.3 handshake** with brand-new unlinkable `ufrag`, `SSRC`, `CNAME`, and ECDHE PFS `session_key` (never reusing plaintext identifiers across scheduled rotations).
+   - Before promoting the standby session, client sends an encrypted in-band `0xFFFC` handover frame carrying `old_ufrag` and `HKDF-SHA256(old_session_key, new_session_key, "handover-v4")` (4 × 380ms retries). Server verifies the proof in constant time (single-use per old session, idempotent on retransmit) and atomically transfers exclusive ownership of `old_sess`'s live `backend_sock` (`BackendPipe::Owned` → `ForwardLocal`/`ForwardRemote`, chained forwarding up to 4 hops, zero `dup()` races, works across Linux `SO_REUSEPORT` workers) so **even strict source-port-pinned UDP backends see 0 port changes and 0 packet loss**. All `0xFFFD`/`0xFFFC` control frames account into SRTP `tx_pkts`/`rx_pkts` for strict RFC 3550 RTCP causality.
+   - Dual triggers: right-skewed **log-normal duration** (`[0.35x, 2.80x]` around `--rotate-interval`) AND randomized **single-session byte-volume budget** (`--rotate-bytes`, default `1200 MiB` → `600–2220 MiB`, 60s cooldown), suspended during background trickle (`< 64 KB / 5 min`, 5–8h fallback cap).
+   - Tracks explicit `standby_for_primary` ownership, cancels orphan standbys on primary failure/restart/close, and delays old-session `BYE` by randomized **2–10s** (`DrainingBeforeBye`) + 1s post-BYE client drain + 250ms server `Closing` downlink flush.
 4. **Known Scope Boundaries**: `webrtc-cloak` is a transparent UDP transport wrapper (not a TCP/TUN VPN), cannot bypass networks blocking 100% of UDP egress, cannot erase single-tenant `(src_ip, dst_ip)` macro NetFlow correlation on a single server, and carries pure-Rust `dimpl` JA4D stack characteristics distinct from C++ BoringSSL.

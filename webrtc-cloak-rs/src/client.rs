@@ -1,20 +1,24 @@
-//! mio-based zero-allocation webrtc-cloak V3.2 client (Hardened):
+//! mio-based zero-allocation webrtc-cloak V4.0 client (Hardened):
 //!   - RFC 8445 / 7675 STUN ICE (4:4 Base64 ufrag, session-constant tie-breaker & priority,
-//!     5s±20% Consent Freshness keepalive, zero-alloc pre-auth strict MI-then-FP parsing)
+//!     5s±20% Consent Freshness keepalive with conservative 10–14s trickle backoff,
+//!     V4.0 1-RTT ICE path migration using per-session HKDF `ice-pwd-v4` + `0xFFFD` challenge/echo)
 //!   - Real RFC 9147 DTLS 1.3 + RFC 6347 DTLS 1.2 via `dimpl 0.9.0` (multi-MTU ClientHello pool,
 //!     mutual rotating P-256 certs, encrypted DTLS 1.3 certs, optional `--dtls-min-version 1.3`,
 //!     Fail-Closed Hybrid PFS, Flight 5 Ready-state retransmit driver, fail-fast handshake reset)
+//!   - V4.0 Scheduled MBB rotation: unlinkable fresh DTLS 1.3 + encrypted `0xFFFC` atomic server
+//!     `backend_sock` handover (0 backend port change, 2–10s delayed old-session BYE)
 //!   - RFC 3550/7714/8285 Dual-SSRC SRTP (PT=111 <=50pps Opus + PT=96 strict M=1 video, 0xBEDE TWCC)
 //!   - RFC 3550 §6.1 / 7714 §9.1 Compound SRTCP + Make-Before-Break Closing drain (zero ICMP bounce)
 
 use crate::protocol::{
-    build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
+    build_dimpl_config_pool, build_ice_stun_request, build_ice_stun_request_with_key,
+    combine_session_key, compute_handover_proof, demux_rfc7983, derive_ice_migration_key,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, jitter_duration_ms,
     lognormal_duration_ms, make_fresh_stun_txid, new_dtls_instance, parse_stun_with_key,
     rand_byte_budget, rand_duration_range_ms, register_shutdown_waker, resolve_srtp_suite,
     stun_hmac_key, validate_dtls_datagram, CertCache, CipherPref, CipherSuite, DtlsConfigPool,
-    DtlsMinVersion, PacketKind, RollingByteWindow, SessionIceParams, SrtpCloakCipher,
-    MAX_INNER_UDP_LEN, STUN_BINDING_SUCCESS,
+    DtlsMinVersion, PacketKind, RollingByteWindow, SessionIceParams, SrtpCloakCipher, SrtpFrame,
+    MAX_INNER_UDP_LEN, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS,
 };
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
@@ -85,6 +89,12 @@ pub struct ClientConfig {
 enum HandshakeState {
     StunWait,
     DtlsHandshake,
+    /// V4: Standby MBB session completed DTLS 1.3 and sent encrypted `0xFFFC` Handover Request,
+    /// waiting <=1 RTT for server Ack while the old primary remains 100% live (0ms stall!).
+    HandoverWait,
+    /// V4: Active session switched to a fresh local UDP socket after uplink blackhole and sent
+    /// 1-RTT RFC 8445 ICE migration STUN (`mi_key_mig` + `USE-CANDIDATE`), awaiting `0xFFFD` challenge.
+    Migrating,
     Ready,
     /// MBB post-promotion receive-only overlap: new 5-tuple already carries all new uplink while
     /// the old 5-tuple stays Ready on the server for a random 2–10s window so slow backend replies
@@ -92,6 +102,12 @@ enum HandshakeState {
     /// is broken. At the deadline, send encrypted BYE + close_notify and transition to `Closing`.
     DrainingBeforeBye(Instant),
     Closing(Instant),
+}
+
+struct OldPathDrain {
+    sock: MioUdpSocket,
+    owner_tok: Token,
+    deadline: Instant,
 }
 
 struct PendingReconnect {
@@ -131,7 +147,20 @@ struct ClientSession {
     ka_retries: u8,
     ka_max_retries: u8,
     ka_rto_at: Option<Instant>,
+    /// V4 1-RTT ICE path migration state & loss-resilient 0xFFFD response echo
+    mig_txid: Option<[u8; 12]>,
+    mig_retries: u8,
+    mig_retry_at: Option<Instant>,
+    mig_echo_payload: Option<Vec<u8>>,
+    mig_echo_next_at: Option<Instant>,
+    mig_echo_left: u8,
+    /// V4 scheduled MBB encrypted 0xFFFC handover state
+    handover_payload: Option<Vec<u8>>,
+    handover_retries: u8,
+    handover_retry_at: Option<Instant>,
     stun_key: Option<[u8; 32]>,
+    session_key: Option<[u8; 32]>,
+    mi_key_mig: Option<[u8; 32]>,
     ssrc_c2s: u32,
     ssrc_s2c: u32,
     dtls: Option<Dtls>,
@@ -222,10 +251,15 @@ fn cancel_standby_for_client(
     now: Instant,
 ) {
     if let Some(st_tok) = standby_by_client.remove(&client_addr) {
+        let owner_prim = sessions_by_token
+            .get(&st_tok)
+            .and_then(|s| s.standby_for_primary);
         if let Some(st_sess) = sessions_by_token.get_mut(&st_tok) {
             if matches!(
                 st_sess.state,
-                HandshakeState::Ready | HandshakeState::DrainingBeforeBye(_)
+                HandshakeState::Ready
+                    | HandshakeState::HandoverWait
+                    | HandshakeState::DrainingBeforeBye(_)
             ) {
                 graceful_teardown_client(st_sess, dtls_buf);
                 st_sess.state =
@@ -233,6 +267,12 @@ fn cancel_standby_for_client(
             } else if !matches!(st_sess.state, HandshakeState::Closing(_)) {
                 st_sess.state =
                     HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+            }
+        }
+        // P1-2 fix: Always clear `standby_spawned` on the surviving primary so MBB never locks up!
+        if let Some(pt) = owner_prim {
+            if let Some(prim) = sessions_by_token.get_mut(&pt) {
+                prim.standby_spawned = false;
             }
         }
     }
@@ -350,6 +390,8 @@ fn drain_client_dtls(
                 == Some(ProtocolVersion::DTLS1_3);
             let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
             let final_key = combine_session_key(&stun_key, Some(km));
+            sess.session_key = Some(final_key);
+            sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
             sess.active_cipher = Some(chosen);
             let mut c = SrtpCloakCipher::new(
                 &final_key,
@@ -416,7 +458,9 @@ fn drain_client_dtls(
 fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
     if matches!(
         sess.state,
-        HandshakeState::Ready | HandshakeState::DrainingBeforeBye(_)
+        HandshakeState::Ready
+            | HandshakeState::HandoverWait
+            | HandshakeState::DrainingBeforeBye(_)
     ) {
         let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
         let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
@@ -447,7 +491,7 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, true, cfg.wan_mtu);
     if !cfg.quiet {
         println!(
-            "[client-rs] V3.2 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs)",
+            "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs)",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
@@ -519,6 +563,11 @@ fn spawn_client_session(
                 }
                 if standby_by_client.get(&old.client_addr) == Some(&t) {
                     standby_by_client.remove(&old.client_addr);
+                    if let Some(pt) = old.standby_for_primary {
+                        if let Some(prim) = sessions_by_token.get_mut(&pt) {
+                            prim.standby_spawned = false;
+                        }
+                    }
                 }
             }
         }
@@ -544,6 +593,11 @@ fn spawn_client_session(
                 }
                 if standby_by_client.get(&s.client_addr) == Some(&t) {
                     standby_by_client.remove(&s.client_addr);
+                    if let Some(pt) = s.standby_for_primary {
+                        if let Some(prim) = sessions_by_token.get_mut(&pt) {
+                            prim.standby_spawned = false;
+                        }
+                    }
                 }
             }
         }
@@ -623,7 +677,18 @@ fn spawn_client_session(
         ka_retries: 0,
         ka_max_retries,
         ka_rto_at: None,
+        mig_txid: None,
+        mig_retries: 0,
+        mig_retry_at: None,
+        mig_echo_payload: None,
+        mig_echo_next_at: None,
+        mig_echo_left: 0,
+        handover_payload: None,
+        handover_retries: 0,
+        handover_retry_at: None,
         stun_key: None,
+        session_key: None,
+        mi_key_mig: None,
         ssrc_c2s: 0,
         ssrc_s2c: 0,
         dtls: None,
@@ -677,6 +742,7 @@ fn run_client_worker(
     let mut sessions_by_token: HashMap<Token, ClientSession> = HashMap::new();
     let mut token_by_client: HashMap<SocketAddr, Token> = HashMap::new();
     let mut standby_by_client: HashMap<SocketAddr, Token> = HashMap::new();
+    let mut old_path_drains: HashMap<Token, OldPathDrain> = HashMap::new();
     let mut pending_reconnects: HashMap<SocketAddr, PendingReconnect> = HashMap::new();
     let mut last_rotation_by_client: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut next_token_id: usize = 1;
@@ -714,7 +780,9 @@ fn run_client_worker(
                 for sess in sessions_by_token.values_mut() {
                     if matches!(
                         sess.state,
-                        HandshakeState::Ready | HandshakeState::DrainingBeforeBye(_)
+                        HandshakeState::Ready
+                            | HandshakeState::HandoverWait
+                            | HandshakeState::DrainingBeforeBye(_)
                     ) {
                         graceful_teardown_client(sess, &mut dtls_buf);
                         torn += 1;
@@ -740,7 +808,23 @@ fn run_client_worker(
         };
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
         let mut to_rotate: Vec<(Token, SocketAddr, bool)> = Vec::new();
+        let mut to_migrate: Vec<Token> = Vec::new();
         let mut to_spawn_standby: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut standby_promoted_timers: Vec<(Token, SocketAddr)> = Vec::new();
+
+        // Expire old migrated receive-only drain sockets
+        if !old_path_drains.is_empty() {
+            let expired_drains: Vec<Token> = old_path_drains
+                .iter()
+                .filter(|(_, d)| now >= d.deadline)
+                .map(|(&t, _)| t)
+                .collect();
+            for dt in expired_drains {
+                if let Some(mut d) = old_path_drains.remove(&dt) {
+                    let _ = poll.registry().deregister(&mut d.sock);
+                }
+            }
+        }
 
         // Fire jittered post-server-BYE reconnects once their 80..350ms backoff expires
         let mut due_reconnects: Vec<SocketAddr> = Vec::new();
@@ -833,7 +917,172 @@ fn run_client_worker(
                         }
                     }
                 }
+                HandshakeState::HandoverWait => {
+                    // Drive DTLS 1.3 Flight 5 retransmit timer if still armed while awaiting 0xFFFC Ack
+                    if let Some(t) = sess.dtls_next_timeout {
+                        let rem = t.saturating_duration_since(now);
+                        if rem > Duration::from_secs(60) {
+                            sess.dtls_next_timeout = None;
+                        } else if now >= t {
+                            let err = if let Some(ref mut dtls) = sess.dtls {
+                                dtls.handle_timeout(now).is_err()
+                            } else {
+                                true
+                            };
+                            if err {
+                                // P1-5 fix: clear expired DTLS timer on Err
+                                sess.dtls_next_timeout = None;
+                            } else if drain_client_dtls(
+                                worker_id,
+                                sess,
+                                &mut dtls_buf,
+                                &mut wbuf,
+                                &cfg,
+                                &cpu,
+                                now,
+                                None,
+                            ) {
+                                sess.state = HandshakeState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                );
+                                continue;
+                            }
+                        } else if rem < wait {
+                            wait = rem.max(Duration::from_millis(5));
+                        }
+                    }
+                    if let Some(rt) = sess.handover_retry_at {
+                        if now >= rt {
+                            // P0-5 fix: 4 retries x ~380ms (~1.5s) covers >=2 full DTLS 1.3 Flight 5 RTOs
+                            // on 180ms trans-Pacific WAN while old primary keeps running with 0ms stall!
+                            if sess.handover_retries < 4 {
+                                sess.handover_retries += 1;
+                                if let (Some(ref payload), Some(ref mut cipher)) =
+                                    (&sess.handover_payload, &mut sess.cipher)
+                                {
+                                    if let Some(wn) = cipher.wrap_control_into(
+                                        SRTP_HANDOVER_MAGIC,
+                                        payload,
+                                        &mut wbuf,
+                                    ) {
+                                        if sess.upstream.send(&wbuf[..wn]).is_ok() {
+                                            sess.tx_pkts += 1;
+                                        }
+                                    }
+                                }
+                                sess.handover_retry_at =
+                                    Some(now + retry_dur.max(Duration::from_millis(380)));
+                            } else {
+                                // P0-5 fix: Only fall back to legacy v0.3.8 promotion if peer proved live
+                                // (authenticated SRTCP/SRTP or DTLS 1.3 Flight 5 ACK received); otherwise
+                                // abort the unconfirmed standby and keep the healthy primary untouched!
+                                let server_confirmed_alive = sess.rx_pkts > 0
+                                    || sess.srtcp_rx > 0
+                                    || sess.dtls_next_timeout.is_none();
+                                sess.handover_payload = None;
+                                sess.handover_retry_at = None;
+                                if server_confirmed_alive {
+                                    sess.state = HandshakeState::Ready;
+                                    standby_promoted_timers.push((tok, sess.client_addr));
+                                } else {
+                                    log(
+                                        worker_id,
+                                        &format!(
+                                            "MBB standby handover unconfirmed (0 server rx) up_sport={} -> aborting standby",
+                                            sess.local_port
+                                        ),
+                                    );
+                                    graceful_teardown_client(sess, &mut dtls_buf);
+                                    sess.state = HandshakeState::Closing(
+                                        now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                    );
+                                }
+                            }
+                        } else {
+                            let rem = rt.saturating_duration_since(now);
+                            if rem < wait {
+                                wait = rem.max(Duration::from_millis(5));
+                            }
+                        }
+                    }
+                }
+                HandshakeState::Migrating => {
+                    if let Some(rt) = sess.mig_retry_at {
+                        if now >= rt {
+                            if sess.mig_retries < 2 {
+                                sess.mig_retries += 1;
+                                if let Some(mk) = sess.mi_key_mig {
+                                    // Fresh txid on each retry prevents an on-path spoofed-IP racer from stalling us!
+                                    let (pkt, txid) = build_ice_stun_request_with_key(
+                                        &cfg.psk,
+                                        &mk,
+                                        &sess.ice,
+                                        None,
+                                        true,
+                                    );
+                                    let _ = sess.upstream.send(&pkt);
+                                    sess.mig_txid = Some(txid);
+                                }
+                                sess.mig_retry_at = Some(now + retry_dur);
+                            } else {
+                                // Server lost session state or is legacy v0.3.8 -> fall back to fresh STUN+DTLS!
+                                log(
+                                    worker_id,
+                                    &format!(
+                                        "ICE 1-RTT migration unanswered up_sport={} -> falling back to fresh STUN+DTLS",
+                                        sess.local_port
+                                    ),
+                                );
+                                sess.mig_txid = None;
+                                sess.mig_retry_at = None;
+                                sess.state = HandshakeState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                );
+                                to_rotate.push((tok, sess.client_addr, true));
+                                continue;
+                            }
+                        } else {
+                            let rem = rt.saturating_duration_since(now);
+                            if rem < wait {
+                                wait = rem.max(Duration::from_millis(5));
+                            }
+                        }
+                    }
+                }
                 HandshakeState::Ready => {
+                    // V4: Re-send encrypted 0xFFFD path challenge response if lossy link dropped first copy
+                    if sess.mig_echo_left > 0 {
+                        if let Some(next_at) = sess.mig_echo_next_at {
+                            if now >= next_at {
+                                if let (Some(ref payload), Some(ref mut cipher)) =
+                                    (&sess.mig_echo_payload, &mut sess.cipher)
+                                {
+                                    if let Some(wn) = cipher.wrap_control_into(
+                                        SRTP_PATH_CHALLENGE_MAGIC,
+                                        payload,
+                                        &mut wbuf,
+                                    ) {
+                                        if sess.upstream.send(&wbuf[..wn]).is_ok() {
+                                            sess.tx_pkts += 1;
+                                        }
+                                    }
+                                }
+                                sess.mig_echo_left -= 1;
+                                if sess.mig_echo_left == 0 {
+                                    sess.mig_echo_payload = None;
+                                    sess.mig_echo_next_at = None;
+                                } else {
+                                    sess.mig_echo_next_at =
+                                        Some(now + Duration::from_millis(250));
+                                }
+                            } else {
+                                let rem = next_at.saturating_duration_since(now);
+                                if rem < wait {
+                                    wait = rem.max(Duration::from_millis(10));
+                                }
+                            }
+                        }
+                    }
                     // H-01 fix: DTLS 1.3 Client emits Output::Connected upon sending Flight 5 (Cert+CV+Fin)
                     // while keeping its Flight 5 retransmission timer armed until server ACK arrives.
                     // Drive near-term (<60s) dtls_next_timeout in Ready state so a single lost Flight 5
@@ -930,7 +1179,6 @@ fn run_client_worker(
                                 })
                         });
                         if byte_trigger {
-                            sess.standby_spawned = true;
                             to_spawn_standby.push((tok, sess.client_addr));
                         } else if let Some(rot_at) = sess.rotate_at {
                             if now >= rot_at {
@@ -946,7 +1194,6 @@ fn run_client_worker(
                                 let hard_cap_hit = sess.hard_rotate_at.map_or(false, |h| now >= h)
                                     && now.duration_since(sess.last_data_active) <= idle_dur;
                                 if active_traffic || hard_cap_hit {
-                                    sess.standby_spawned = true;
                                     to_spawn_standby.push((tok, sess.client_addr));
                                 } else {
                                     // Background trickle keepalives only -> suspend MBB churn and re-check later!
@@ -994,6 +1241,31 @@ fn run_client_worker(
                                     } else {
                                         let active_recently = now.duration_since(sess.last_data_active)
                                             <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                        if active_recently
+                                            && !sess.is_standby
+                                            && sess.mi_key_mig.is_some()
+                                            && sess.cipher.is_some()
+                                        {
+                                            // V4: Attempt 1-RTT RFC 8445 ICE path migration on fresh 5-tuple
+                                            // (preserves DTLS PFS key, SRTP seq, and server backend_lport!)
+                                            log(
+                                                worker_id,
+                                                &format!(
+                                                    "RFC 7675 consent lost ({}/{} STUN unanswered) client={} up_sport={} -> 1-RTT ICE path migration (draining old {}s)",
+                                                    sess.ka_max_retries + 1,
+                                                    sess.ka_max_retries + 1,
+                                                    sess.client_addr,
+                                                    sess.local_port,
+                                                    BLACKHOLE_DRAIN_SECS,
+                                                ),
+                                            );
+                                            sess.ka_txid = None;
+                                            sess.ka_pkt.clear();
+                                            sess.ka_retries = 0;
+                                            sess.ka_rto_at = None;
+                                            to_migrate.push(tok);
+                                            continue;
+                                        }
                                         log(
                                             worker_id,
                                             &format!(
@@ -1097,9 +1369,93 @@ fn run_client_worker(
             }
         }
 
+        // Execute V4 1-RTT ICE path migrations (blackhole recovery without DTLS re-handshake or backend port change)
+        for tok in to_migrate {
+            let client_addr_opt = sessions_by_token.get(&tok).map(|s| s.client_addr);
+            let Some(client_addr) = client_addr_opt else {
+                continue;
+            };
+            cancel_standby_for_client(
+                client_addr,
+                &mut standby_by_client,
+                &mut sessions_by_token,
+                &mut dtls_buf,
+                now,
+            );
+            let recently_rotated = last_rotation_by_client
+                .get(&client_addr)
+                .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+                .unwrap_or(false);
+            last_rotation_by_client.insert(client_addr, now);
+            let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+            let new_up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, 2 * 1024 * 1024) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
+            let new_port = new_up.local_addr().map(|a| a.port()).unwrap_or(0);
+            if let Some(sess) = sessions_by_token.get_mut(&tok) {
+                let mut old_up = std::mem::replace(&mut sess.upstream, new_up);
+                let _ = poll.registry().deregister(&mut old_up);
+                if poll.registry().register(&mut sess.upstream, tok, Interest::READABLE).is_err() {
+                    // Restore old socket on unexpected registration failure
+                    sess.upstream = old_up;
+                    let _ = poll.registry().register(&mut sess.upstream, tok, Interest::READABLE);
+                    continue;
+                }
+                // Move old blackholed socket into bounded silent receive-only drain pool (50s, zero ICMP bounce!)
+                if old_path_drains.len() >= MAX_DRAINING_SESSIONS {
+                    if let Some((&oldest_t, _)) = old_path_drains.iter().min_by_key(|(_, d)| d.deadline) {
+                        if let Some(mut evicted) = old_path_drains.remove(&oldest_t) {
+                            let _ = poll.registry().deregister(&mut evicted.sock);
+                        }
+                    }
+                }
+                let drain_tok = Token(next_token_id);
+                next_token_id = next_token_id.wrapping_add(1);
+                if next_token_id == 0 || next_token_id == usize::MAX {
+                    next_token_id = 1;
+                }
+                if poll.registry().register(&mut old_up, drain_tok, Interest::READABLE).is_ok() {
+                    old_path_drains.insert(
+                        drain_tok,
+                        OldPathDrain {
+                            sock: old_up,
+                            owner_tok: tok,
+                            deadline: now + Duration::from_secs(BLACKHOLE_DRAIN_SECS),
+                        },
+                    );
+                }
+
+                let old_port = sess.local_port;
+                sess.local_port = new_port;
+                sess.ka_max_retries = if recently_rotated {
+                    KA_MAX_RETRIES_DAMPED
+                } else {
+                    KA_MAX_RETRIES
+                };
+                if let Some(mk) = sess.mi_key_mig {
+                    let (pkt, txid) =
+                        build_ice_stun_request_with_key(&cfg.psk, &mk, &sess.ice, None, true);
+                    let _ = sess.upstream.send(&pkt);
+                    sess.state = HandshakeState::Migrating;
+                    sess.mig_txid = Some(txid);
+                    sess.mig_retries = 0;
+                    sess.mig_retry_at = Some(now + retry_dur);
+                    log(
+                        worker_id,
+                        &format!(
+                            "ICE 1-RTT migration started client={} old_sport={} -> new_sport={} ufrag={}",
+                            client_addr, old_port, new_port, sess.ice.username()
+                        ),
+                    );
+                }
+            }
+        }
+
         for (prim_tok, client_addr) in to_spawn_standby {
             if !standby_by_client.contains_key(&client_addr) {
-                let _ = spawn_client_session(
+                // P1-2 fix: Only set `standby_spawned = true` when spawn actually succeeds!
+                if spawn_client_session(
                     worker_id,
                     client_addr,
                     &cfg,
@@ -1115,7 +1471,13 @@ fn run_client_worker(
                     idle_dur,
                     KA_MAX_RETRIES,
                     Some(prim_tok),
-                );
+                )
+                .is_some()
+                {
+                    if let Some(prim) = sessions_by_token.get_mut(&prim_tok) {
+                        prim.standby_spawned = true;
+                    }
+                }
             }
         }
 
@@ -1145,7 +1507,17 @@ fn run_client_worker(
                 KA_MAX_RETRIES
             };
             if active_recently {
-                let _ = spawn_client_session(
+                // P0-5 fix: Carry over any buffered app packets (`old_sess.pending`) into the replacement session!
+                let (carried_pending, carried_bytes) = sessions_by_token
+                    .get_mut(&old_tok)
+                    .map(|s| {
+                        let p = std::mem::take(&mut s.pending);
+                        let b = s.pending_bytes;
+                        s.pending_bytes = 0;
+                        (p, b)
+                    })
+                    .unwrap_or_else(|| (VecDeque::new(), 0));
+                if let Some(new_tok) = spawn_client_session(
                     worker_id,
                     client_addr,
                     &cfg,
@@ -1161,13 +1533,27 @@ fn run_client_worker(
                     idle_dur,
                     next_ka_retries,
                     None,
-                );
+                ) {
+                    if !carried_pending.is_empty() {
+                        if let Some(ns) = sessions_by_token.get_mut(&new_tok) {
+                            ns.pending = carried_pending;
+                            ns.pending_bytes = carried_bytes;
+                        }
+                    }
+                }
             }
         }
 
         for (tok, reason) in to_close {
             if let Some(mut sess) = sessions_by_token.remove(&tok) {
                 let _ = poll.registry().deregister(&mut sess.upstream);
+                // P2-1: Shrink any remaining old_path_drains owned by a normally closed session to free 2MB socket FDs promptly
+                let drain_cap = now + Duration::from_millis(CLOSING_DRAIN_MS);
+                for d in old_path_drains.values_mut() {
+                    if d.owner_tok == tok && d.deadline > drain_cap {
+                        d.deadline = drain_cap;
+                    }
+                }
                 if token_by_client.get(&sess.client_addr) == Some(&tok) {
                     token_by_client.remove(&sess.client_addr);
                     // Primary closed -> cancel any orphan standby belonging to it!
@@ -1216,7 +1602,8 @@ fn run_client_worker(
         }
 
         let now = Instant::now();
-        let mut standby_promoted: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut standby_ready: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut standby_promoted: Vec<(Token, SocketAddr)> = standby_promoted_timers;
         let mut graceful_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
         for ev in events.iter() {
             if ev.token() == WAKE_TOKEN {
@@ -1318,6 +1705,58 @@ fn run_client_worker(
                         }
                     }
                 }
+            } else if let Some(drain) = old_path_drains.get_mut(&ev.token()) {
+                // V4 silent receive-only drain for old socket after 1-RTT ICE migration:
+                // still delivers trailing authenticated downlink SRTP with zero WAN TX (zero ICMP bounce!).
+                let owner_tok = drain.owner_tok;
+                loop {
+                    let n = match drain.sock.recv(&mut rbuf) {
+                        Ok(n) => n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    };
+                    let pkt = &rbuf[..n];
+                    match demux_rfc7983(pkt) {
+                        PacketKind::Srtp => {
+                            if let Some(owner) = sessions_by_token.get_mut(&owner_tok) {
+                                if let Some(ref mut cipher) = owner.cipher {
+                                    if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
+                                        if listen_sock.send_to(&wbuf[..pn], owner.client_addr).is_ok() {
+                                            owner.rx_pkts += 1;
+                                            owner.rx_bytes += pn as u64;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // P1-5 fix: Detect server SIGTERM graceful BYE arriving on old draining socket during migration!
+                        PacketKind::Srtcp => {
+                            if let Some(owner) = sessions_by_token.get_mut(&owner_tok) {
+                                if matches!(
+                                    owner.state,
+                                    HandshakeState::Migrating | HandshakeState::Ready
+                                ) {
+                                    if let Some(ref mut cipher) = owner.cipher {
+                                        if let Some(true) = cipher.verify_srtcp(pkt) {
+                                            owner.srtcp_rx += 1;
+                                            let active_recently = now
+                                                .duration_since(owner.last_data_active)
+                                                <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                            owner.state = HandshakeState::Closing(
+                                                now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                            );
+                                            if !owner.is_standby && active_recently {
+                                                graceful_reconnects
+                                                    .push((owner_tok, owner.client_addr));
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
             } else if let Some(sess) = sessions_by_token.get_mut(&ev.token()) {
                 loop {
                     let n = match sess.upstream.recv(&mut rbuf) {
@@ -1364,6 +1803,22 @@ fn run_client_worker(
 
                     match demux_rfc7983(pkt) {
                         PacketKind::Stun => {
+                            if sess.state == HandshakeState::Migrating {
+                                // V4 1-RTT ICE migration STUN Success signed with per-session mi_key_mig
+                                if let Some(mk) = sess.mi_key_mig {
+                                    if let Some(parsed) = parse_stun_with_key(pkt, &cfg.psk, &mk) {
+                                        if parsed.authenticated
+                                            && parsed.msg_type == STUN_BINDING_SUCCESS
+                                            && sess.mig_txid == Some(parsed.txid)
+                                        {
+                                            // Valid STUN reply; paired 0xFFFD challenge arrives in same flight
+                                            continue;
+                                        }
+                                    }
+                                }
+                                sess.auth_drops += 1;
+                                continue;
+                            }
                             if let Some(parsed) = parse_stun_with_key(pkt, &cfg.psk, &stun_mi_key) {
                                 if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
                                     if sess.state == HandshakeState::StunWait && parsed.txid == sess.stun_txid {
@@ -1410,6 +1865,8 @@ fn run_client_worker(
                                         } else {
                                             let chosen = resolve_srtp_suite(cfg.cipher_pref, None, &cpu, true);
                                             let final_key = combine_session_key(&stun_key, None);
+                                            sess.session_key = Some(final_key);
+                                            sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
                                             sess.active_cipher = Some(chosen);
                                             let mut c = SrtpCloakCipher::new(
                                                 &final_key, s_c2s, s_s2c, true, chosen,
@@ -1431,7 +1888,7 @@ fn run_client_worker(
                                             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
                                             schedule_mbb_timers(sess, &cfg, now);
                                             if sess.is_standby {
-                                                standby_promoted.push((ev.token(), sess.client_addr));
+                                                standby_ready.push((ev.token(), sess.client_addr));
                                             }
                                             let mut flushed = 0usize;
                                             let mut flushed_bytes = 0u64;
@@ -1490,11 +1947,13 @@ fn run_client_worker(
                         }
                         PacketKind::Dtls => {
                             // V3.2: strict DTLS pre-validation + Ready gating + Fail-Fast reset in DtlsHandshake
-                            let ready_only_alert = sess.state == HandshakeState::Ready
-                                && sess
-                                    .ready_at
-                                    .map(|r| now.duration_since(r) > Duration::from_secs(5))
-                                    .unwrap_or(false);
+                            let ready_only_alert = matches!(
+                                sess.state,
+                                HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::Migrating
+                            ) && sess
+                                .ready_at
+                                .map(|r| now.duration_since(r) > Duration::from_secs(5))
+                                .unwrap_or(false);
                             if !validate_dtls_datagram(pkt, ready_only_alert) {
                                 sess.auth_drops += 1;
                                 continue;
@@ -1518,7 +1977,10 @@ fn run_client_worker(
                             }
                             if dtls_err {
                                 sess.auth_drops += 1;
-                                if sess.state == HandshakeState::Ready {
+                                if matches!(
+                                    sess.state,
+                                    HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::Migrating
+                                ) {
                                     // Keep established SRTP tunnel alive; drop corrupted DTLS handle only
                                     sess.dtls = None;
                                     sess.dtls_next_timeout = None;
@@ -1579,19 +2041,21 @@ fn run_client_worker(
                                 && sess.state == HandshakeState::Ready
                                 && sess.is_standby
                             {
-                                standby_promoted.push((ev.token(), sess.client_addr));
+                                standby_ready.push((ev.token(), sess.client_addr));
                             }
                         }
                         PacketKind::Srtcp => {
-                            if sess.state == HandshakeState::Ready {
+                            // P1-5 fix: Also accept authenticated SRTCP (esp. server SIGTERM BYE) during HandoverWait/Migrating!
+                            if matches!(
+                                sess.state,
+                                HandshakeState::Ready
+                                    | HandshakeState::HandoverWait
+                                    | HandshakeState::Migrating
+                            ) {
                                 if let Some(ref mut cipher) = sess.cipher {
                                     if let Some(has_bye) = cipher.verify_srtcp(pkt) {
                                         sess.srtcp_rx += 1;
-                                        // Note: do NOT refresh uplink consent liveness from unsolicited server
-                                        // SRTCP — only STUN Binding Success proves uplink reaches the server.
                                         if has_bye {
-                                            // V3-M-05 + v0.3.7: enter brief Closing drain to absorb close_notify,
-                                            // and immediately reconnect on fresh 5-tuple if active (sub-second server restart!).
                                             let active_recently = now
                                                 .duration_since(sess.last_data_active)
                                                 <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
@@ -1611,17 +2075,155 @@ fn run_client_worker(
                             }
                         }
                         PacketKind::Srtp => {
-                            if sess.state == HandshakeState::Ready {
+                            if matches!(
+                                sess.state,
+                                HandshakeState::Ready
+                                    | HandshakeState::HandoverWait
+                                    | HandshakeState::Migrating
+                            ) {
                                 let mut rx_ok_bytes = 0u64;
-                                if let Some(ref mut cipher) = sess.cipher {
-                                    if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
+                                let frame = sess
+                                    .cipher
+                                    .as_mut()
+                                    .and_then(|c| c.unwrap_into_ex(pkt, &mut wbuf));
+                                match frame {
+                                    Some(SrtpFrame::Data(pn)) => {
                                         sess.last_data_active = now;
+                                        if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0 {
+                                            sess.mig_echo_left = 0;
+                                            sess.mig_echo_payload = None;
+                                            sess.mig_echo_next_at = None;
+                                        }
                                         if listen_sock.send_to(&wbuf[..pn], sess.client_addr).is_ok() {
                                             sess.rx_pkts += 1;
                                             sess.rx_bytes += pn as u64;
                                             rx_ok_bytes = pn as u64;
                                         }
-                                    } else {
+                                    }
+                                    Some(SrtpFrame::PathChallenge(pn)) => {
+                                        sess.rx_pkts += 1;
+                                        if pn == 17 && wbuf[0] == 0x01 {
+                                            // P0-2 fix: Accept 0xFFFD(0x01) both in `Migrating` AND while
+                                            // in `Ready` with unconfirmed `mig_echo_left > 0` (epoch >= current)!
+                                            let cur_epoch = sess
+                                                .mig_echo_payload
+                                                .as_deref()
+                                                .filter(|p| p.len() == 17)
+                                                .map(|p| {
+                                                    u64::from_be_bytes(p[9..17].try_into().unwrap())
+                                                })
+                                                .unwrap_or(0);
+                                            let got_epoch =
+                                                u64::from_be_bytes(wbuf[9..17].try_into().unwrap());
+                                            let accept_challenge = sess.state
+                                                == HandshakeState::Migrating
+                                                || (sess.state == HandshakeState::Ready
+                                                    && sess.mig_echo_left > 0
+                                                    && got_epoch >= cur_epoch);
+                                            if accept_challenge {
+                                                let mut resp_payload = [0u8; 17];
+                                                resp_payload[0] = 0x02;
+                                                resp_payload[1..17].copy_from_slice(&wbuf[1..17]);
+                                                let was_migrating =
+                                                    sess.state == HandshakeState::Migrating;
+                                                let mut flushed = 0usize;
+                                                let mut flushed_bytes = 0u64;
+                                                if was_migrating {
+                                                    sess.pending_bytes = 0;
+                                                }
+                                                if let Some(ref mut cipher) = sess.cipher {
+                                                    let mut cbuf = [0u8; 256];
+                                                    if let Some(wn) = cipher.wrap_control_into(
+                                                        SRTP_PATH_CHALLENGE_MAGIC,
+                                                        &resp_payload,
+                                                        &mut cbuf,
+                                                    ) {
+                                                        if sess.upstream.send(&cbuf[..wn]).is_ok() {
+                                                            sess.tx_pkts += 1;
+                                                        }
+                                                    }
+                                                    if was_migrating {
+                                                        while let Some(raw) =
+                                                            sess.pending.pop_front()
+                                                        {
+                                                            if let Some(wn) =
+                                                                cipher.wrap_into(&raw, &mut wbuf)
+                                                            {
+                                                                if sess
+                                                                    .upstream
+                                                                    .send(&wbuf[..wn])
+                                                                    .is_ok()
+                                                                {
+                                                                    sess.tx_pkts += 1;
+                                                                    sess.tx_bytes +=
+                                                                        raw.len() as u64;
+                                                                    flushed_bytes = flushed_bytes
+                                                                        .saturating_add(
+                                                                            raw.len() as u64,
+                                                                        );
+                                                                    flushed += 1;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                                sess.state = HandshakeState::Ready;
+                                                sess.mig_txid = None;
+                                                sess.mig_retry_at = None;
+                                                sess.mig_echo_payload = Some(resp_payload.to_vec());
+                                                sess.mig_echo_next_at =
+                                                    Some(now + Duration::from_millis(250));
+                                                sess.mig_echo_left = 3;
+                                                if was_migrating {
+                                                    sess.next_keepalive_at =
+                                                        now + jitter_duration_ms(ka_base_ms);
+                                                    if flushed_bytes > 0 {
+                                                        record_client_media_bytes(
+                                                            sess,
+                                                            &cfg,
+                                                            ka_base_ms,
+                                                            now,
+                                                            flushed_bytes,
+                                                        );
+                                                    }
+                                                    log(
+                                                        worker_id,
+                                                        &format!(
+                                                            "ICE 1-RTT MIGRATION OK -> READY up_sport={} flushed={}",
+                                                            sess.local_port, flushed
+                                                        ),
+                                                    );
+                                                }
+                                            }
+                                        } else if pn >= 9 && wbuf[0] == 0x03 {
+                                            // P2-1: Verify confirm nonce matches active in-flight echo
+                                            let nonce_ok = sess
+                                                .mig_echo_payload
+                                                .as_deref()
+                                                .filter(|p| p.len() >= 9)
+                                                .map(|p| &p[1..9] == &wbuf[1..9])
+                                                .unwrap_or(true);
+                                            if nonce_ok {
+                                                sess.mig_echo_left = 0;
+                                                sess.mig_echo_payload = None;
+                                                sess.mig_echo_next_at = None;
+                                            }
+                                        }
+                                    }
+                                    Some(SrtpFrame::Handover(pn)) => {
+                                        sess.rx_pkts += 1;
+                                        if sess.state == HandshakeState::HandoverWait
+                                            && pn >= 2
+                                            && wbuf[0] == 0x02
+                                        {
+                                            sess.handover_payload = None;
+                                            sess.handover_retry_at = None;
+                                            sess.state = HandshakeState::Ready;
+                                            standby_promoted.push((ev.token(), sess.client_addr));
+                                        }
+                                    }
+                                    Some(SrtpFrame::Probe(_)) => {}
+                                    None => {
                                         sess.auth_drops += 1;
                                     }
                                 }
@@ -1636,6 +2238,72 @@ fn run_client_worker(
                             sess.auth_drops += 1;
                         }
                     }
+                }
+            }
+        }
+
+        // V4: When a standby MBB session completes DTLS 1.3 (or STUN), send encrypted 0xFFFC
+        // backend_sock atomic handover request while keeping old primary 100% live (0ms stall!).
+        for (new_tok, client_addr) in standby_ready {
+            let is_current_standby = standby_by_client.get(&client_addr) == Some(&new_tok);
+            let expected_prim = sessions_by_token
+                .get(&new_tok)
+                .and_then(|s| s.standby_for_primary);
+            let owner_info = if is_current_standby
+                && expected_prim.is_some()
+                && token_by_client.get(&client_addr).copied() == expected_prim
+            {
+                expected_prim.and_then(|pt| {
+                    sessions_by_token.get(&pt).and_then(|p| {
+                        if p.state == HandshakeState::Ready {
+                            p.session_key.map(|k| (p.ice.username(), k))
+                        } else {
+                            None
+                        }
+                    })
+                })
+            } else {
+                None
+            };
+
+            let Some((old_ufrag, old_key)) = owner_info else {
+                if is_current_standby {
+                    standby_by_client.remove(&client_addr);
+                }
+                if let Some(orphan) = sessions_by_token.get_mut(&new_tok) {
+                    graceful_teardown_client(orphan, &mut dtls_buf);
+                    orphan.state = HandshakeState::Closing(
+                        now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
+                    );
+                }
+                continue;
+            };
+
+            if let Some(new_sess) = sessions_by_token.get_mut(&new_tok) {
+                if let Some(new_key) = new_sess.session_key {
+                    let proof = compute_handover_proof(&old_key, &new_key);
+                    let ub = old_ufrag.as_bytes();
+                    let mut payload = Vec::with_capacity(2 + ub.len() + 32);
+                    payload.push(0x01);
+                    payload.push(ub.len() as u8);
+                    payload.extend_from_slice(ub);
+                    payload.extend_from_slice(&proof);
+                    if let Some(ref mut cipher) = new_sess.cipher {
+                        if let Some(wn) =
+                            cipher.wrap_control_into(SRTP_HANDOVER_MAGIC, &payload, &mut wbuf)
+                        {
+                            if new_sess.upstream.send(&wbuf[..wn]).is_ok() {
+                                new_sess.tx_pkts += 1;
+                            }
+                        }
+                    }
+                    new_sess.state = HandshakeState::HandoverWait;
+                    new_sess.handover_payload = Some(payload);
+                    new_sess.handover_retries = 0;
+                    new_sess.handover_retry_at =
+                        Some(now + retry_dur.max(Duration::from_millis(380)));
+                } else {
+                    standby_promoted.push((new_tok, client_addr));
                 }
             }
         }
@@ -2815,5 +3483,1374 @@ mod tests {
             port1,
             "background trickle keepalives (<64KB/5min) MUST suspend proactive MBB rotation!"
         );
+    }
+
+    /// V4.0 Scenario #1 (Carbon): Strict source-port-pinned stateful UDP backend (simulating
+    /// legacy game server / SIP / OpenVPN that breaks if server backend_lport EVER changes!)
+    /// MUST see ZERO backend port changes across BOTH:
+    ///   1) Scheduled DTLS 1.3 MBB rotation (unlinkable new ufrag/SSRC + encrypted 0xFFFC handover), AND
+    ///   2) Asymmetric uplink blackhole 1-RTT ICE path migration (ZERO DTLS packets on migrated port!).
+    #[test]
+    fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migration() {
+        let psk = b"v040-strict-pinned-udp-test-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        // StrictPinnedUdpBackend: locks onto first backend_lport; records any violation; pushes async ticks!
+        let pinned_port = Arc::new(AtomicU16::new(0));
+        let port_violations = Arc::new(AtomicUsize::new(0));
+        let stop_backend = Arc::new(AtomicBool::new(false));
+        let b_pinned = Arc::clone(&pinned_port);
+        let b_viol = Arc::clone(&port_violations);
+        let b_stop = Arc::clone(&stop_backend);
+
+        let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut locked_peer: Option<SocketAddr> = None;
+            let mut tick_seq = 0u32;
+            let mut last_tick = Instant::now();
+            while !b_stop.load(Ordering::Relaxed) {
+                if let Ok((n, peer)) = backend_sock.recv_from(&mut buf) {
+                    match locked_peer {
+                        None => {
+                            locked_peer = Some(peer);
+                            b_pinned.store(peer.port(), Ordering::SeqCst);
+                        }
+                        Some(p) if p != peer => {
+                            b_viol.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                    // Always reply ONLY to locked_peer!
+                    if let Some(lp) = locked_peer {
+                        let _ = backend_sock.send_to(&buf[..n], lp);
+                    }
+                }
+                if let Some(lp) = locked_peer {
+                    if last_tick.elapsed() >= Duration::from_millis(35) {
+                        last_tick = Instant::now();
+                        let msg = format!("TICK:{:05}", tick_seq);
+                        tick_seq += 1;
+                        let _ = backend_sock.send_to(msg.as_bytes(), lp);
+                    }
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let blackhole_port = Arc::new(AtomicU16::new(0));
+        let dtls_by_port = Arc::new(std::sync::Mutex::new(HashMap::<u16, usize>::new()));
+        let r_latest = Arc::clone(&latest_port);
+        let r_bh = Arc::clone(&blackhole_port);
+        let r_dtls = Arc::clone(&dtls_by_port);
+
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let bh = r_bh.load(Ordering::SeqCst);
+                    if bh != 0 && cport == bh {
+                        continue; // 100% asymmetric uplink blackhole!
+                    }
+                    if demux_rfc7983(&buf[..n]) == PacketKind::Dtls {
+                        *r_dtls.lock().unwrap().entry(cport).or_insert(0) += 1;
+                    }
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(&buf[..n]);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 16 * 1024, // triggers full DTLS 1.3 MBB + 0xFFFC handover!
+                rotate_cooldown_secs: 1,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 1,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+
+        let mut rbuf = [0u8; 2048];
+        let mut ready = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"PIN_INIT");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PIN_INIT" {
+                    ready = true;
+                    break;
+                }
+            } else {
+                thread::sleep(Duration::from_millis(30));
+            }
+        }
+        assert!(ready, "initial tunnel must come up");
+        let port1 = latest_port.load(Ordering::SeqCst);
+        let initial_backend_port = pinned_port.load(Ordering::SeqCst);
+        assert_ne!(initial_backend_port, 0);
+
+        // Phase 1: Trigger full DTLS 1.3 MBB rotation via byte budget (port1 -> port2)
+        // Verify unlinkable DTLS handshake happened on port2 AND backend_lport stayed 100% IDENTICAL!
+        app.set_nonblocking(true).unwrap();
+        let mut ticks_seen = 0usize;
+        let t_mbb = Instant::now();
+        let mut port2 = 0u16;
+        while t_mbb.elapsed() < Duration::from_secs(5) {
+            let bulk = vec![0x42u8; 900];
+            let _ = app.send(&bulk);
+            while let Ok(n) = app.recv(&mut rbuf) {
+                if rbuf[..n].starts_with(b"TICK:") {
+                    ticks_seen += 1;
+                }
+            }
+            let cur = latest_port.load(Ordering::SeqCst);
+            if cur != port1 {
+                port2 = cur;
+                // Send a few more packets on port2 to confirm StrictPinnedUdpBackend accepts them!
+                for i in 0..5u32 {
+                    let p = format!("POST_MBB_{}", i);
+                    let _ = app.send(p.as_bytes());
+                    thread::sleep(Duration::from_millis(25));
+                    while let Ok(n) = app.recv(&mut rbuf) {
+                        if rbuf[..n].starts_with(b"TICK:") {
+                            ticks_seen += 1;
+                        }
+                    }
+                }
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_ne!(port2, 0, "MBB byte-budget rotation must switch off port {}", port1);
+        assert!(
+            *dtls_by_port.lock().unwrap().get(&port2).unwrap_or(&0) >= 2,
+            "scheduled MBB rotation MUST run fresh DTLS 1.3 handshake on port2 (unlinkable outer identity!)"
+        );
+        assert_eq!(
+            port_violations.load(Ordering::SeqCst),
+            0,
+            "scheduled DTLS 1.3 MBB + 0xFFFC handover MUST NEVER change server backend_lport!"
+        );
+
+        // Phase 2: Inject 100% asymmetric uplink blackhole on port2 -> triggers V4 1-RTT ICE migration (port2 -> port3)!
+        blackhole_port.store(port2, Ordering::SeqCst);
+        let t_mig = Instant::now();
+        let mut recovered_after_mig = false;
+        let mut port3 = 0u16;
+        while t_mig.elapsed() < Duration::from_secs(9) {
+            let _ = app.send(b"PING_POST_1RTT_MIG");
+            while let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PING_POST_1RTT_MIG" {
+                    let cur = latest_port.load(Ordering::SeqCst);
+                    if cur != port2 && cur != port1 {
+                        port3 = cur;
+                        recovered_after_mig = true;
+                    }
+                } else if rbuf[..n].starts_with(b"TICK:") {
+                    ticks_seen += 1;
+                }
+            }
+            if recovered_after_mig {
+                break;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        stop_backend.store(true, Ordering::SeqCst);
+
+        assert!(recovered_after_mig, "1-RTT ICE migration MUST recover from asymmetric blackhole on port {}", port2);
+        assert_eq!(
+            *dtls_by_port.lock().unwrap().get(&port3).unwrap_or(&0),
+            0,
+            "1-RTT ICE blackhole migration on port {} MUST NOT run any DTLS handshake!",
+            port3
+        );
+        assert_eq!(
+            port_violations.load(Ordering::SeqCst),
+            0,
+            "StrictPinnedUdpBackend MUST see ZERO backend_lport changes across BOTH MBB handover AND 1-RTT migration!"
+        );
+        assert!(ticks_seen >= 5, "async backend ticks must keep flowing across cutovers (got {})", ticks_seen);
+    }
+
+    /// V4.0 Scenario #2 (Carbon Red-Team):
+    /// 1) Spoofed-IP reflection DDoS: attacker clones legitimate migration STUN from `victim_sock`
+    ///    while backend streams heavy downlink SRTP -> `victim_sock` MUST receive <200B total (0 business SRTP!);
+    /// 2) Same-PSK cross-session hijack: evil peer with SAME PSK tries (a) global-PSK STUN migration
+    ///    using victim's plaintext ufrag, and (b) encrypted 0xFFFC handover with forged proof -> BOTH 100% blocked!
+    #[test]
+    fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
+        let psk = b"v040-redteam-anti-reflection-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        // Heavy downlink echo backend (amplifies replies 20x to make any reflection leak unmistakable!)
+        let stop_all = Arc::new(AtomicBool::new(false));
+        let b_stop = Arc::clone(&stop_all);
+        let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let big = vec![0xEEu8; 1000];
+            while !b_stop.load(Ordering::Relaxed) {
+                if let Ok((n, peer)) = backend_sock.recv_from(&mut buf) {
+                    if &buf[..n] == b"BLAST" {
+                        for _ in 0..12 {
+                            let _ = backend_sock.send_to(&big, peer);
+                        }
+                    } else {
+                        let _ = backend_sock.send_to(&buf[..n], peer);
+                    }
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        let s_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: Some(s_stop),
+            });
+        });
+
+        let captured_ufrag = Arc::new(std::sync::Mutex::new(Option::<String>::None));
+        let blackhole_port = Arc::new(AtomicU16::new(0));
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let victim_rx_bytes = Arc::new(AtomicUsize::new(0));
+        let spoof_fired = Arc::new(AtomicBool::new(false));
+
+        let r_ufrag = Arc::clone(&captured_ufrag);
+        let r_bh = Arc::clone(&blackhole_port);
+        let r_latest = Arc::clone(&latest_port);
+        let r_vbytes = Arc::clone(&victim_rx_bytes);
+        let r_spoof = Arc::clone(&spoof_fired);
+        let r_stop = Arc::clone(&stop_all);
+
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        let victim_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        victim_sock.set_nonblocking(true).unwrap();
+        victim_sock.connect(("127.0.0.1", server_port)).unwrap();
+
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            while !r_stop.load(Ordering::Relaxed) {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let pkt = &buf[..n];
+                    if demux_rfc7983(pkt) == PacketKind::Stun {
+                        if let Some(u) = crate::protocol::peek_stun_request_username(pkt) {
+                            let mut g = r_ufrag.lock().unwrap();
+                            if g.is_none() {
+                                *g = Some(u.to_string());
+                            }
+                        }
+                    }
+                    let bh = r_bh.load(Ordering::SeqCst);
+                    if bh != 0 && cport == bh {
+                        continue;
+                    }
+                    // When client opens migrated port (cport != bh && bh != 0), attacker intercepts first
+                    // migration STUN and races it from victim_sock BEFORE forwarding!
+                    if bh != 0
+                        && cport != bh
+                        && demux_rfc7983(pkt) == PacketKind::Stun
+                        && !r_spoof.swap(true, Ordering::SeqCst)
+                    {
+                        let _ = victim_sock.send(pkt);
+                        thread::sleep(Duration::from_millis(5));
+                    }
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(pkt);
+                }
+                while let Ok(vn) = victim_sock.recv(&mut buf) {
+                    r_vbytes.fetch_add(vn, Ordering::SeqCst);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        let c_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 0,
+                rotate_cooldown_secs: 60,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 1,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: Some(c_stop),
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+        let mut rbuf = [0u8; 2048];
+        let mut ready = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"REDTEAM_INIT");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"REDTEAM_INIT" {
+                    ready = true;
+                    break;
+                }
+            } else {
+                thread::sleep(Duration::from_millis(30));
+            }
+        }
+        assert!(ready);
+        let port1 = latest_port.load(Ordering::SeqCst);
+        let victim_ufrag = captured_ufrag.lock().unwrap().clone().expect("ufrag captured");
+
+        // Attack 2a: Same-PSK attacker tries forging STUN migration with victim's plaintext ufrag using global PSK!
+        let evil_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        evil_sock.set_read_timeout(Some(Duration::from_millis(120))).unwrap();
+        evil_sock.connect(("127.0.0.1", server_port)).unwrap();
+        let parts: Vec<&str> = victim_ufrag.split(':').collect();
+        let mut evil_ice = SessionIceParams::generate();
+        evil_ice.ufrag_remote = parts[0].to_string();
+        evil_ice.ufrag_local = parts[1].to_string();
+        let (forged_mig, _) = build_ice_stun_request(&psk, &evil_ice, None, true);
+        let _ = evil_sock.send(&forged_mig);
+        assert!(
+            evil_sock.recv(&mut rbuf).is_err(),
+            "global-PSK forged STUN migration for active ufrag MUST be 100% silent-dropped!"
+        );
+
+        // Attack 2b: Same-PSK attacker opens a real DTLS session and sends encrypted 0xFFFC handover with forged proof!
+        let evil_ice2 = SessionIceParams::generate();
+        let (evil_stun, evil_txid) = build_ice_stun_request(&psk, &evil_ice2, None, true);
+        let _ = evil_sock.send(&evil_stun);
+        let sn = evil_sock.recv(&mut rbuf).expect("evil legit STUN");
+        let parsed_e = parse_stun(&rbuf[..sn], &psk).unwrap();
+        assert!(parsed_e.authenticated);
+        // Complete evil DTLS 1.3 handshake to get real encrypted SRTP channel
+        let cpu = detect_cpu_accel();
+        let dcfg = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, 1488).pick();
+        let mut edtls = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            dcfg,
+            crate::protocol::generate_ephemeral_webrtc_cert(),
+            Instant::now(),
+        );
+        edtls.set_active(true);
+        let _ = edtls.handle_timeout(Instant::now());
+        let mut dbuf = vec![0u8; 4096];
+        let mut ekm = None;
+        let mut e_conn = false;
+        let t_hs = Instant::now();
+        while !e_conn && t_hs.elapsed() < Duration::from_secs(3) {
+            loop {
+                match edtls.poll_output(&mut dbuf) {
+                    DtlsOutput::Packet(p) => { let _ = evil_sock.send(p); }
+                    DtlsOutput::KeyingMaterial(km, _) => ekm = Some(km.to_vec()),
+                    DtlsOutput::Connected => e_conn = true,
+                    DtlsOutput::Timeout(_) => break,
+                    _ => {}
+                }
+            }
+            if !e_conn {
+                if let Ok(rn) = evil_sock.recv(&mut rbuf) {
+                    if demux_rfc7983(&rbuf[..rn]) == PacketKind::Dtls {
+                        let _ = edtls.handle_packet(&rbuf[..rn]);
+                    }
+                }
+            }
+        }
+        assert!(e_conn && ekm.is_some());
+        let (esk, es_c2s, es_s2c) = derive_stun_material(&psk, &evil_txid, &evil_ice2.username());
+        let efk = combine_session_key(&esk, ekm.as_deref());
+        let mut ecipher = SrtpCloakCipher::new(&efk, es_c2s, es_s2c, true, CipherSuite::Aes128Gcm);
+        ecipher.set_dual_ssrc(true);
+        let mut forged_ho = Vec::new();
+        forged_ho.push(0x01);
+        forged_ho.push(victim_ufrag.len() as u8);
+        forged_ho.extend_from_slice(victim_ufrag.as_bytes());
+        forged_ho.extend_from_slice(&[0xAAu8; 32]); // Forged proof!
+        let mut wbuf = [0u8; 512];
+        let wn = ecipher.wrap_control_into(SRTP_HANDOVER_MAGIC, &forged_ho, &mut wbuf).unwrap();
+        let _ = evil_sock.send(&wbuf[..wn]);
+        let mut saw_reject_ack = false;
+        for _ in 0..5 {
+            if let Ok(rn) = evil_sock.recv(&mut rbuf) {
+                if demux_rfc7983(&rbuf[..rn]) == PacketKind::Srtp {
+                    if let Some(SrtpFrame::Handover(hn)) = ecipher.unwrap_into_ex(&rbuf[..rn], &mut wbuf) {
+                        if hn >= 2 && wbuf[0] == 0x02 && wbuf[1] == 0x00 {
+                            saw_reject_ack = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(saw_reject_ack, "forged 0xFFFC handover proof MUST be rejected (status=0x00)!");
+
+        // Attack 1: Trigger blackhole migration while spoofing victim_sock + blasting heavy downlink!
+        blackhole_port.store(port1, Ordering::SeqCst);
+        let t_mig = Instant::now();
+        let mut healed = false;
+        while t_mig.elapsed() < Duration::from_secs(9) {
+            let _ = app.send(b"BLAST");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if n == 1000 && latest_port.load(Ordering::SeqCst) != port1 {
+                    healed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        stop_all.store(true, Ordering::SeqCst);
+
+        assert!(spoof_fired.load(Ordering::SeqCst), "spoof race must have been injected");
+        assert!(healed, "legitimate client MUST still recover via fresh-txid retry despite spoofed racer!");
+        let vbytes = victim_rx_bytes.load(Ordering::SeqCst);
+        assert!(
+            vbytes < 250,
+            "victim_sock MUST NEVER receive reflected backend SRTP (received {}B, expected <250B bounded STUN+Challenge!)",
+            vbytes
+        );
+    }
+
+    /// V4.0 Scenario #3 & #6 (Carbon): High-BDP Trans-Pacific (160ms RTT + 3% loss + 20% reorder)
+    /// mid-flight cutover with StrictPinnedUdpBackend + Outer Wire DPI Statistical Audit!
+    #[test]
+    fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
+        let psk = b"v040-high-bdp-dpi-audit-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let stop_all = Arc::new(AtomicBool::new(false));
+        let pinned_port = Arc::new(AtomicU16::new(0));
+        let port_violations = Arc::new(AtomicUsize::new(0));
+        let b_stop = Arc::clone(&stop_all);
+        let b_pinned = Arc::clone(&pinned_port);
+        let b_viol = Arc::clone(&port_violations);
+
+        let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut locked: Option<SocketAddr> = None;
+            while !b_stop.load(Ordering::Relaxed) {
+                if let Ok((n, peer)) = backend_sock.recv_from(&mut buf) {
+                    match locked {
+                        None => {
+                            locked = Some(peer);
+                            b_pinned.store(peer.port(), Ordering::SeqCst);
+                        }
+                        Some(lp) if lp != peer => {
+                            b_viol.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                    if let Some(lp) = locked {
+                        let _ = backend_sock.send_to(&buf[..n], lp);
+                    }
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        let s_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: Some(s_stop),
+            });
+        });
+
+        // Delay + 3% loss + 20% reorder relay WITH live DPI wire-statistics collector!
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let max_wire_udp = Arc::new(AtomicUsize::new(0));
+        let video_lens = Arc::new(std::sync::Mutex::new(Vec::<usize>::new()));
+        let audio_burst_violations = Arc::new(AtomicUsize::new(0));
+        let r_latest = Arc::clone(&latest_port);
+        let r_maxw = Arc::clone(&max_wire_udp);
+        let r_vlens = Arc::clone(&video_lens);
+        let r_aviol = Arc::clone(&audio_burst_violations);
+        let r_stop = Arc::clone(&stop_all);
+
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut queue: VecDeque<(Instant, bool, u16, SocketAddr, Vec<u8>)> = VecDeque::new();
+            let mut prng: u64 = 0xDEAD_BEEF_CAFE_0040;
+            let mut next_r = || -> u64 {
+                prng ^= prng << 13;
+                prng ^= prng >> 7;
+                prng ^= prng << 17;
+                prng
+            };
+            let mut last_audio_ts_c2s: Option<(u32, Instant)> = None;
+            let mut buf = [0u8; 4096];
+            while !r_stop.load(Ordering::Relaxed) {
+                let now = Instant::now();
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    r_latest.store(cport, Ordering::SeqCst);
+                    r_maxw.fetch_max(n, Ordering::SeqCst);
+                    let pkt = &buf[..n];
+                    if demux_rfc7983(pkt) == PacketKind::Srtp && n >= 12 {
+                        let pt = pkt[1] & 0x7F;
+                        if pt == crate::protocol::RTP_VIDEO_PT {
+                            r_vlens.lock().unwrap().push(n);
+                        } else if pt == crate::protocol::RTP_AUDIO_PT {
+                            let ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
+                            if let Some((prev_ts, prev_t)) = last_audio_ts_c2s {
+                                if prev_ts == ts && now.duration_since(prev_t) < Duration::from_millis(18) {
+                                    r_aviol.fetch_add(1, Ordering::SeqCst);
+                                }
+                            }
+                            last_audio_ts_c2s = Some((ts, now));
+                        }
+                    }
+                    upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    // 3% random loss on SRTP data only (keep test deterministic), 80ms one-way + 20% reorder
+                    if demux_rfc7983(pkt) == PacketKind::Srtp && (next_r() % 100) < 3 {
+                        continue;
+                    }
+                    let mut delay = 40u64; // 80ms RTT
+                    if (next_r() % 100) < 20 {
+                        delay += 15 + (next_r() % 20);
+                    }
+                    queue.push_back((now + Duration::from_millis(delay), true, cport, cli_addr, pkt.to_vec()));
+                }
+                for (&cport, (usock, cli_addr)) in upstreams.iter() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        r_maxw.fetch_max(n, Ordering::SeqCst);
+                        let pkt = &buf[..n];
+                        let mut delay = 40u64;
+                        if (next_r() % 100) < 20 {
+                            delay += 15 + (next_r() % 20);
+                        }
+                        queue.push_back((now + Duration::from_millis(delay), false, cport, *cli_addr, pkt.to_vec()));
+                    }
+                }
+                let mut i = 0;
+                while i < queue.len() {
+                    if queue[i].0 <= now {
+                        let (_, c2s, cp, ca, data) = queue.remove(i).unwrap();
+                        if c2s {
+                            if let Some((us, _)) = upstreams.get(&cp) {
+                                let _ = us.send(&data);
+                            }
+                        } else {
+                            let _ = relay_front.send_to(&data, ca);
+                        }
+                    } else {
+                        i += 1;
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        let c_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 50 * 1024, // mid-flight byte-budget MBB handover during burst!
+                rotate_cooldown_secs: 1,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 250,
+                max_retries: 8,
+                keepalive_secs: 5,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: Some(c_stop),
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+        let mut rbuf = [0u8; 2048];
+        let mut ready = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"BDP_INIT");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"BDP_INIT" {
+                    ready = true;
+                    break;
+                }
+            }
+        }
+        assert!(ready);
+        let port1 = latest_port.load(Ordering::SeqCst);
+
+        // Stream 120 x 1200B packets (~144KB each way) across the 1s cooldown + byte-budget MBB cutover!
+        app.set_nonblocking(true).unwrap();
+        let mut rx_seqs = std::collections::HashSet::<u32>::new();
+        let mut payload = vec![0x55u8; 1200];
+        for seq in 0..120u32 {
+            payload[..4].copy_from_slice(&seq.to_be_bytes());
+            let _ = app.send(&payload);
+            while let Ok(n) = app.recv(&mut rbuf) {
+                if n == 1200 {
+                    rx_seqs.insert(u32::from_be_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]));
+                }
+            }
+            thread::sleep(Duration::from_millis(18));
+        }
+        let t_drain = Instant::now();
+        while t_drain.elapsed() < Duration::from_millis(400) {
+            while let Ok(n) = app.recv(&mut rbuf) {
+                if n == 1200 {
+                    rx_seqs.insert(u32::from_be_bytes([rbuf[0], rbuf[1], rbuf[2], rbuf[3]]));
+                }
+            }
+            thread::sleep(Duration::from_millis(10));
+        }
+        stop_all.store(true, Ordering::SeqCst);
+
+        let port2 = latest_port.load(Ordering::SeqCst);
+        assert_ne!(port2, port1, "byte-budget MBB cutover must fire during high-BDP burst!");
+        assert_eq!(
+            port_violations.load(Ordering::SeqCst),
+            0,
+            "StrictPinnedUdpBackend MUST see ZERO port changes even under 80ms RTT + 3% loss + 20% reorder!"
+        );
+        assert!(
+            rx_seqs.len() >= 100,
+            "delivery under 3% loss + 20% reorder + mid-flight handover must stay >=83% (got {}/120)",
+            rx_seqs.len()
+        );
+        // Outer Wire DPI Audit (Carbon Scenario #6):
+        assert!(max_wire_udp.load(Ordering::SeqCst) <= 1460, "outer wire UDP MUST never exceed 1460B!");
+        assert_eq!(
+            audio_burst_violations.load(Ordering::SeqCst),
+            0,
+            "PT=111 Opus MUST NEVER exceed 1 packet per 20ms frame!"
+        );
+        let vlens = video_lens.lock().unwrap();
+        assert!(vlens.len() >= 50);
+        let mean = vlens.iter().map(|&x| x as f64).sum::<f64>() / (vlens.len() as f64);
+        let var = vlens.iter().map(|&x| { let d = x as f64 - mean; d * d }).sum::<f64>() / (vlens.len() as f64);
+        let stddev = var.sqrt();
+        assert!(
+            stddev > 4.0,
+            "PT=96 video outer packet-length stddev MUST exceed 4.0B for padding entropy (got {:.2}B)!",
+            stddev
+        );
+    }
+
+    /// V4.0 Linux Multi-Worker (`--workers 4` SO_REUSEPORT) cross-thread ownership transfer test:
+    /// Exercises real kernel 4-tuple hashing across 4 workers during BOTH scheduled DTLS 1.3 MBB
+    /// `0xFFFC` handover AND 1-RTT ICE blackhole migration, asserting ZERO `backend_lport` changes!
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn v40_linux_multiworker_reuseport_cross_thread_migration_and_handover() {
+        let psk = b"v040-linux-4worker-reuseport-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let stop_all = Arc::new(AtomicBool::new(false));
+        let port_violations = Arc::new(AtomicUsize::new(0));
+        let b_stop = Arc::clone(&stop_all);
+        let b_viol = Arc::clone(&port_violations);
+
+        let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            let mut locked: Option<SocketAddr> = None;
+            while !b_stop.load(Ordering::Relaxed) {
+                if let Ok((n, peer)) = backend_sock.recv_from(&mut buf) {
+                    match locked {
+                        None => locked = Some(peer),
+                        Some(lp) if lp != peer => {
+                            b_viol.fetch_add(1, Ordering::SeqCst);
+                        }
+                        _ => {}
+                    }
+                    if let Some(lp) = locked {
+                        let _ = backend_sock.send_to(&buf[..n], lp);
+                    }
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        let s_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 4, // Real Linux SO_REUSEPORT 4-worker hash distribution!
+                max_sessions: 64,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: Some(s_stop),
+            });
+        });
+
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let blackhole_port = Arc::new(AtomicU16::new(0));
+        let r_latest = Arc::clone(&latest_port);
+        let r_bh = Arc::clone(&blackhole_port);
+        let r_stop = Arc::clone(&stop_all);
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            while !r_stop.load(Ordering::Relaxed) {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let bh = r_bh.load(Ordering::SeqCst);
+                    if bh != 0 && cport == bh {
+                        continue;
+                    }
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(&buf[..n]);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        let c_stop = Arc::clone(&stop_all);
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 14 * 1024,
+                rotate_cooldown_secs: 1,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 1,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: Some(c_stop),
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+        let mut rbuf = [0u8; 2048];
+        let mut ready = false;
+        let t0 = Instant::now();
+        while t0.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"MW_INIT");
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"MW_INIT" => {
+                    ready = true;
+                    break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => thread::sleep(Duration::from_millis(40)),
+            }
+        }
+        assert!(ready);
+        let p1 = latest_port.load(Ordering::SeqCst);
+
+        // Trigger MBB handover across 4 workers
+        let mut p2 = 0u16;
+        let t_mbb = Instant::now();
+        while t_mbb.elapsed() < Duration::from_secs(5) {
+            let bulk = vec![0x7Au8; 900];
+            let _ = app.send(&bulk);
+            let _ = app.recv(&mut rbuf);
+            let cur = latest_port.load(Ordering::SeqCst);
+            if cur != p1 {
+                p2 = cur;
+                break;
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert_ne!(p2, 0);
+
+        // Trigger 1-RTT blackhole migration across 4 workers
+        blackhole_port.store(p2, Ordering::SeqCst);
+        let mut healed = false;
+        let t_bh = Instant::now();
+        while t_bh.elapsed() < Duration::from_secs(9) {
+            let _ = app.send(b"MW_POST_BH");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"MW_POST_BH" && latest_port.load(Ordering::SeqCst) != p2 {
+                    healed = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(60));
+        }
+        stop_all.store(true, Ordering::SeqCst);
+        assert!(healed, "4-worker SO_REUSEPORT 1-RTT blackhole migration MUST heal!");
+        assert_eq!(
+            port_violations.load(Ordering::SeqCst),
+            0,
+            "4-worker SO_REUSEPORT migration + handover MUST keep backend_lport 100% unchanged!"
+        );
+    }
+
+    /// Carbon Audit P0-1 + P0-2 + P0-5 Regression Test:
+    ///   - Part A (P0-1 + P0-2): Drop the server's VERY FIRST `0xFFFD(0x01)` PathChallenge during
+    ///     1-RTT migration AND replay a reordered earlier migration STUN; client MUST recover cleanly
+    ///     on the migrated port with 0 backend port changes (proving no `token_by_peer` self-lockout
+    ///     and idempotent nonce reuse across the 4-slot candidate table).
+    ///   - Part B (P0-5): When a legacy `v0.3.8` server ignores `mi_key_mig`-signed migration STUN,
+    ///     `Migrating` timeout fallback (`to_rotate`) MUST preserve `old_sess.pending` app packets
+    ///     into the replacement DTLS session without silently dropping them!
+    #[test]
+    fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
+        // ---- Part A: P0-1 (dropped 1st 0xFFFD challenge) + P0-2 (reordered dup migration STUN) ----
+        {
+            let psk = b"v040-carbon-p01-p02-regression-psk".to_vec();
+            let backend_port = reserve_free_port();
+            let server_port = reserve_free_port();
+            let relay_port = reserve_free_port();
+            let client_port = reserve_free_port();
+
+            let stop_all = Arc::new(AtomicBool::new(false));
+            let port_violations = Arc::new(AtomicUsize::new(0));
+            let b_stop = Arc::clone(&stop_all);
+            let b_viol = Arc::clone(&port_violations);
+
+            let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+            backend_sock
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                let mut locked: Option<SocketAddr> = None;
+                while !b_stop.load(Ordering::Relaxed) {
+                    if let Ok((n, peer)) = backend_sock.recv_from(&mut buf) {
+                        match locked {
+                            None => locked = Some(peer),
+                            Some(lp) if lp != peer => {
+                                b_viol.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => {}
+                        }
+                        if let Some(lp) = locked {
+                            let _ = backend_sock.send_to(&buf[..n], lp);
+                        }
+                    }
+                }
+            });
+
+            let srv_psk = psk.clone();
+            let s_stop = Arc::clone(&stop_all);
+            thread::spawn(move || {
+                let _ = run_server(ServerConfig {
+                    listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                    backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                    psk: srv_psk,
+                    cipher_pref: CipherPref::Auto,
+                    dtls_required: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: 1488,
+                    idle_timeout_secs: 60,
+                    stats_interval_secs: 3600,
+                    wire_audit_file: None,
+                    quiet: true,
+                    stop: Some(s_stop),
+                });
+            });
+
+            let blackhole_port = Arc::new(AtomicU16::new(0));
+            let latest_port = Arc::new(AtomicU16::new(0));
+            let dropped_first_challenge = Arc::new(AtomicBool::new(false));
+            let replayed_reordered_stun = Arc::new(AtomicBool::new(false));
+            let r_bh = Arc::clone(&blackhole_port);
+            let r_latest = Arc::clone(&latest_port);
+            let r_drop_ch = Arc::clone(&dropped_first_challenge);
+            let r_replay = Arc::clone(&replayed_reordered_stun);
+            let r_stop = Arc::clone(&stop_all);
+
+            let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+            relay_front.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+                let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+                let mut saved_mig_stun: Option<(u16, Vec<u8>)> = None;
+                let mut mig_stun_count: usize = 0;
+                let mut buf = [0u8; 4096];
+                while !r_stop.load(Ordering::Relaxed) {
+                    while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                        let cport = cli_addr.port();
+                        r_latest.store(cport, Ordering::SeqCst);
+                        let pkt = &buf[..n];
+                        let bh = r_bh.load(Ordering::SeqCst);
+                        if bh != 0 && cport == bh {
+                            continue; // 100% uplink blackhole on old port
+                        }
+                        let entry = upstreams.entry(cport).or_insert_with(|| {
+                            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                            s.set_nonblocking(true).unwrap();
+                            s.connect(srv_addr).unwrap();
+                            (s, cli_addr)
+                        });
+                        if bh != 0 && cport != bh && demux_rfc7983(pkt) == PacketKind::Stun {
+                            mig_stun_count += 1;
+                            if mig_stun_count == 1 {
+                                saved_mig_stun = Some((cport, pkt.to_vec()));
+                            }
+                            let _ = entry.0.send(pkt);
+                            // On the 2nd migration STUN, immediately inject a reordered copy of the 1st STUN
+                            // to verify P0-2 idempotent nonce reuse!
+                            if mig_stun_count == 2 {
+                                if let Some((sp, ref first_pkt)) = saved_mig_stun {
+                                    if sp == cport {
+                                        let _ = entry.0.send(first_pkt);
+                                        r_replay.store(true, Ordering::SeqCst);
+                                    }
+                                }
+                            }
+                        } else {
+                            let _ = entry.0.send(pkt);
+                        }
+                    }
+                    let bh = r_bh.load(Ordering::SeqCst);
+                    for (&cport, (usock, cli_addr)) in upstreams.iter() {
+                        while let Ok(n) = usock.recv(&mut buf) {
+                            let pkt = &buf[..n];
+                            // P0-1 fault injection: drop the VERY FIRST 0xFFFD SRTP challenge
+                            // sent to the migrated port (57B unpadded SRTP)!
+                            if bh != 0
+                                && cport != bh
+                                && demux_rfc7983(pkt) == PacketKind::Srtp
+                                && !r_drop_ch.swap(true, Ordering::SeqCst)
+                            {
+                                continue;
+                            }
+                            let _ = relay_front.send_to(pkt, *cli_addr);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+
+            let cli_psk = psk.clone();
+            let c_stop = Arc::clone(&stop_all);
+            thread::spawn(move || {
+                let _ = run_client(ClientConfig {
+                    listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                    server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                    psk: cli_psk,
+                    cipher_pref: CipherPref::Auto,
+                    dtls_decoy: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    rotate_interval_secs: 0,
+                    rotate_max_bytes: 0,
+                    rotate_cooldown_secs: 60,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: 1488,
+                    retry_ms: 150,
+                    max_retries: 8,
+                    keepalive_secs: 1,
+                    idle_timeout_secs: 60,
+                    stats_interval_secs: 3600,
+                    quiet: true,
+                    stop: Some(c_stop),
+                });
+            });
+
+            let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+            app.set_read_timeout(Some(Duration::from_millis(150)))
+                .unwrap();
+            app.connect(("127.0.0.1", client_port)).unwrap();
+            let mut rbuf = [0u8; 512];
+            let mut ready = false;
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(5) {
+                let _ = app.send(b"P01_INIT");
+                match app.recv(&mut rbuf) {
+                    Ok(n) if &rbuf[..n] == b"P01_INIT" => {
+                        ready = true;
+                        break;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    _ => thread::sleep(Duration::from_millis(30)),
+                }
+            }
+            assert!(ready, "initial tunnel must come up");
+            let port1 = latest_port.load(Ordering::SeqCst);
+
+            blackhole_port.store(port1, Ordering::SeqCst);
+            let mut recovered = false;
+            let t_bh = Instant::now();
+            while t_bh.elapsed() < Duration::from_secs(9) {
+                let _ = app.send(b"P01_HEALED");
+                if let Ok(n) = app.recv(&mut rbuf) {
+                    if &rbuf[..n] == b"P01_HEALED" && latest_port.load(Ordering::SeqCst) != port1 {
+                        recovered = true;
+                        break;
+                    }
+                }
+                thread::sleep(Duration::from_millis(60));
+            }
+            stop_all.store(true, Ordering::SeqCst);
+
+            assert!(
+                dropped_first_challenge.load(Ordering::SeqCst),
+                "fault injector must have dropped the 1st 0xFFFD challenge"
+            );
+            assert!(
+                replayed_reordered_stun.load(Ordering::SeqCst),
+                "fault injector must have replayed reordered 1st migration STUN"
+            );
+            assert!(
+                recovered,
+                "P0-1/P0-2: client MUST recover after dropped 1st 0xFFFD challenge + reordered STUN!"
+            );
+            assert_eq!(
+                port_violations.load(Ordering::SeqCst),
+                0,
+                "P0-1/P0-2: StrictPinnedUdpBackend MUST keep exact same backend_lport!"
+            );
+        }
+
+        // ---- Part B: P0-5 (`Migrating` fallback to legacy server preserves `old_sess.pending`) ----
+        {
+            let psk = b"v040-carbon-p05-pending-fallback-psk".to_vec();
+            let backend_port = reserve_free_port();
+            let server_port = reserve_free_port();
+            let relay_port = reserve_free_port();
+            let client_port = reserve_free_port();
+
+            let stop_all = Arc::new(AtomicBool::new(false));
+            let b_stop = Arc::clone(&stop_all);
+            let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+            echo_sock
+                .set_read_timeout(Some(Duration::from_millis(20)))
+                .unwrap();
+            thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                while !b_stop.load(Ordering::Relaxed) {
+                    if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                        let _ = echo_sock.send_to(&buf[..n], peer);
+                    }
+                }
+            });
+
+            let srv_psk = psk.clone();
+            let s_stop = Arc::clone(&stop_all);
+            thread::spawn(move || {
+                let _ = run_server(ServerConfig {
+                    listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                    backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                    psk: srv_psk,
+                    cipher_pref: CipherPref::Auto,
+                    dtls_required: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: 1488,
+                    idle_timeout_secs: 60,
+                    stats_interval_secs: 3600,
+                    wire_audit_file: None,
+                    quiet: true,
+                    stop: Some(s_stop),
+                });
+            });
+
+            let blackhole_port = Arc::new(AtomicU16::new(0));
+            let mig_port_seen = Arc::new(AtomicU16::new(0));
+            let latest_port = Arc::new(AtomicU16::new(0));
+            let r_bh = Arc::clone(&blackhole_port);
+            let r_mig = Arc::clone(&mig_port_seen);
+            let r_latest = Arc::clone(&latest_port);
+            let r_stop = Arc::clone(&stop_all);
+            let relay_psk = psk.clone();
+
+            let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+            relay_front.set_nonblocking(true).unwrap();
+            thread::spawn(move || {
+                let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+                let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+                let mut buf = [0u8; 4096];
+                while !r_stop.load(Ordering::Relaxed) {
+                    while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                        let cport = cli_addr.port();
+                        r_latest.store(cport, Ordering::SeqCst);
+                        let pkt = &buf[..n];
+                        let bh = r_bh.load(Ordering::SeqCst);
+                        if bh != 0 && cport == bh {
+                            continue;
+                        }
+                        // Emulate a v0.3.8 legacy server: drop migration STUNs that are NOT signed with global PSK!
+                        // (Fresh fallback DTLS STUN IS signed with global PSK and passes cleanly!)
+                        if bh != 0 && cport != bh && demux_rfc7983(pkt) == PacketKind::Stun {
+                            let is_global_psk = parse_stun(pkt, &relay_psk)
+                                .map(|p| p.authenticated)
+                                .unwrap_or(false);
+                            if !is_global_psk {
+                                let _ = r_mig.compare_exchange(
+                                    0,
+                                    cport,
+                                    Ordering::SeqCst,
+                                    Ordering::SeqCst,
+                                );
+                                continue;
+                            }
+                        }
+                        let entry = upstreams.entry(cport).or_insert_with(|| {
+                            let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                            s.set_nonblocking(true).unwrap();
+                            s.connect(srv_addr).unwrap();
+                            (s, cli_addr)
+                        });
+                        let _ = entry.0.send(pkt);
+                    }
+                    for (usock, cli_addr) in upstreams.values() {
+                        while let Ok(n) = usock.recv(&mut buf) {
+                            let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                        }
+                    }
+                    thread::sleep(Duration::from_millis(2));
+                }
+            });
+
+            let cli_psk = psk.clone();
+            let c_stop = Arc::clone(&stop_all);
+            thread::spawn(move || {
+                let _ = run_client(ClientConfig {
+                    listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                    server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                    psk: cli_psk,
+                    cipher_pref: CipherPref::Auto,
+                    dtls_decoy: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    rotate_interval_secs: 0,
+                    rotate_max_bytes: 0,
+                    rotate_cooldown_secs: 60,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: 1488,
+                    retry_ms: 120,
+                    max_retries: 8,
+                    keepalive_secs: 1,
+                    idle_timeout_secs: 60,
+                    stats_interval_secs: 3600,
+                    quiet: true,
+                    stop: Some(c_stop),
+                });
+            });
+
+            let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+            app.set_read_timeout(Some(Duration::from_millis(120)))
+                .unwrap();
+            app.connect(("127.0.0.1", client_port)).unwrap();
+            let mut rbuf = [0u8; 512];
+            let mut ready = false;
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(5) {
+                let _ = app.send(b"P05_INIT");
+                match app.recv(&mut rbuf) {
+                    Ok(n) if &rbuf[..n] == b"P05_INIT" => {
+                        ready = true;
+                        break;
+                    }
+                    Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                    _ => thread::sleep(Duration::from_millis(30)),
+                }
+            }
+            assert!(ready, "initial tunnel must come up");
+            let port1 = latest_port.load(Ordering::SeqCst);
+
+            // Blackhole port1 and wait until client enters `Migrating` (observed via first per-session STUN)
+            blackhole_port.store(port1, Ordering::SeqCst);
+            let t_wait_mig = Instant::now();
+            while mig_port_seen.load(Ordering::SeqCst) == 0
+                && t_wait_mig.elapsed() < Duration::from_secs(8)
+            {
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert_ne!(
+                mig_port_seen.load(Ordering::SeqCst),
+                0,
+                "client must attempt V4 1-RTT migration first"
+            );
+
+            // Send a SINGLE app packet while client is in `Migrating`; it MUST be buffered in
+            // `old_sess.pending`, carried across `to_rotate` fallback into the fresh DTLS session,
+            // and echoed back WITHOUT the app ever re-sending it!
+            let _ = app.send(b"PRESERVE_ME_P05");
+            let mut got_preserved = false;
+            let t_fb = Instant::now();
+            while t_fb.elapsed() < Duration::from_secs(6) {
+                if let Ok(n) = app.recv(&mut rbuf) {
+                    if &rbuf[..n] == b"PRESERVE_ME_P05" {
+                        got_preserved = true;
+                        break;
+                    }
+                }
+            }
+            stop_all.store(true, Ordering::SeqCst);
+            assert!(
+                got_preserved,
+                "P0-5: app packet buffered during Migrating MUST survive fallback to fresh DTLS session!"
+            );
+        }
     }
 }

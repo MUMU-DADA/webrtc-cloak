@@ -1,8 +1,9 @@
-//! Wire-format protocol primitives for webrtc-cloak V3.2 (Hardened):
+//! Wire-format protocol primitives for webrtc-cloak V4.0 (Hardened):
 //!   - RFC 5389 / 8445 STUN ICE Binding Request & Success Response:
 //!     * libwebrtc 4-char Base64 ufrag (zero modulo bias), libwebrtc attribute order
-//!     * Session-constant ICE-CONTROLLING tie-breaker & PRIORITY; USE-CANDIDATE only on nomination
+//!     * Session-constant ICE-CONTROLLING tie-breaker & PRIORITY; USE-CANDIDATE on nomination & 1-RTT migration
 //!     * Timestamp-masked anti-replay txid (±30s window) + zero-alloc pre-auth strict MI-then-FP parsing
+//!     * V4.0 RFC 5869 HKDF-SHA256 per-session `ice-pwd-v4` migration key & `handover-v4` dual-key proof
 //!   - Real RFC 9147 DTLS 1.3 + RFC 6347 DTLS 1.2 via `dimpl 0.9.0` (pure-Rust Sans-IO, mutual ECDSA
 //!     P-256 certs, encrypted DTLS 1.3 certs, multi-MTU ClientHello pool, optional strict 1.3 anti-downgrade,
 //!     RFC 5764/7714 KeyingMaterial export -> Fail-Closed Hybrid PFS, real `close_notify` teardown)
@@ -10,10 +11,11 @@
 //!     * Standard Chrome `0x90` (V=2, P=0, X=1, CC=0) + 8B RFC 8285 `0xBEDE` global transport-wide-cc ext
 //!     * Dual-SSRC Audio (`PT=111`, 48kHz Opus capped <=50pps) + Video (`PT=96`, 90kHz strict M=1 causality)
 //!     * Orthogonal AEAD Nonce domains (Video `dir`, Audio `dir|0x40` + high-16-bit disjoint SSRC, SRTCP `dir|0x80`)
+//!     * Encrypted in-band control frames: `0xFFFE` Probe, `0xFFFD` 1-RTT Path Challenge, `0xFFFC` MBB Handover
 //!     * Inner-ciphertext length prefix + randomized 0..=31B padding + 2048-packet RFC 6479 sliding replay rings
 //!   - RFC 3550 §6.1 / 5761 / 7714 §9.1 Compound SRTCP:
-//!     * Plaintext header ALWAYS PT=200(SR) or PT=201(RR), real RC=0/1 matching rx media state
-//!     * Encrypted compound subpackets (session-constant 13B CNAME SDES + smooth FB + encrypted trailing BYE PT=203)
+//!     * Plaintext header ALWAYS PT=200(SR) or PT=201(RR), real per-interval RC=0/1 matching rx media state
+//!     * Encrypted compound subpackets (session-constant 13B CNAME SDES + rx-gated FB + encrypted trailing BYE PT=203)
 //!     * Always 16B AEAD/MAC tag + trailing 4B E_SRTCP_Index (0-based) + 64-packet SRTCP sliding replay window
 
 use aes_gcm::aead::AeadInPlace;
@@ -79,6 +81,8 @@ pub const RTP_FULL_HDR_LEN: usize = RTP_FIXED_HDR_LEN + RTP_EXT_LEN; // 20B
 pub const SRTP_TAG_LEN: usize = 16; // Unified 16B tag across AES-GCM, ChaCha20, and BLAKE2b-128
 pub const MAX_INNER_UDP_LEN: usize = 65_400; // Hard bound preventing wbuf[65664] overflow
 pub const SRTP_PROBE_MAGIC_LEN: u16 = 0xFFFE; // Reserved > MAX_INNER_UDP_LEN for in-band encrypted selftest echo
+pub const SRTP_PATH_CHALLENGE_MAGIC: u16 = 0xFFFD; // V4: in-band encrypted 1-RTT ICE migration challenge/response/confirm
+pub const SRTP_HANDOVER_MAGIC: u16 = 0xFFFC; // V4: in-band encrypted MBB backend_sock atomic handover request/ack
 pub const RTP_VIDEO_PT: u8 = 96;
 pub const RTP_AUDIO_PT: u8 = 111; // Chrome Opus dynamic PT (48 kHz)
 /// Hard SRTP 48-bit extended sequence exhaustion ceiling (never wrap Nonce!).
@@ -120,6 +124,10 @@ pub fn new_dtls_instance(
 pub enum SrtpFrame {
     Data(usize),
     Probe(usize),
+    /// V4 in-band encrypted path reachability challenge / response / confirm (`0xFFFD`)
+    PathChallenge(usize),
+    /// V4 in-band encrypted MBB `backend_sock` atomic handover request / ack (`0xFFFC`)
+    Handover(usize),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -531,11 +539,42 @@ pub fn stun_hmac_key(psk: &[u8]) -> [u8; 32] {
     h.finalize().into()
 }
 
-fn finalize_stun(msg_type: u16, txid: &[u8; 12], body_in: &[u8], psk: &[u8]) -> Vec<u8> {
+type HmacSha256 = Hmac<Sha256>;
+
+/// RFC 5869 HKDF-SHA256 (Extract + single-block 32-byte Expand, pure Rust zero new deps).
+pub fn hkdf_sha256_32(salt: &[u8], ikm: &[u8], info: &[u8]) -> [u8; 32] {
+    let mut ext = HmacSha256::new_from_slice(salt).expect("HKDF salt");
+    ext.update(ikm);
+    let prk = ext.finalize().into_bytes();
+    let mut exp = HmacSha256::new_from_slice(&prk).expect("HKDF prk");
+    exp.update(info);
+    exp.update(&[1u8]);
+    exp.finalize().into_bytes().into()
+}
+
+/// V4: Derive per-session RFC 8445 `ice-pwd` STUN migration key strictly from `session_key`.
+/// When DTLS Hybrid PFS is enabled (default), even a peer holding the global PSK cannot forge a
+/// 1-RTT path migration for another session (with `--no-dtls-decoy`, relies on PSK + txid entropy).
+pub fn derive_ice_migration_key(session_key: &[u8; 32]) -> [u8; 32] {
+    hkdf_sha256_32(b"webrtc-cloak-v4-salt", session_key, b"ice-pwd-v4")
+}
+
+/// V4: Compute cryptographic handover proof binding BOTH `old_session_key` and `new_session_key`
+/// so a scheduled DTLS 1.3 MBB session can atomically inherit `old_sess`'s `backend_sock` with
+/// zero source-port change and zero hijack/replay surface.
+pub fn compute_handover_proof(old_session_key: &[u8; 32], new_session_key: &[u8; 32]) -> [u8; 32] {
+    hkdf_sha256_32(old_session_key, new_session_key, b"handover-v4")
+}
+
+fn finalize_stun_with_key(
+    msg_type: u16,
+    txid: &[u8; 12],
+    body_in: &[u8],
+    mi_key: &[u8; 32],
+) -> Vec<u8> {
     let mut body = body_in.to_vec();
-    let mi_key = stun_hmac_key(psk);
     let len_for_mi = (body.len() + 24) as u16;
-    let mut mac = HmacSha1::new_from_slice(&mi_key).expect("HMAC key");
+    let mut mac = HmacSha1::new_from_slice(mi_key).expect("HMAC key");
     mac.update(&msg_type.to_be_bytes());
     mac.update(&len_for_mi.to_be_bytes());
     mac.update(&STUN_MAGIC_COOKIE.to_be_bytes());
@@ -555,6 +594,11 @@ fn finalize_stun(msg_type: u16, txid: &[u8; 12], body_in: &[u8], psk: &[u8]) -> 
     let crc = crc32fast::hash(&out) ^ STUN_FINGERPRINT_XOR;
     push_stun_attr(&mut out, ATTR_FINGERPRINT, &crc.to_be_bytes());
     out
+}
+
+fn finalize_stun(msg_type: u16, txid: &[u8; 12], body_in: &[u8], psk: &[u8]) -> Vec<u8> {
+    let mi_key = stun_hmac_key(psk);
+    finalize_stun_with_key(msg_type, txid, body_in, &mi_key)
 }
 
 pub fn encode_xor_mapped_v4(addr: SocketAddrV4) -> [u8; 8] {
@@ -588,6 +632,19 @@ pub fn build_ice_stun_request(
     txid_opt: Option<[u8; 12]>,
     include_use_candidate: bool,
 ) -> (Vec<u8>, [u8; 12]) {
+    let mi_key = stun_hmac_key(psk);
+    build_ice_stun_request_with_key(psk, &mi_key, ice, txid_opt, include_use_candidate)
+}
+
+/// Build an RFC 8445 ICE STUN Binding Request signed with an explicit 32B `mi_key`
+/// (e.g., V4 per-session DTLS-PFS `mi_key_mig` for 1-RTT path migration, 100% standard wire format).
+pub fn build_ice_stun_request_with_key(
+    psk: &[u8],
+    mi_key: &[u8; 32],
+    ice: &SessionIceParams,
+    txid_opt: Option<[u8; 12]>,
+    include_use_candidate: bool,
+) -> (Vec<u8>, [u8; 12]) {
     let txid = txid_opt.unwrap_or_else(|| make_fresh_stun_txid(psk));
     let uname = ice.username();
     let mut body = Vec::with_capacity(64);
@@ -598,7 +655,7 @@ pub fn build_ice_stun_request(
     }
     push_stun_attr(&mut body, ATTR_PRIORITY, &ice.priority.to_be_bytes());
 
-    let pkt = finalize_stun(STUN_BINDING_REQUEST, &txid, &body, psk);
+    let pkt = finalize_stun_with_key(STUN_BINDING_REQUEST, &txid, &body, mi_key);
     (pkt, txid)
 }
 
@@ -610,12 +667,67 @@ pub fn build_stun_success_response(txid: &[u8; 12], peer: SocketAddrV4, psk: &[u
     finalize_stun(STUN_BINDING_SUCCESS, txid, &body, psk)
 }
 
+/// Build an authenticated RFC 8445 ICE STUN Binding Success Response (64 bytes) with explicit `mi_key`.
+pub fn build_stun_success_response_with_key(
+    txid: &[u8; 12],
+    peer: SocketAddrV4,
+    mi_key: &[u8; 32],
+) -> Vec<u8> {
+    let mut body = Vec::with_capacity(48);
+    let xma = encode_xor_mapped_v4(peer);
+    push_stun_attr(&mut body, ATTR_XOR_MAPPED_ADDRESS, &xma);
+    finalize_stun_with_key(STUN_BINDING_SUCCESS, txid, &body, mi_key)
+}
+
+/// Zero-allocation pre-auth peek of `USERNAME` on a framed `STUN_BINDING_REQUEST` so the server
+/// can select a session's V4 per-session `mi_key_mig` before running constant-time HMAC verification.
+pub fn peek_stun_request_username(data: &[u8]) -> Option<&str> {
+    if data.len() < 20 {
+        return None;
+    }
+    let msg_type = u16::from_be_bytes([data[0], data[1]]);
+    let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
+    let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    if msg_type != STUN_BINDING_REQUEST
+        || magic != STUN_MAGIC_COOKIE
+        || msg_len % 4 != 0
+        || 20 + msg_len != data.len()
+    {
+        return None;
+    }
+    let mut pos = 20usize;
+    let end = 20 + msg_len;
+    while pos + 4 <= end {
+        let attr_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let attr_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        let val_start = pos + 4;
+        let val_end = val_start + attr_len;
+        if val_end > end {
+            return None;
+        }
+        if attr_type == ATTR_USERNAME {
+            if attr_len == 0 || attr_len > 64 {
+                return None;
+            }
+            let s = std::str::from_utf8(&data[val_start..val_end]).ok()?;
+            return if s.contains(':') { Some(s) } else { None };
+        }
+        if attr_type == ATTR_MESSAGE_INTEGRITY {
+            return None;
+        }
+        let pad = (4 - (attr_len % 4)) % 4;
+        pos = val_end + pad;
+    }
+    None
+}
+
 #[derive(Debug)]
 #[allow(dead_code)]
 pub struct ParsedStun {
     pub msg_type: u16,
     pub txid: [u8; 12],
     pub username: Option<String>,
+    pub tie_breaker: Option<[u8; 8]>,
     pub use_candidate: bool,
     pub xor_mapped: Option<SocketAddrV4>,
     pub fingerprint_ok: bool,
@@ -647,6 +759,7 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
     let mut pos = 20usize;
     let end = 20 + msg_len;
     let mut username_range: Option<(usize, usize)> = None;
+    let mut tie_breaker: Option<[u8; 8]> = None;
     let mut use_candidate = false;
     let mut xor_mapped = None;
     let mut seen_mi = false;
@@ -682,6 +795,11 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
         match attr_type {
             ATTR_USERNAME => {
                 username_range = Some((val_start, val_end));
+            }
+            ATTR_ICE_CONTROLLING if attr_len == 8 => {
+                let mut tb = [0u8; 8];
+                tb.copy_from_slice(val);
+                tie_breaker = Some(tb);
             }
             ATTR_XOR_MAPPED_ADDRESS => {
                 xor_mapped = decode_xor_mapped_v4(val);
@@ -743,6 +861,7 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
         msg_type,
         txid,
         username,
+        tie_breaker: if auth_ok { tie_breaker } else { None },
         use_candidate,
         xor_mapped,
         fingerprint_ok: fp_ok,
@@ -1809,22 +1928,69 @@ impl SrtpCloakCipher {
     ///   [16B AEAD / MAC Tag]
     #[inline]
     pub fn wrap_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
-        self.wrap_inner(false, plaintext, out)
+        self.wrap_inner(None, false, plaintext, out)
     }
 
     /// Wrap an in-band AEAD-encrypted diagnostic probe (`0xFFFE || probe_len || payload || random pad`).
     /// Identical Chrome `0x90` SRTP format on the wire; strictly disjoint from real UDP (`<= 65400`).
     #[inline]
     pub fn wrap_probe_into(&mut self, payload: &[u8], out: &mut [u8]) -> Option<usize> {
-        if payload.len() > 1460 {
-            return None;
-        }
-        self.wrap_inner(true, payload, out)
+        self.wrap_control_into(SRTP_PROBE_MAGIC_LEN, payload, out)
+    }
+
+    /// Wrap an in-band AEAD-encrypted control frame (`magic` in `{0xFFFE, 0xFFFD, 0xFFFC}`).
+    /// Byte-for-byte identical Chrome `0x90` SRTP on the wire; strictly inside AEAD ciphertext.
+    #[inline]
+    pub fn wrap_control_into(
+        &mut self,
+        magic: u16,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        self.wrap_control_inner(magic, false, payload, out)
+    }
+
+    /// Wrap an unpadded in-band encrypted control frame (used for server -> unverified candidate
+    /// `0xFFFD` path challenges so total reply stays strictly `64B STUN + 57B SRTP = 121B <= 1.32x`).
+    #[inline]
+    pub fn wrap_control_unpadded_into(
+        &mut self,
+        magic: u16,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        self.wrap_control_inner(magic, true, payload, out)
     }
 
     #[inline]
-    fn wrap_inner(&mut self, is_probe: bool, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
-        let prefix_len = if is_probe { 4 } else { 2 };
+    fn wrap_control_inner(
+        &mut self,
+        magic: u16,
+        no_pad: bool,
+        payload: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        if payload.len() > 1460
+            || !matches!(
+                magic,
+                SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
+            )
+        {
+            return None;
+        }
+        self.wrap_inner(Some(magic), no_pad, payload, out)
+    }
+
+    #[inline]
+    fn wrap_inner(
+        &mut self,
+        control_magic: Option<u16>,
+        no_pad: bool,
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        let is_control = control_magic.is_some();
+        let prefix_len = if is_control { 4 } else { 2 };
         let fixed_overhead = RTP_FULL_HDR_LEN + prefix_len + SRTP_TAG_LEN;
         let base_total = fixed_overhead.saturating_add(plaintext.len());
         if plaintext.len() > MAX_INNER_UDP_LEN
@@ -1839,8 +2005,10 @@ impl SrtpCloakCipher {
         } else {
             31
         };
-        let eff_len = plaintext.len() + if is_probe { 2 } else { 0 };
-        let max_pad = if eff_len >= 1340 {
+        let eff_len = plaintext.len() + if is_control { 2 } else { 0 };
+        let max_pad = if no_pad {
+            0
+        } else if eff_len >= 1340 {
             headroom.min(7)
         } else {
             headroom.min(31)
@@ -1973,12 +2141,12 @@ impl SrtpCloakCipher {
         out[19] = 0x00;
 
         // Inner encrypted payload:
-        //   Data : [inner_len: u16 BE] || [plaintext] || [random pad]
-        //   Probe: [0xFFFE: u16 BE] || [probe_len: u16 BE] || [payload] || [random pad]
+        //   Data   : [inner_len: u16 BE] || [plaintext] || [random pad]
+        //   Control: [magic: u16 BE (0xFFFE/0xFFFD/0xFFFC)] || [len: u16 BE] || [payload] || [random pad]
         let ct_end = RTP_FULL_HDR_LEN + ct_len;
-        if is_probe {
+        if let Some(magic) = control_magic {
             out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
-                .copy_from_slice(&SRTP_PROBE_MAGIC_LEN.to_be_bytes());
+                .copy_from_slice(&magic.to_be_bytes());
             out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 4]
                 .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
         } else {
@@ -2236,16 +2404,24 @@ impl SrtpCloakCipher {
             return None;
         }
         let raw_len = u16::from_be_bytes([out[0], out[1]]);
-        if raw_len == SRTP_PROBE_MAGIC_LEN {
+        if matches!(
+            raw_len,
+            SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
+        ) {
             if ct_len < 4 {
                 return None;
             }
-            let probe_len = u16::from_be_bytes([out[2], out[3]]) as usize;
-            if probe_len > 1460 || 4 + probe_len > ct_len {
+            let ctrl_len = u16::from_be_bytes([out[2], out[3]]) as usize;
+            if ctrl_len > 1460 || 4 + ctrl_len > ct_len {
                 return None;
             }
-            out.copy_within(4..4 + probe_len, 0);
-            return Some(SrtpFrame::Probe(probe_len));
+            out.copy_within(4..4 + ctrl_len, 0);
+            return Some(match raw_len {
+                SRTP_PROBE_MAGIC_LEN => SrtpFrame::Probe(ctrl_len),
+                SRTP_PATH_CHALLENGE_MAGIC => SrtpFrame::PathChallenge(ctrl_len),
+                SRTP_HANDOVER_MAGIC => SrtpFrame::Handover(ctrl_len),
+                _ => unreachable!(),
+            });
         }
         let inner_len = raw_len as usize;
         if inner_len > MAX_INNER_UDP_LEN || 2 + inner_len > ct_len {
@@ -2850,5 +3026,69 @@ mod tests {
         let mid = win.bytes_in_window(t0 + Duration::from_secs(15));
         assert!(mid >= 4_500 && mid <= 5_500, "half-decayed window should be ~5000 (got {})", mid);
         assert_eq!(win.bytes_in_window(t0 + Duration::from_secs(21)), 0);
+    }
+
+    #[test]
+    fn v40_hkdf_stun_per_session_mig_and_control_frames() {
+        let psk = b"v040-hkdf-mig-unit-test-psk";
+        let global_mi = stun_hmac_key(psk);
+        let skey1 = [0x11u8; 32];
+        let skey2 = [0x22u8; 32];
+
+        // 1. HKDF per-session ice-pwd-v4 is distinct from global PSK key & distinct per session
+        let mig1 = derive_ice_migration_key(&skey1);
+        let mig2 = derive_ice_migration_key(&skey2);
+        assert_ne!(mig1, global_mi);
+        assert_ne!(mig1, mig2);
+
+        // 2. Handover proof binds BOTH old and new session keys (asymmetric & non-forgeable)
+        let p12 = compute_handover_proof(&skey1, &skey2);
+        let p21 = compute_handover_proof(&skey2, &skey1);
+        assert_ne!(p12, p21);
+
+        // 3. Per-session STUN migration request: zero-alloc username peek, exact tie_breaker,
+        //    rejected under global PSK key, accepted ONLY under mi_key_mig!
+        let ice = SessionIceParams::generate();
+        let (mig_pkt, txid) = build_ice_stun_request_with_key(psk, &mig1, &ice, None, true);
+        assert_eq!(peek_stun_request_username(&mig_pkt), Some(ice.username().as_str()));
+        let bad_global = parse_stun_with_key(&mig_pkt, psk, &global_mi).unwrap();
+        assert!(!bad_global.authenticated, "migration STUN MUST fail global PSK verification!");
+        let ok_mig = parse_stun_with_key(&mig_pkt, psk, &mig1).unwrap();
+        assert!(ok_mig.authenticated);
+        assert!(ok_mig.use_candidate);
+        assert_eq!(ok_mig.txid, txid);
+        assert_eq!(ok_mig.tie_breaker, Some(ice.tie_breaker));
+
+        // 4. 0xFFFD PathChallenge & 0xFFFC Handover AEAD round-trip + replay rejection across all 3 suites
+        for suite in [
+            CipherSuite::Aes128Gcm,
+            CipherSuite::ChaCha20Poly1305,
+            CipherSuite::Blake2b,
+        ] {
+            let mut cli = SrtpCloakCipher::new(&skey1, 0x1020_3040, 0x5060_7080, true, suite);
+            let mut srv = SrtpCloakCipher::new(&skey1, 0x5060_7080, 0x1020_3040, false, suite);
+            cli.set_dual_ssrc(true);
+            srv.set_dual_ssrc(true);
+
+            let mut wbuf = [0u8; 512];
+            let mut rbuf = [0u8; 512];
+
+            let ch = [0x01u8, 1, 2, 3, 4, 5, 6, 7, 8, 0, 0, 0, 0, 0, 0, 0, 1];
+            let wn1 = cli.wrap_control_unpadded_into(SRTP_PATH_CHALLENGE_MAGIC, &ch, &mut wbuf).unwrap();
+            assert_eq!(wbuf[0], 0x90);
+            // P0-4 strict anti-reflection bound: 20B RTP+ext + 4B ctrl + 17B challenge + 16B tag = exact 57B
+            // (64B STUN Success + 57B SRTP Challenge = 121B <= 1.32x against 92B STUN Request)
+            assert_eq!(wn1, 57, "unpadded 0xFFFD challenge MUST be exact 57B (<= 1.32x total reply)");
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn1], &mut rbuf), Some(SrtpFrame::PathChallenge(ch.len())));
+            assert_eq!(&rbuf[..ch.len()], &ch);
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn1], &mut rbuf), None); // replay blocked!
+
+            let ho = [0x01u8, 9, b'a', b'b', b'c', b'd', b':', b'e', b'f', b'g', b'h'];
+            let wn2 = cli.wrap_control_into(SRTP_HANDOVER_MAGIC, &ho, &mut wbuf).unwrap();
+            assert_eq!(wbuf[0], 0x90);
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn2], &mut rbuf), Some(SrtpFrame::Handover(ho.len())));
+            assert_eq!(&rbuf[..ho.len()], &ho);
+            assert_eq!(srv.unwrap_into_ex(&wbuf[..wn2], &mut rbuf), None); // replay blocked!
+        }
     }
 }

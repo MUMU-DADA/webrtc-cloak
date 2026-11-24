@@ -36,7 +36,7 @@
 │   └── pages.yml                          # 自动部署交互原理演示页至 GitHub Pages
 ├── LICENSE                                # MIT 开源许可证
 ├── README.md                              # 项目说明、协议架构与构建文档
-├── SPEC.md                                # V3.2 / v0.3.8 线格式、密码学与状态机协议规范
+├── SPEC.md                                # V4.0 / v0.4.0 线格式、密码学与状态机协议规范
 ├── .gitignore                             # 忽略构建产物、密钥文件与抓包日志
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线/Pages 双用）
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
@@ -82,7 +82,10 @@ flowchart LR
 - **严谨的状态机边界防护**：
   - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；`parse_stun` 鉴权前零堆分配；会话退出进入 `Closing` 吸收在途尾包（客户端排空期仍 Make-Before-Break 解密投递合法下行 SRTP 且零公网回包），避免触发 `ICMP Port Unreachable`。
   - **入口预校验与抗注入**：`validate_dtls_datagram` 同时覆盖 DTLS 1.2 与 RFC 9147 DTLS 1.3（`C=0`、`≥18B`），拒绝 `Epoch=0` 明文 Alert 及 `Ready` 态明文 `ct=26`；服务端 `Ready` 态绝不被伪造 DTLS 垃圾包误续命 Consent；客户端在 `Ready` 态持续驱动 DTLS 1.3 Flight 5 重传定时器防单包丢包黑洞；`extract_dtls_server_hello_suite` 严格校检帧长与扩展边界并过滤 `TLS13_HRR_RANDOM`；SRTP 双流各自维护独立 **2048 包 RFC 6479 滑动防重放环**，SRTCP 内置 64-bit 滑动防重放窗口。
-  - **单向上行黑洞、静默退避与无感轮换自愈（`v0.3.8`）**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并在 `45s` 无认证对端报文时静默回收；空闲/微流态自动关闭空载假 `PT=205/206` 反馈，双端 SRTCP 退避至 `20–40s`（服务端持续微流 `>60s` 后静默暂停），STUN 保活温和退避至 `10–14s` 且来包秒切回 `5s`；主动 MBB 轮换结合对数正态宽分布时长 + 随机字节预算（`600MB–2.2GB`）+ 夜间微流自动挂起 + `2–10s` 随机延迟旧流 `BYE` 排空，服务端 `SIGTERM` 优雅退服后客户端抖动 `80–350ms` 快重连避免明文 `ICMP Port Unreachable`。
+  - **V4.0 万用无感 UDP 承载与自愈（“换路不换门牌”）**：
+    - **定时/定量无感轮换 + 密文过户**：主动 MBB 轮换走完整全新 DTLS 1.3（对外全新 `ufrag`/`SSRC`/`CNAME` 彻底防关联），在 AEAD 密文内通过 `0xFFFC` + HKDF 双密钥证明将服务端旧 `backend_sock` 原子过户给新会话（支持多核 `SO_REUSEPORT` 跨线程无锁迁移），哪怕内部是认死源端口的游戏/语音/OpenVPN 也 **0 端口变化、0 丢包**；同时保留 `2–10s` 随机延迟旧流 `BYE`、对数正态宽分布时长、随机字节预算（`600MB–2.2GB`）与夜间微流挂起。
+    - **1-RTT 故障黑洞原地迁移**：确认上行黑洞后，客户端用 DTLS-PFS 派生的每会话 `ice-pwd-v4` 在新端口发 1 个标准 RFC 8445 `USE-CANDIDATE` 迁移包，服务端通过 `<1.5x` 防反射加密 `0xFFFD` 挑战验真后原地更新 `peer_addr` 并保留原 `backend_sock`（1-RTT 救活、0 DTLS 重握，并向下兼容旧版服务端自动回退）。
+    - **空闲微流静音与优雅重连**：空闲/微流态自动关闭空载假 `PT=205/206` 反馈，双端 SRTCP 退避至 `20–40s`（服务端持续微流 `>60s` 后静默暂停），STUN 保活温和退避至 `10–14s` 且来包秒切回 `5s`；服务端 `SIGTERM` 退服后客户端抖动 `80–350ms` 快重连避免明文 `ICMP Port Unreachable`。
 - **内置双模式 12 项自测与算力体检（`v0.3.5+`）**：`webrtc-cloak selftest` 支持**真实线上远程隧道直测**（`--server-host <IP> --server-port 19643 --psk-file <PATH>`，通过加密带内 `0xFFFE` SRTP 回显探针在不影响线上业务后端的前提下实测真实公网 NAT 映射、DTLS 1.3/1.2 握手、WAN 延迟/抖动/丢包、公网 Path MTU 边界、多端口 NAT 轮换与 7 类主动探测 Silent-Drop 验真，并兼容 `< v0.3.5` 服务端自动降级 `[SKIP]`）以及**离线本地故障注入沙箱**（`--local`），同时内置本机单核/全核加解密与 P-256 证书签发算力体检。
 - **AEAD 密文内层随机填充**：线上传输首字节固定为 `0x90 (P=0)`，`[inner_len: u16 BE] || plaintext || [0..=31B random pad]` 全部位于 AEAD 密文内，大包（`>= 1340B`）自动收窄填充至 `0..=7B` 以适配 `1492B` PPPoE MTU 避免 IP 分片。
 - **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书（DTLS 1.3 模式下证书在公网 100% 加密不可见）；客户端全平台完整宣告 6 个 DTLS 1.3/1.2 AEAD 套件，并通过多 MTU 预构建配置池打散 ClientHello 长度。
