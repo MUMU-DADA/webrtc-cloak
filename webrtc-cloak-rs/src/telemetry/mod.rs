@@ -1,27 +1,18 @@
-//! Zero-dependency outer-path health telemetry for `webrtc-cloak` (`v0.4.1`):
-//!   - Exposes real outer link quality (STUN RTT / EWMA / RFC 3550 jitter / rolling packet loss %,
-//!     smoothed Mbps throughput, 10-minute blackhole & 1-RTT migration counters, MBB rotations,
-//!     and server unauthenticated silent-drop scan counters) while keeping the data plane 100%
-//!     transparent and decoupled from inner protocols.
-//!   - Supports BOTH:
-//!       1. `--status-file <PATH>`: atomic `tmp + rename` JSON snapshot (ideal for tmpfs / OpenWrt
-//!          `jsonfilter` / shell watchdogs with zero open ports and zero flash wear).
-//!       2. `--status-http <IP:PORT>`: minimal pure-std read-only HTTP server serving JSON at
-//!          `/`, `/status`, `/health`, `/healthz` (503 when critical) and Prometheus text metrics
-//!          at `/metrics` (strict timeouts, bounded reads, zero external crates).
-//!   - Strictly zero overhead on the SRTP hot path (`Option<Arc<TelemetryHub>>`, updated only on
-//!     slow periodic timers and rare control-plane transitions) and 32-bit `armv5te`-safe (no `AtomicU64`).
+//! 外层链路健康状态聚合与只读遥测中心。
 
+mod export;
+#[cfg(test)]
+mod tests;
+
+use self::export::{handle_http_request, write_atomic_file};
 use serde::Serialize;
 use std::collections::VecDeque;
-use std::io::Write;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tiny_http::{Header, Method, Request, Response, Server as HttpServer, StatusCode};
+use tiny_http::Server as HttpServer;
 
 const STUN_LOSS_WINDOW: usize = 20;
 const RECENT_EVENT_CAP: usize = 8;
@@ -73,106 +64,106 @@ pub struct WorkerSnapshot {
 }
 
 #[derive(Clone, Serialize)]
-struct TelemetryEvent {
+pub(super) struct TelemetryEvent {
     #[serde(rename = "ts")]
-    ts_unix: u64,
-    event: &'static str,
-    detail: String,
+    pub(super) ts_unix: u64,
+    pub(super) event: &'static str,
+    pub(super) detail: String,
 }
 
 #[derive(Serialize)]
-struct LinkPayload {
-    stun_rtt_ms: Option<f64>,
-    stun_rtt_ewma_ms: Option<f64>,
-    stun_jitter_ms: f64,
-    stun_loss_pct: f64,
-    tx_mbps: f64,
-    rx_mbps: f64,
-    tx_bytes_total: u64,
-    rx_bytes_total: u64,
-    tx_pkts_total: u64,
-    rx_pkts_total: u64,
+pub(super) struct LinkPayload {
+    pub(super) stun_rtt_ms: Option<f64>,
+    pub(super) stun_rtt_ewma_ms: Option<f64>,
+    pub(super) stun_jitter_ms: f64,
+    pub(super) stun_loss_pct: f64,
+    pub(super) tx_mbps: f64,
+    pub(super) rx_mbps: f64,
+    pub(super) tx_bytes_total: u64,
+    pub(super) rx_bytes_total: u64,
+    pub(super) tx_pkts_total: u64,
+    pub(super) rx_pkts_total: u64,
 }
 
 #[derive(Serialize)]
-struct EventsPayload {
-    blackholes_total: u64,
-    blackholes_last_10m: usize,
-    migrations_1rtt_total: u64,
-    migrations_1rtt_last_10m: usize,
-    mbb_rotations_total: u64,
-    graceful_reconnects_total: u64,
-    stun_probes_ok_total: u64,
-    stun_probes_lost_total: u64,
-    last_event: &'static str,
-    last_event_unix: u64,
-    recent: Vec<TelemetryEvent>,
+pub(super) struct EventsPayload {
+    pub(super) blackholes_total: u64,
+    pub(super) blackholes_last_10m: usize,
+    pub(super) migrations_1rtt_total: u64,
+    pub(super) migrations_1rtt_last_10m: usize,
+    pub(super) mbb_rotations_total: u64,
+    pub(super) graceful_reconnects_total: u64,
+    pub(super) stun_probes_ok_total: u64,
+    pub(super) stun_probes_lost_total: u64,
+    pub(super) last_event: &'static str,
+    pub(super) last_event_unix: u64,
+    pub(super) recent: Vec<TelemetryEvent>,
 }
 
 #[derive(Serialize)]
-struct SessionsPayload {
-    active: usize,
-    handshaking: usize,
-    migrating: usize,
-    up_sport: u16,
-    backend_sport: u16,
-    mapped_nat: Option<String>,
-    auth_drops_total: u64,
-    unauth_silent_drops_total: u64,
-    unauth_silent_drops_last_10m: u64,
+pub(super) struct SessionsPayload {
+    pub(super) active: usize,
+    pub(super) handshaking: usize,
+    pub(super) migrating: usize,
+    pub(super) up_sport: u16,
+    pub(super) backend_sport: u16,
+    pub(super) mapped_nat: Option<String>,
+    pub(super) auth_drops_total: u64,
+    pub(super) unauth_silent_drops_total: u64,
+    pub(super) unauth_silent_drops_last_10m: u64,
 }
 
 #[derive(Serialize)]
-struct StatusPayload {
-    version: &'static str,
-    role: &'static str,
-    updated_at_unix: u64,
-    uptime_secs: u64,
-    health: &'static str,
-    dtls_version: &'static str,
-    cipher: &'static str,
-    dual_ssrc: bool,
-    mtu: usize,
-    workers: usize,
-    link: LinkPayload,
-    events: EventsPayload,
-    sessions: SessionsPayload,
+pub(super) struct StatusPayload {
+    pub(super) version: &'static str,
+    pub(super) role: &'static str,
+    pub(super) updated_at_unix: u64,
+    pub(super) uptime_secs: u64,
+    pub(super) health: &'static str,
+    pub(super) dtls_version: &'static str,
+    pub(super) cipher: &'static str,
+    pub(super) dual_ssrc: bool,
+    pub(super) mtu: usize,
+    pub(super) workers: usize,
+    pub(super) link: LinkPayload,
+    pub(super) events: EventsPayload,
+    pub(super) sessions: SessionsPayload,
 }
 
-struct TelemetryInner {
-    role: &'static str,
-    started_at: Instant,
-    wan_mtu: usize,
-    workers: Vec<WorkerSnapshot>,
+pub(super) struct TelemetryInner {
+    pub(super) role: &'static str,
+    pub(super) started_at: Instant,
+    pub(super) wan_mtu: usize,
+    pub(super) workers: Vec<WorkerSnapshot>,
     // Rate tracking
-    rate_prev_at: Instant,
-    rate_prev_tx_bytes: u64,
-    rate_prev_rx_bytes: u64,
-    tx_mbps: f64,
-    rx_mbps: f64,
+    pub(super) rate_prev_at: Instant,
+    pub(super) rate_prev_tx_bytes: u64,
+    pub(super) rate_prev_rx_bytes: u64,
+    pub(super) tx_mbps: f64,
+    pub(super) rx_mbps: f64,
     // Client outer STUN link quality
-    stun_rtt_ms: Option<f64>,
-    stun_rtt_ewma_ms: Option<f64>,
-    stun_jitter_ms: f64,
-    stun_rtt_samples: u64,
-    stun_outcomes: VecDeque<bool>,
-    stun_probes_ok_total: u64,
-    stun_probes_lost_total: u64,
-    mapped_nat: Option<String>,
+    pub(super) stun_rtt_ms: Option<f64>,
+    pub(super) stun_rtt_ewma_ms: Option<f64>,
+    pub(super) stun_jitter_ms: f64,
+    pub(super) stun_rtt_samples: u64,
+    pub(super) stun_outcomes: VecDeque<bool>,
+    pub(super) stun_probes_ok_total: u64,
+    pub(super) stun_probes_lost_total: u64,
+    pub(super) mapped_nat: Option<String>,
     // Outer lifecycle events & 10-minute sliding windows
-    blackholes_total: u64,
-    blackhole_times: VecDeque<Instant>,
-    migrations_1rtt_total: u64,
-    migration_times: VecDeque<Instant>,
-    mbb_rotations_total: u64,
-    graceful_reconnects_total: u64,
-    unauth_prev_total: u64,
-    unauth_deltas_10m: VecDeque<(Instant, u64)>,
-    last_event: &'static str,
-    last_event_unix: u64,
-    recent_events: VecDeque<TelemetryEvent>,
+    pub(super) blackholes_total: u64,
+    pub(super) blackhole_times: VecDeque<Instant>,
+    pub(super) migrations_1rtt_total: u64,
+    pub(super) migration_times: VecDeque<Instant>,
+    pub(super) mbb_rotations_total: u64,
+    pub(super) graceful_reconnects_total: u64,
+    pub(super) unauth_prev_total: u64,
+    pub(super) unauth_deltas_10m: VecDeque<(Instant, u64)>,
+    pub(super) last_event: &'static str,
+    pub(super) last_event_unix: u64,
+    pub(super) recent_events: VecDeque<TelemetryEvent>,
     // Atomic file write throttle
-    last_file_flush: Option<Instant>,
+    pub(super) last_file_flush: Option<Instant>,
 }
 
 pub struct TelemetryHub {
@@ -193,7 +184,7 @@ fn unix_now_secs() -> u64 {
 }
 
 #[inline]
-fn round_n(v: f64, scale: f64) -> f64 {
+pub(super) fn round_n(v: f64, scale: f64) -> f64 {
     if v.is_finite() {
         (v * scale).round() / scale
     } else {
@@ -221,33 +212,34 @@ fn prune_unauth(q: &mut VecDeque<(Instant, u64)>, now: Instant) {
     }
 }
 
-struct AggregatedView {
-    updated_at_unix: u64,
-    uptime_secs: u64,
-    health: &'static str,
-    health_code: u8,
-    dtls_version: &'static str,
-    cipher: &'static str,
-    dual_ssrc: bool,
-    active_sessions: usize,
-    handshaking_sessions: usize,
-    migrating_sessions: usize,
-    tx_bytes_total: u64,
-    rx_bytes_total: u64,
-    tx_pkts_total: u64,
-    rx_pkts_total: u64,
-    auth_drops_total: u64,
-    unauth_drops_total: u64,
-    unauth_drops_last_10m: u64,
-    active_up_sport: u16,
-    active_backend_sport: u16,
-    stun_loss_pct: f64,
-    blackholes_last_10m: usize,
-    migrations_1rtt_last_10m: usize,
+pub(super) struct AggregatedView {
+    pub(super) updated_at_unix: u64,
+    pub(super) uptime_secs: u64,
+    pub(super) health: &'static str,
+    pub(super) health_code: u8,
+    pub(super) dtls_version: &'static str,
+    pub(super) cipher: &'static str,
+    pub(super) dual_ssrc: bool,
+    pub(super) active_sessions: usize,
+    pub(super) handshaking_sessions: usize,
+    pub(super) migrating_sessions: usize,
+    pub(super) tx_bytes_total: u64,
+    pub(super) rx_bytes_total: u64,
+    pub(super) tx_pkts_total: u64,
+    pub(super) rx_pkts_total: u64,
+    pub(super) auth_drops_total: u64,
+    pub(super) unauth_drops_total: u64,
+    pub(super) unauth_drops_last_10m: u64,
+    pub(super) active_up_sport: u16,
+    pub(super) active_backend_sport: u16,
+    pub(super) stun_loss_pct: f64,
+    pub(super) blackholes_last_10m: usize,
+    pub(super) migrations_1rtt_last_10m: usize,
 }
 
+
 impl TelemetryInner {
-    fn compute_view(&mut self, now: Instant) -> AggregatedView {
+    pub(super) fn compute_view(&mut self, now: Instant) -> AggregatedView {
         prune_times(&mut self.blackhole_times, now);
         prune_times(&mut self.migration_times, now);
         prune_unauth(&mut self.unauth_deltas_10m, now);
@@ -357,181 +349,6 @@ impl TelemetryInner {
             migrations_1rtt_last_10m,
         }
     }
-
-    fn render_json(&mut self, now: Instant) -> String {
-        let v = self.compute_view(now);
-        let payload = StatusPayload {
-            version: env!("CARGO_PKG_VERSION"),
-            role: self.role,
-            updated_at_unix: v.updated_at_unix,
-            uptime_secs: v.uptime_secs,
-            health: v.health,
-            dtls_version: v.dtls_version,
-            cipher: v.cipher,
-            dual_ssrc: v.dual_ssrc,
-            mtu: self.wan_mtu,
-            workers: self.workers.len(),
-            link: LinkPayload {
-                stun_rtt_ms: self.stun_rtt_ms.map(|x| round_n(x, 100.0)),
-                stun_rtt_ewma_ms: self.stun_rtt_ewma_ms.map(|x| round_n(x, 100.0)),
-                stun_jitter_ms: round_n(self.stun_jitter_ms, 100.0),
-                stun_loss_pct: round_n(v.stun_loss_pct, 100.0),
-                tx_mbps: round_n(self.tx_mbps, 1000.0),
-                rx_mbps: round_n(self.rx_mbps, 1000.0),
-                tx_bytes_total: v.tx_bytes_total,
-                rx_bytes_total: v.rx_bytes_total,
-                tx_pkts_total: v.tx_pkts_total,
-                rx_pkts_total: v.rx_pkts_total,
-            },
-            events: EventsPayload {
-                blackholes_total: self.blackholes_total,
-                blackholes_last_10m: v.blackholes_last_10m,
-                migrations_1rtt_total: self.migrations_1rtt_total,
-                migrations_1rtt_last_10m: v.migrations_1rtt_last_10m,
-                mbb_rotations_total: self.mbb_rotations_total,
-                graceful_reconnects_total: self.graceful_reconnects_total,
-                stun_probes_ok_total: self.stun_probes_ok_total,
-                stun_probes_lost_total: self.stun_probes_lost_total,
-                last_event: self.last_event,
-                last_event_unix: self.last_event_unix,
-                recent: self.recent_events.iter().cloned().collect(),
-            },
-            sessions: SessionsPayload {
-                active: v.active_sessions,
-                handshaking: v.handshaking_sessions,
-                migrating: v.migrating_sessions,
-                up_sport: v.active_up_sport,
-                backend_sport: v.active_backend_sport,
-                mapped_nat: self.mapped_nat.clone(),
-                auth_drops_total: v.auth_drops_total,
-                unauth_silent_drops_total: v.unauth_drops_total,
-                unauth_silent_drops_last_10m: v.unauth_drops_last_10m,
-            },
-        };
-        let mut s = serde_json::to_string_pretty(&payload).unwrap_or_else(|_| "{}".to_string());
-        s.push('\n');
-        s
-    }
-
-    fn render_prometheus(&mut self, now: Instant) -> String {
-        let v = self.compute_view(now);
-        let r = self.role;
-        let mut s = String::with_capacity(1400);
-        s.push_str("# HELP webrtc_cloak_up 1 while process is running\n# TYPE webrtc_cloak_up gauge\n");
-        s.push_str(&format!("webrtc_cloak_up{{role=\"{}\"}} 1\n", r));
-        s.push_str("# HELP webrtc_cloak_uptime_seconds Process uptime in seconds\n# TYPE webrtc_cloak_uptime_seconds gauge\n");
-        s.push_str(&format!("webrtc_cloak_uptime_seconds{{role=\"{}\"}} {}\n", r, v.uptime_secs));
-        s.push_str("# HELP webrtc_cloak_health_code 3=good 2=degraded 1=idle 0=critical\n# TYPE webrtc_cloak_health_code gauge\n");
-        s.push_str(&format!("webrtc_cloak_health_code{{role=\"{}\",health=\"{}\"}} {}\n", r, v.health, v.health_code));
-        if let Some(rtt) = self.stun_rtt_ms {
-            s.push_str(&format!("webrtc_cloak_stun_rtt_ms{{role=\"{}\"}} {:.2}\n", r, rtt));
-        }
-        if let Some(ewma) = self.stun_rtt_ewma_ms {
-            s.push_str(&format!("webrtc_cloak_stun_rtt_ewma_ms{{role=\"{}\"}} {:.2}\n", r, ewma));
-        }
-        s.push_str(&format!("webrtc_cloak_stun_jitter_ms{{role=\"{}\"}} {:.2}\n", r, self.stun_jitter_ms));
-        s.push_str(&format!("webrtc_cloak_stun_loss_percent{{role=\"{}\"}} {:.2}\n", r, v.stun_loss_pct));
-        s.push_str(&format!("webrtc_cloak_tx_mbps{{role=\"{}\"}} {:.3}\n", r, self.tx_mbps));
-        s.push_str(&format!("webrtc_cloak_rx_mbps{{role=\"{}\"}} {:.3}\n", r, self.rx_mbps));
-        s.push_str(&format!("webrtc_cloak_tx_bytes_total{{role=\"{}\"}} {}\n", r, v.tx_bytes_total));
-        s.push_str(&format!("webrtc_cloak_rx_bytes_total{{role=\"{}\"}} {}\n", r, v.rx_bytes_total));
-        s.push_str(&format!("webrtc_cloak_tx_pkts_total{{role=\"{}\"}} {}\n", r, v.tx_pkts_total));
-        s.push_str(&format!("webrtc_cloak_rx_pkts_total{{role=\"{}\"}} {}\n", r, v.rx_pkts_total));
-        s.push_str(&format!("webrtc_cloak_active_sessions{{role=\"{}\"}} {}\n", r, v.active_sessions));
-        s.push_str(&format!("webrtc_cloak_migrating_sessions{{role=\"{}\"}} {}\n", r, v.migrating_sessions));
-        s.push_str(&format!("webrtc_cloak_blackholes_total{{role=\"{}\"}} {}\n", r, self.blackholes_total));
-        s.push_str(&format!("webrtc_cloak_blackholes_last_10m{{role=\"{}\"}} {}\n", r, v.blackholes_last_10m));
-        s.push_str(&format!("webrtc_cloak_migrations_1rtt_total{{role=\"{}\"}} {}\n", r, self.migrations_1rtt_total));
-        s.push_str(&format!("webrtc_cloak_migrations_1rtt_last_10m{{role=\"{}\"}} {}\n", r, v.migrations_1rtt_last_10m));
-        s.push_str(&format!("webrtc_cloak_mbb_rotations_total{{role=\"{}\"}} {}\n", r, self.mbb_rotations_total));
-        s.push_str(&format!("webrtc_cloak_graceful_reconnects_total{{role=\"{}\"}} {}\n", r, self.graceful_reconnects_total));
-        s.push_str(&format!("webrtc_cloak_auth_drops_total{{role=\"{}\"}} {}\n", r, v.auth_drops_total));
-        s.push_str(&format!("webrtc_cloak_unauth_silent_drops_total{{role=\"{}\"}} {}\n", r, v.unauth_drops_total));
-        s.push_str(&format!("webrtc_cloak_unauth_silent_drops_last_10m{{role=\"{}\"}} {}\n", r, v.unauth_drops_last_10m));
-        s
-    }
-
-    fn is_critical(&mut self, now: Instant) -> bool {
-        self.compute_view(now).health_code == 0
-    }
-}
-
-fn write_atomic_file(path: &str, body: &str) -> std::io::Result<()> {
-    let p = Path::new(path);
-    if let Some(parent) = p.parent() {
-        if !parent.as_os_str().is_empty() {
-            let _ = std::fs::create_dir_all(parent);
-        }
-    }
-    let tmp = format!("{}.tmp.{}", path, std::process::id());
-    {
-        let mut f = std::fs::File::create(&tmp)?;
-        f.write_all(body.as_bytes())?;
-    }
-    match std::fs::rename(&tmp, path) {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            #[cfg(windows)]
-            {
-                let _ = std::fs::remove_file(path);
-                if std::fs::rename(&tmp, path).is_ok() {
-                    return Ok(());
-                }
-            }
-            let _ = std::fs::remove_file(&tmp);
-            Err(e)
-        }
-    }
-}
-
-fn handle_http_request(req: Request, hub: &TelemetryHub) {
-    let method = req.method().clone();
-    let raw_url = req.url().to_string();
-    let path = raw_url.split('?').next().unwrap_or("/");
-
-    if method != Method::Get && method != Method::Head {
-        let mut resp = Response::from_string("").with_status_code(StatusCode(405));
-        if let Ok(h) = Header::from_bytes(&b"Allow"[..], &b"GET, HEAD"[..]) {
-            resp.add_header(h);
-        }
-        let _ = req.respond(resp);
-        return;
-    }
-
-    let (status_code, ctype, body) = match path {
-        "/" | "/status" | "/health" => (
-            200u16,
-            "application/json; charset=utf-8",
-            hub.snapshot_json(),
-        ),
-        "/healthz" => {
-            let crit = hub.is_critical();
-            (
-                if crit { 503u16 } else { 200u16 },
-                "application/json; charset=utf-8",
-                hub.snapshot_json(),
-            )
-        }
-        "/metrics" => (
-            200u16,
-            "text/plain; version=0.0.4; charset=utf-8",
-            hub.snapshot_prometheus(),
-        ),
-        _ => (
-            404u16,
-            "text/plain; charset=utf-8",
-            "not found (use /status, /health, /healthz, or /metrics)\n".to_string(),
-        ),
-    };
-
-    let mut resp = Response::from_string(body).with_status_code(StatusCode(status_code));
-    if let Ok(h) = Header::from_bytes(&b"Content-Type"[..], ctype.as_bytes()) {
-        resp.add_header(h);
-    }
-    if let Ok(h) = Header::from_bytes(&b"Cache-Control"[..], &b"no-store"[..]) {
-        resp.add_header(h);
-    }
-    let _ = req.respond(resp);
 }
 
 impl TelemetryHub {
@@ -845,128 +662,5 @@ impl TelemetryHub {
             event,
             detail,
         });
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::io::Read;
-    use std::net::{IpAddr, Ipv4Addr, TcpListener, TcpStream};
-
-    #[test]
-    fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
-        let probe_sock = TcpListener::bind("127.0.0.1:0").unwrap();
-        let http_addr = probe_sock.local_addr().unwrap();
-        drop(probe_sock);
-
-        let tmp_path = std::env::temp_dir()
-            .join(format!("wc_telemetry_unit_{}.json", std::process::id()))
-            .to_string_lossy()
-            .to_string();
-
-        let cfg = TelemetryConfig {
-            status_file: Some(tmp_path.clone()),
-            status_http: Some(http_addr),
-            status_interval_secs: 1,
-        };
-        let hub = TelemetryHub::start("client", &cfg, 1, 1488, true, None).unwrap();
-
-        // 1. Initially idle (0 active sessions)
-        let j0 = std::fs::read_to_string(&tmp_path).expect("initial status file");
-        assert!(j0.contains("\"health\": \"idle\""), "expected idle: {}", j0);
-
-        // 2. Active session + clean STUN samples -> good
-        hub.update_worker(
-            0,
-            WorkerSnapshot {
-                active_sessions: 1,
-                tx_bytes_total: 100_000,
-                rx_bytes_total: 500_000,
-                tx_pkts_total: 100,
-                rx_pkts_total: 400,
-                active_up_sport: 45678,
-                dtls_version: "1.3",
-                cipher: "aes-128-gcm",
-                dual_ssrc: true,
-                ..Default::default()
-            },
-        );
-        for rtt in [160.0, 161.0, 159.5, 160.5] {
-            hub.record_stun_ok(
-                rtt,
-                0,
-                Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 4444)),
-            );
-        }
-        hub.record_mbb_rotation("45678->45999".to_string());
-        let j1 = hub.snapshot_json();
-        let v1: serde_json::Value = serde_json::from_str(&j1).expect("valid serde JSON");
-        assert_eq!(v1["health"], "good");
-        assert_eq!(v1["link"]["stun_loss_pct"], 0.0);
-        assert_eq!(v1["events"]["mbb_rotations_total"], 1);
-        assert_eq!(v1["sessions"]["mapped_nat"], "198.51.100.10:4444");
-
-        // 3. HTTP /status, /metrics, /healthz, 404, 405 checks
-        let http_get = |req: &str| -> String {
-            let mut s = TcpStream::connect(http_addr).unwrap();
-            s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-            s.write_all(req.as_bytes()).unwrap();
-            let mut buf = String::new();
-            let _ = s.read_to_string(&mut buf);
-            buf
-        };
-        let r_status = http_get("GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        assert!(r_status.starts_with("HTTP/1.1 200 OK"));
-        assert!(r_status.contains("application/json"));
-        assert!(r_status.contains("\"health\": \"good\""));
-
-        let r_metrics = http_get("GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        assert!(r_metrics.starts_with("HTTP/1.1 200 OK"));
-        assert!(r_metrics.contains("webrtc_cloak_health_code{role=\"client\",health=\"good\"} 3"));
-        assert!(r_metrics.contains("webrtc_cloak_mbb_rotations_total{role=\"client\"} 1"));
-
-        let r_404 = http_get("GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        assert!(r_404.starts_with("HTTP/1.1 404 Not Found"));
-
-        let r_405 = http_get("POST /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        assert!(r_405.starts_with("HTTP/1.1 405 Method Not Allowed"));
-
-        // 3b. Read-only scrapes between worker ticks MUST preserve non-zero tx_mbps / rx_mbps!
-        thread::sleep(Duration::from_millis(550));
-        hub.update_worker(
-            0,
-            WorkerSnapshot {
-                active_sessions: 1,
-                tx_bytes_total: 600_000,
-                rx_bytes_total: 2_500_000,
-                tx_pkts_total: 600,
-                rx_pkts_total: 2000,
-                active_up_sport: 45678,
-                dtls_version: "1.3",
-                cipher: "aes-128-gcm",
-                dual_ssrc: true,
-                ..Default::default()
-            },
-        );
-        thread::sleep(Duration::from_millis(550));
-        let r_rate1 = http_get("GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        let b_rate1 = r_rate1.split_once("\r\n\r\n").unwrap().1;
-        let vr1: serde_json::Value = serde_json::from_str(b_rate1).unwrap();
-        assert!(vr1["link"]["rx_mbps"].as_f64().unwrap() > 10.0);
-        let r_rate2 = http_get("GET /status HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        let b_rate2 = r_rate2.split_once("\r\n\r\n").unwrap().1;
-        let vr2: serde_json::Value = serde_json::from_str(b_rate2).unwrap();
-        assert_eq!(vr1["link"]["rx_mbps"], vr2["link"]["rx_mbps"]);
-
-        // 4. Two blackholes in 10m -> critical -> /healthz returns 503!
-        hub.record_blackhole(3, "bh#1".to_string());
-        assert!(hub.snapshot_json().contains("\"health\": \"critical\"") || hub.snapshot_json().contains("\"health\": \"degraded\""));
-        hub.record_blackhole(3, "bh#2".to_string());
-        let r_hz = http_get("GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-        assert!(r_hz.starts_with("HTTP/1.1 503 Service Unavailable"), "got: {}", r_hz);
-
-        hub.shutdown();
-        let _ = std::fs::remove_file(&tmp_path);
     }
 }

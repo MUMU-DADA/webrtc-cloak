@@ -44,11 +44,13 @@
     ├── Cargo.lock
     ├── .cargo/config.toml
     └── src/
-        ├── main.rs                        # CLI / PSK 加载 / cpu / bench / selftest / sink / loadgen
-        ├── protocol.rs                    # STUN / dimpl DTLS 1.3+1.2 / X.509 / 双 SSRC SRTP / SRTCP
-        ├── client.rs                      # 客户端 mio 非阻塞事件循环与失活/黑洞自愈状态机
-        ├── server.rs                      # 服务端 mio 事件循环 / 防重放 / Silent Drop / 乱序缓冲
-        └── selftest.rs                    # 线上直测 + 本地离线 12 项自测与算力体检套件
+        ├── main.rs                        # CLI 参数解析与子命令分发入口
+        ├── bench_tools.rs                 # cpu / bench / sink / loadgen 压测与算力工具
+        ├── protocol/                      # STUN / dimpl DTLS 1.3+1.2 / X.509 / 双 SSRC SRTP / SRTCP
+        ├── client/                        # 客户端 mio 事件循环、黑洞 1-RTT 迁移、MBB 状态机与集成测试
+        ├── server/                        # 服务端 mio 事件循环、防重放、跨 worker 注册表与 Silent Drop
+        ├── selftest/                      # 线上直测 + 本地离线 12 项自测、劣化代理与报告渲染
+        └── telemetry/                     # 外层链路健康只读遥测（原子 JSON 落盘 / HTTP / Prometheus）
 ```
 
 ---
