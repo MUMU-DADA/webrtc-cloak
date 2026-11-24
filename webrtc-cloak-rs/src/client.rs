@@ -1381,12 +1381,18 @@ mod tests {
 
         let mut rbuf = [0u8; 256];
         let mut ready = false;
-        for _ in 0..20 {
+        let t_init = Instant::now();
+        while t_init.elapsed() < Duration::from_secs(5) {
             let _ = app.send(b"PING_INIT");
-            if let Ok(n) = app.recv(&mut rbuf) {
-                if &rbuf[..n] == b"PING_INIT" {
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"PING_INIT" => {
                     ready = true;
                     break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => {
+                    // Linux returns immediate ECONNREFUSED before client thread binds listen_port
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
@@ -1550,12 +1556,16 @@ mod tests {
         let t0 = Instant::now();
         let mut ok = false;
         let mut rbuf = [0u8; 256];
-        while t0.elapsed() < Duration::from_secs(3) {
+        while t0.elapsed() < Duration::from_secs(5) {
             let _ = app.send(b"PING_F5_RECOVER");
-            if let Ok(n) = app.recv(&mut rbuf) {
-                if &rbuf[..n] == b"PING_F5_RECOVER" {
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"PING_F5_RECOVER" => {
                     ok = true;
                     break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => {
+                    thread::sleep(Duration::from_millis(50));
                 }
             }
         }
