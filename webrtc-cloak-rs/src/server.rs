@@ -1,18 +1,19 @@
-//! mio-based zero-allocation webrtc-cloak V3.1 server (Production Freeze):
+//! mio-based zero-allocation webrtc-cloak V3.2 server (Hardened):
 //!   - Pure Silent-Drop on all unauthenticated, malformed, expired, or replayed probes
-//!   - Shared O(1) bounded FIFO `SeenTxidCache` across all SO_REUSEPORT workers (stack-buffered
-//!     cached replies + max 6 retransmits cap -> zero heap alloc in Mutex, zero reflection abuse)
-//!   - Real RFC 6347 DTLS 1.2 via `dimpl` (strict pre-validation + Ready gating + NEVER killed by
-//!     single spoofed packet + worker-cached rotating Chrome certs + early_srtp reordering buffer)
+//!   - Zero-alloc pre-auth STUN parser + shared O(1) bounded FIFO `SeenTxidCache` across workers
+//!   - Real RFC 9147 DTLS 1.3 + RFC 6347 DTLS 1.2 via `dimpl 0.9.0` (strict pre-validation, optional
+//!     `--dtls-min-version 1.3`, Fail-Closed Hybrid PFS, fail-fast handshake reset, Ready gating)
+//!   - Dual-SSRC SRTP (PT=111 <=50pps Opus + PT=96 video) + in-band `0xFFFE` probe echo (also early_srtp)
 //!   - RFC 3550 §6.1 / 7714 §9.1 Compound SRTCP (encrypted BYE, real RC=0/1) + Closing(250ms) drain
 
 use crate::protocol::{
-    build_dimpl_config, build_stun_success_response, combine_session_key, demux_rfc7983,
-    derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, parse_stun,
-    rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram, CertCache, CipherPref,
-    CipherSuite, PacketKind, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN, STUN_BINDING_REQUEST,
+    build_dimpl_config_pool, build_stun_success_response, combine_session_key, demux_rfc7983,
+    derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, new_dtls_instance,
+    parse_stun_with_key, rand_duration_range_ms, resolve_srtp_suite, stun_hmac_key,
+    validate_dtls_datagram, CertCache, CipherPref, CipherSuite, DtlsConfigPool, DtlsMinVersion,
+    PacketKind, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN, STUN_BINDING_REQUEST,
 };
-use dimpl::{Config as DtlsConfig, Dtls, Output as DtlsOutput};
+use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -35,6 +36,7 @@ const RETRANSMIT_WINDOW: Duration = Duration::from_secs(8);
 const MAX_STUN_RETRANSMITS: u8 = 6;
 const SEEN_TXID_CAP: usize = 65_536;
 const EARLY_SRTP_CAP: usize = 32;
+const MAX_DTLS_RESETS: u8 = 3;
 const CLOSING_DRAIN_MS: u64 = 250;
 /// RFC 7675 §5.1 consent lifetime: stop transmitting and silently release session after 30s
 /// with zero authenticated packets (STUN/SRTP/SRTCP/DTLS) received from peer.
@@ -144,6 +146,7 @@ pub struct ServerConfig {
     pub psk: Vec<u8>,
     pub cipher_pref: CipherPref,
     pub dtls_required: bool,
+    pub dtls_min_version: DtlsMinVersion,
     pub workers: usize,
     pub max_sessions: usize,
     pub wan_mtu: usize,
@@ -172,6 +175,7 @@ struct ServerSession {
     ssrc_c2s: u32,
     ssrc_s2c: u32,
     dtls: Option<Dtls>,
+    dtls_resets: u8,
     dtls_next_timeout: Option<Instant>,
     dtls_suite_id: Option<u16>,
     dtls_km: Option<Vec<u8>>,
@@ -197,6 +201,7 @@ fn make_udp_socket(
     bind_addr: SocketAddr,
     connect_to: Option<SocketAddr>,
     reuse_port: bool,
+    buf_bytes: usize,
 ) -> std::io::Result<MioUdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let _ = sock.set_reuse_address(true);
@@ -206,8 +211,8 @@ fn make_udp_socket(
     }
     #[cfg(not(unix))]
     let _ = reuse_port;
-    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
-    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_recv_buffer_size(buf_bytes);
+    let _ = sock.set_send_buffer_size(buf_bytes);
     sock.set_nonblocking(true)?;
     sock.bind(&bind_addr.into())?;
     if let Some(target) = connect_to {
@@ -272,8 +277,23 @@ where
     }
 
     if connected_now && sess.state == ServerState::DtlsHandshake {
+        let Some(km) = sess.dtls_km.as_deref().filter(|k| !k.is_empty()) else {
+            log(
+                worker_id,
+                &format!(
+                    "DTLS Connected without SRTP KeyingMaterial peer={} (Fail-Closed!)",
+                    sess.peer_addr
+                ),
+            );
+            return true;
+        };
+        let is_dtls13 = sess
+            .dtls
+            .as_ref()
+            .and_then(|d| d.protocol_version())
+            == Some(ProtocolVersion::DTLS1_3);
         let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
-        let final_key = combine_session_key(&sess.stun_key, sess.dtls_km.as_deref());
+        let final_key = combine_session_key(&sess.stun_key, Some(km));
         sess.negotiated_cipher = Some(chosen);
         let mut c = SrtpCloakCipher::new(
             &final_key,
@@ -283,33 +303,51 @@ where
             chosen,
         );
         c.set_wan_mtu(cfg.wan_mtu);
+        c.set_dual_ssrc(is_dtls13);
         sess.cipher = Some(c);
         sess.state = ServerState::Ready;
         sess.ready_at = Some(now);
         sess.last_data_active = now;
+        sess.last_peer_rx = now;
         sess.next_srtcp_at = now + rand_duration_range_ms(300, 750);
 
-        // V3-M-03: flush any reordered early SRTP packets that arrived just ahead of Flight 5!
+        // V3-M-03 + L-03: flush any reordered early SRTP (Data or in-band 0xFFFE Probe) arriving ahead of Flight 5!
         let mut early_flushed = 0usize;
         if let Some(ref mut cipher) = sess.cipher {
             while let Some(raw_srtp) = sess.early_srtp.pop_front() {
-                if let Some(pn) = cipher.unwrap_into(&raw_srtp, wbuf) {
-                    if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
-                        sess.rx_pkts += 1;
-                        sess.rx_bytes += pn as u64;
-                        early_flushed += 1;
+                match cipher.unwrap_into_ex(&raw_srtp, wbuf) {
+                    Some(SrtpFrame::Data(pn)) => {
+                        if sess.backend_sock.send(&wbuf[..pn]).is_ok() {
+                            sess.rx_pkts += 1;
+                            sess.rx_bytes += pn as u64;
+                            early_flushed += 1;
+                        }
                     }
-                } else {
-                    sess.auth_drops += 1;
+                    Some(SrtpFrame::Probe(pn)) => {
+                        let mut pbuf = [0u8; 2048];
+                        if let Some(wn) = cipher.wrap_probe_into(&wbuf[..pn], &mut pbuf) {
+                            audit_pkt(1, &pbuf[..wn]);
+                            if listen_sock.send_to(&pbuf[..wn], sess.peer_addr).is_ok() {
+                                sess.rx_pkts += 1;
+                                sess.tx_pkts += 1;
+                                early_flushed += 1;
+                            }
+                        }
+                    }
+                    None => {
+                        sess.auth_drops += 1;
+                    }
                 }
             }
         }
         log(
             worker_id,
             &format!(
-                "DTLS 1.2 (dimpl mutual-cert PFS) OK -> READY peer={} cipher={} backend_sport={} early_srtp={}",
+                "DTLS {} (dimpl mutual-cert PFS) OK -> READY peer={} cipher={} dual_ssrc={} backend_sport={} early_srtp={}",
+                if is_dtls13 { "1.3" } else { "1.2" },
                 sess.peer_addr,
                 chosen.name(),
+                is_dtls13,
                 sess.backend_lport,
                 early_flushed
             ),
@@ -329,7 +367,7 @@ fn graceful_teardown_server<F>(
 {
     if sess.state == ServerState::Ready {
         let has_rx = sess.rx_pkts > 0;
-        let is_sender = sess.tx_pkts > 0;
+        let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
         if let Some(ref mut cipher) = sess.cipher {
             let bye = cipher.build_srtcp(has_rx, is_sender, true);
             audit_pkt(1, &bye);
@@ -356,15 +394,16 @@ fn graceful_teardown_server<F>(
 pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
-    let dtls_cfg = build_dimpl_config(cfg.cipher_pref, &cpu, false);
+    let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, false, cfg.wan_mtu);
     let seen_txids = Arc::new(Mutex::new(SeenTxidCache::new()));
     if !cfg.quiet {
         println!(
-            "[server-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(mutual-cert,cookie,pfs) silent_drop=true",
+            "[server-rs] V3.2 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,cookie,pfs) silent_drop=true",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
             workers,
+            cfg.dtls_min_version.as_str(),
         );
     }
     #[cfg(not(target_os = "linux"))]
@@ -373,22 +412,22 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     }
 
     if workers == 1 {
-        return run_server_worker(0, cfg, false, dtls_cfg, seen_txids);
+        return run_server_worker(0, cfg, false, dtls_pool, seen_txids);
     }
 
     let mut handles = Vec::with_capacity(workers - 1);
     for wid in 1..workers {
         let mut c = cfg.clone();
         c.wire_audit_file = None;
-        let dc = Arc::clone(&dtls_cfg);
+        let dp = dtls_pool.clone();
         let cache = Arc::clone(&seen_txids);
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_server_worker(wid, c, true, dc, cache) {
+            if let Err(e) = run_server_worker(wid, c, true, dp, cache) {
                 eprintln!("[server-rs#{}] error: {}", wid, e);
             }
         }));
     }
-    let res = run_server_worker(0, cfg, true, dtls_cfg, seen_txids);
+    let res = run_server_worker(0, cfg, true, dtls_pool, seen_txids);
     for h in handles {
         let _ = h.join();
     }
@@ -399,14 +438,14 @@ fn run_server_worker(
     worker_id: usize,
     cfg: ServerConfig,
     reuse_port: bool,
-    dtls_cfg: Arc<DtlsConfig>,
+    dtls_pool: DtlsConfigPool,
     seen_txids: Arc<Mutex<SeenTxidCache>>,
 ) -> std::io::Result<()> {
     SERVER_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(256);
 
-    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port)?;
+    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, 8 * 1024 * 1024)?;
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
 
@@ -414,6 +453,12 @@ fn run_server_worker(
     let mut token_by_peer: HashMap<SocketAddr, Token> = HashMap::new();
     let mut next_token_id: usize = 1;
     let mut cert_cache = CertCache::new();
+    let stun_mi_key = stun_hmac_key(&cfg.psk);
+    let max_early_srtp_len = if cfg.wan_mtu > 0 {
+        cfg.wan_mtu.saturating_sub(28).clamp(576, 2048)
+    } else {
+        2048
+    };
 
     let mut audit_fp = cfg
         .wire_audit_file
@@ -508,7 +553,12 @@ fn run_server_worker(
                         to_close.push((tok, "consent_timeout"));
                         continue;
                     }
-                    if now.duration_since(sess.last_data_active) > idle_dur {
+                    let seq_exhausted = sess
+                        .cipher
+                        .as_ref()
+                        .map(|c| c.is_seq_exhausted())
+                        .unwrap_or(false);
+                    if seq_exhausted || now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_server(sess, &listen_sock, &mut dtls_buf, &mut audit_pkt);
                         sess.state = ServerState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
                         continue;
@@ -591,7 +641,7 @@ fn run_server_worker(
 
                     match demux_rfc7983(pkt) {
                         PacketKind::Stun => {
-                            let parsed = match parse_stun(pkt, &cfg.psk) {
+                            let parsed = match parse_stun_with_key(pkt, &cfg.psk, &stun_mi_key) {
                                 Some(p) if p.msg_type == STUN_BINDING_REQUEST && p.authenticated => p,
                                 _ => {
                                     // Pure Silent Drop on all unauthenticated/malformed/expired STUN!
@@ -701,7 +751,7 @@ fn run_server_worker(
                             let (stun_key, s_c2s, s_s2c) =
                                 derive_stun_material(&cfg.psk, &parsed.txid, &uname);
                             let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-                            let mut bs = match make_udp_socket(bind_any, Some(cfg.backend_addr), false) {
+                            let mut bs = match make_udp_socket(bind_any, Some(cfg.backend_addr), false, 512 * 1024) {
                                 Ok(s) => s,
                                 Err(e) => {
                                     log(worker_id, &format!("backend socket error: {}", e));
@@ -710,14 +760,22 @@ fn run_server_worker(
                             };
                             let blport = bs.local_addr().map(|a| a.port()).unwrap_or(0);
                             let tok = Token(next_token_id);
-                            next_token_id += 1;
+                            next_token_id = next_token_id.wrapping_add(1);
+                            if next_token_id == 0 {
+                                next_token_id = 1;
+                            }
                             if poll.registry().register(&mut bs, tok, Interest::READABLE).is_err() {
                                 continue;
                             }
 
                             let (state, dtls_opt, cipher_opt, chosen_opt, ready_at) = if cfg.dtls_required {
                                 let cert = cert_cache.get(now);
-                                let mut dtls = Dtls::new_12(Arc::clone(&dtls_cfg), cert, now);
+                                let mut dtls = new_dtls_instance(
+                                    cfg.dtls_min_version,
+                                    dtls_pool.pick(),
+                                    cert,
+                                    now,
+                                );
                                 let _ = dtls.handle_timeout(now);
                                 (ServerState::DtlsHandshake, Some(dtls), None, None, None)
                             } else {
@@ -753,6 +811,7 @@ fn run_server_worker(
                                 ssrc_c2s: s_c2s,
                                 ssrc_s2c: s_s2c,
                                 dtls: dtls_opt,
+                                dtls_resets: 0,
                                 dtls_next_timeout: None,
                                 dtls_suite_id: None,
                                 dtls_km: None,
@@ -797,7 +856,9 @@ fn run_server_worker(
                                     }
                                     let mut dtls_err = false;
                                     if let Some(ref mut dtls) = sess.dtls {
-                                        let _ = dtls.handle_timeout(now);
+                                        if sess.dtls_next_timeout.map(|t| now >= t).unwrap_or(false) {
+                                            let _ = dtls.handle_timeout(now);
+                                        }
                                         if dtls.handle_packet(pkt).is_err() {
                                             dtls_err = true;
                                         }
@@ -809,10 +870,32 @@ fn run_server_worker(
                                         sess.auth_drops += 1;
                                         if sess.state == ServerState::Ready {
                                             sess.dtls = None;
+                                            sess.dtls_next_timeout = None;
+                                        } else if sess.state == ServerState::DtlsHandshake
+                                            && sess.dtls_resets < MAX_DTLS_RESETS
+                                            && sess.dtls_suite_id.is_none()
+                                        {
+                                            // P0-4: reset poisoned pre-ServerHello dimpl state instead of stalling 15s
+                                            sess.dtls_resets += 1;
+                                            sess.dtls_km = None;
+                                            let cert = cert_cache.get(now);
+                                            let mut fresh = new_dtls_instance(
+                                                cfg.dtls_min_version,
+                                                dtls_pool.pick(),
+                                                cert,
+                                                now,
+                                            );
+                                            let _ = fresh.handle_timeout(now);
+                                            sess.dtls = Some(fresh);
+                                            sess.dtls_next_timeout = None;
                                         }
                                         continue;
                                     }
-                                    sess.last_peer_rx = now;
+                                    // M-01 / P0-4 fix: NEVER refresh last_peer_rx in Ready state from DTLS
+                                    // (dimpl silently returns Ok(()) on forged AEAD ciphertext!).
+                                    if sess.state == ServerState::DtlsHandshake {
+                                        sess.last_peer_rx = now;
+                                    }
                                     if drain_server_dtls(
                                         worker_id,
                                         sess,
@@ -881,7 +964,10 @@ fn run_server_worker(
                                                         let mut pbuf = [0u8; 2048];
                                                         if let Some(wn) = cipher.wrap_probe_into(&wbuf[..pn], &mut pbuf) {
                                                             audit_pkt(1, &pbuf[..wn]);
-                                                            let _ = listen_sock.send_to(&pbuf[..wn], sess.peer_addr);
+                                                            if listen_sock.send_to(&pbuf[..wn], sess.peer_addr).is_ok() {
+                                                                sess.rx_pkts += 1;
+                                                                sess.tx_pkts += 1;
+                                                            }
                                                         }
                                                     }
                                                     None => {
@@ -891,8 +977,11 @@ fn run_server_worker(
                                             }
                                         }
                                         ServerState::DtlsHandshake => {
-                                            // V3-M-03: buffer reordered early SRTP arriving before Flight 5!
-                                            if sess.early_srtp.len() < EARLY_SRTP_CAP {
+                                            // V3-M-03 + P1-4: bounded-length buffer for reordered early SRTP
+                                            if sess.early_srtp.len() < EARLY_SRTP_CAP
+                                                && pkt.len() >= 38
+                                                && pkt.len() <= max_early_srtp_len
+                                            {
                                                 sess.early_srtp.push_back(pkt.to_vec());
                                             }
                                         }

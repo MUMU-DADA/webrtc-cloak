@@ -5,12 +5,12 @@
 [![Interactive Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-0ea5e9.svg)](https://mumu-dada.github.io/webrtc-cloak/)
 [![Release](https://img.shields.io/github/v/release/MUMU-DADA/webrtc-cloak?color=10b981)](https://github.com/MUMU-DADA/webrtc-cloak/releases)
 
-一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用与 UDP 封装实验原型。本项目基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550），实现了一套完整的 `ICE STUN + 真双向证书 DTLS 1.2 + SRTP/SRTCP` 透明 UDP 传输层实验框架，用于研究现代网络协议识别（DPI）、UDP 状态化防火墙行为、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
+一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用与 UDP 封装实验原型。本项目基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 9147 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550 / 7587），实现了一套完整的 `ICE STUN + 真双向加密证书 DTLS 1.3/1.2 + 双 SSRC SRTP/SRTCP` 透明 UDP 传输层实验框架，用于研究现代网络协议识别（DPI）、UDP 状态化防火墙行为、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
 
 > [!TIP]
 > **在线交互式原理演示（无需下载）**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**
 >
-> 支持在线交互体验 4 种对抗与自愈场景动态推演、字节级报文解剖（`ICE STUN / DTLS 1.2 / SRTP 0x90 / Compound SRTCP`）、AEAD 内层随机填充打散直方图模拟以及 Hybrid PFS 密钥派生流程（也可离线双击本地 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）。
+> 支持在线交互体验 5 种对抗与自愈场景动态推演、字节级报文解剖（`ICE STUN / DTLS 1.3 & 1.2 / 双流 SRTP 0x90 / Compound SRTCP`）、双 SSRC + PPPoE MTU 1488 + AEAD 内层随机填充直方图模拟以及 Hybrid PFS 密钥派生流程（也可离线双击本地 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）。
 >
 > **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（含 Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
@@ -44,10 +44,10 @@
     ├── .cargo/config.toml
     └── src/
         ├── main.rs                        # CLI / PSK 加载 / cpu / bench / selftest / sink / loadgen
-        ├── protocol.rs                    # STUN / dimpl DTLS 1.2 / X.509 / SRTP / SRTCP
-        ├── client.rs                      # 客户端 mio 非阻塞事件循环与失活重握状态机
+        ├── protocol.rs                    # STUN / dimpl DTLS 1.3+1.2 / X.509 / 双 SSRC SRTP / SRTCP
+        ├── client.rs                      # 客户端 mio 非阻塞事件循环与失活/黑洞自愈状态机
         ├── server.rs                      # 服务端 mio 事件循环 / 防重放 / Silent Drop / 乱序缓冲
-        └── selftest.rs                    # 本地 12 项弱网故障注入、安全探测与 CPU 算力自测套件
+        └── selftest.rs                    # 线上直测 + 本地离线 12 项自测与算力体检套件
 ```
 
 ---
@@ -59,7 +59,7 @@
 ```mermaid
 flowchart LR
     App["本地测试应用 / 上层 UDP<br/>(127.0.0.1:19543)"] -->|"原始 UDP 报文"| Cli["webrtc-cloak client<br/>(默认单线程 mio)"]
-    Cli <-->|"单端口 RFC 7983 复用<br/>STUN + DTLS 1.2 + SRTP/SRTCP"| Net{{"公网 / 实验链路<br/>(NAT / 状态化中间件)"}}
+    Cli <-->|"单端口 RFC 7983 复用<br/>STUN + DTLS 1.3/1.2 + 双流 SRTP/SRTCP"| Net{{"公网 / 实验链路<br/>(NAT / 状态化中间件)"}}
     Net <-->|"UDP :19643"| Srv["webrtc-cloak server<br/>(默认单线程 mio)"]
     Srv -->|"解封装还原 UDP"| Backend["后端本地 UDP 服务<br/>(127.0.0.1:<BACKEND>)"]
 ```
@@ -70,21 +70,21 @@ flowchart LR
 
 | 首字节范围 | 协议层 | 关键规范与实现要点 |
 | :--- | :--- | :--- |
-| `0..=3` | **ICE STUN** (RFC 5389 / 8445 / 7675) | 初始连通性检查（`4:4` Base64 `ufrag`、`USE-CANDIDATE`、HMAC-SHA1 `MESSAGE-INTEGRITY`、唯一尾部 8B `FINGERPRINT`、±30s 时间戳防重放），以及 `5s ± 20%` Consent Freshness 保活 |
-| `20..=23` | **DTLS 1.2** (RFC 6347 / 5764) | 嵌入纯 Rust Sans-IO 库 **`dimpl 0.9.0`**，执行完整 6-Flight 双向 ECDSA P-256 证书 + `HelloVerifyRequest` Cookie + ECDHE 握手 |
-| `128..=191` (`PT 64..95` 除外) | **SRTP** (RFC 3711 / 7714 / 8285) | 标准 **`0x90`**（`V=2, P=0, X=1, CC=0`）+ `0xBEDE` 单字节扩展头 + 90kHz 墙钟时间戳 + AEAD 密文内层长度与随机填充 |
-| `128..=191` (`PT 64..95`) | **Compound SRTCP** (RFC 3550 / 7714) | 明文首包恒为 `PT=200 (SR)` 或 `PT=201 (RR)`，动态 `RC=0/1`，加密复合体包含 `SDES (202)` + `FB (205/206)` + 加密尾部 `BYE (203)` |
+| `0..=3` | **ICE STUN** (RFC 5389 / 8445 / 7675) | 初始连通性检查（`4:4` Base64 `ufrag`、`USE-CANDIDATE`、零分配前置 HMAC-SHA1 `MESSAGE-INTEGRITY`、唯一尾部 8B `FINGERPRINT`、±30s 时间戳防重放），以及 `5s ± 20%` Consent Freshness 保活 |
+| `20..=63` | **DTLS 1.3 / 1.2 Auto** (RFC 9147 / 6347 / 5764) | 嵌入纯 Rust Sans-IO 库 **`dimpl 0.9.0`**，默认 DTLS 1.3 优先（`0x2e` 全程加密双向 ECDSA P-256 证书 + 省 1 RTT + 多 MTU 预构建配置池打散 ClientHello 长度），同时无缝向下兼容 `v0.3.5` DTLS 1.2 滚动升级；支持 `--dtls-min-version 1.3` 锁定彻底防降级 |
+| `128..=191` (`PT 64..95` 除外) | **双 SSRC SRTP** (RFC 3711 / 7714 / 8285 / 7587) | 标准 **`0x90`**（`V=2, P=0, X=1, CC=0`）+ 全局共享 `0xBEDE` TWCC 扩展头；DTLS 1.3 自动启用双 SSRC 分流：抖动阈值小包走 `PT=111` 48kHz Opus（每 20ms 严格限 1 包 `≤50 pps`），其余与大包走 `PT=96` 90kHz 视频（严格 `M=1` 帧尾因果律）+ AEAD 密文内层长度与随机填充 |
+| `128..=191` (`PT 64..95`) | **Compound SRTCP** (RFC 3550 / 7714) | 明文首包恒为 `PT=200 (SR)` 或 `PT=201 (RR)`，动态 `RC=0/1` 且按实际音视频发包 SSRC 上报；加密复合体包含会话恒定 CNAME `SDES (202)`（严格 `0x00` 对齐）+ 平滑随机 `FB (205/206)` + 加密尾部 `BYE (203)`，0-based 序号 |
 
 ### 3. 核心工程设计亮点
 
-- **双重混合前向安全（Hybrid PFS）**：最终会话主密钥由 `SHA-256("webrtc-cloak-v3-pfs-mix" || stun_key || dtls_keying_material)` 派生，将预置共享密钥（PSK）认证与每次会话独立的 ECDHE-P256 前向安全密钥材料深度绑定；SRTP 与 SRTCP 通过 `dir | 0x80` 实现 100% 不相交的 AEAD Nonce 域分离。
+- **双重混合前向安全（Fail-Closed Hybrid PFS）**：最终会话主密钥由 `SHA-256("webrtc-cloak-v3|pfs-bind|" || stun_key || "|dtls-km|" || dtls_keying_material)` 派生（缺失 `KeyingMaterial` 时严格 Fail-Closed 拒连）；Video SRTP（`dir`）、Audio SRTP（`dir | 0x40` + 高 16 位严格互异 `audio_ssrc`）与 SRTCP（`dir | 0x80`）三域 100% 数学正交隔离，并在序号逼近上限时主动重连永不回绕。
 - **严谨的状态机边界防护**：
-  - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；会话优雅退出时进入 `Closing(250ms)` 吸收在途尾包，避免触发 `ICMP Port Unreachable`。
-  - **入口预校验与抗注入**：`validate_dtls_datagram` 拒绝 `Epoch=0` 明文 Alert 及 `<18B` 的伪造加密记录；`parse_stun` 严格执行 RFC 5389 §15.4 拒绝 `MESSAGE-INTEGRITY` 后的任何夹带属性；SRTP 内置 **2048 包 RFC 6479 滑动防重放窗口**（容忍跨洋高包率 ECMP 乱序），SRTCP 内置 64-bit 滑动防重放窗口。
-  - **单向上行黑洞与服务端重启自愈（`v0.3.4`）**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并按 RFC 7675 §5.1 在 30s 无认证对端报文时静默回收旧会话；客户端仅凭双向 STUN Consent 应答判定上行活性（不被服务端单向下行 SRTCP/SRTP 误续命），丢失应答时按 RFC 5389 §7.2.1 同 `txid` 指数退避重传（避免单包丢包误切），3 次无应答即确认上行黑洞，旧端口转入 35s 静默接收态（零 ICMP 弹包且避免 CGNAT 复用黑洞外网端口）并立即在新端口完成重握自愈。
-- **内置双模式 12 项自测与算力体检（`v0.3.5`）**：新增 `webrtc-cloak selftest` 子命令，同时支持**真实线上远程隧道直测**（`--server-host <IP> --server-port 19643 --psk-file <PATH>`，通过加密带内 `0xFFFE` SRTP 回显探针在不影响线上 Hysteria 2 等业务后端的前提下实测真实公网 NAT 映射、DTLS 1.2 握手、WAN 延迟/抖动/丢包、公网 Path MTU 边界、多端口 NAT 轮换与 7 类主动探测 Silent-Drop 验真，并兼容 `< v0.3.5` 服务端自动降级 `[SKIP]`）以及**离线本地故障注入沙箱**（`--local`，模拟单向上行黑洞、服务端重启、35% 乱序+30% 重放等线上不可直接触发的故障场景），同时内置本机单核/全核加解密与 P-256 证书签发算力体检。
+  - **纯 Silent Drop**：未通过 PSK 鉴权或新鲜度校验的探测包 0 字节静默丢弃；`parse_stun` 鉴权前零堆分配；会话退出进入 `Closing` 吸收在途尾包（客户端排空期仍 Make-Before-Break 解密投递合法下行 SRTP 且零公网回包），避免触发 `ICMP Port Unreachable`。
+  - **入口预校验与抗注入**：`validate_dtls_datagram` 同时覆盖 DTLS 1.2 与 RFC 9147 DTLS 1.3（`C=0`、`≥18B`），拒绝 `Epoch=0` 明文 Alert 及 `Ready` 态明文 `ct=26`；服务端 `Ready` 态绝不被伪造 DTLS 垃圾包误续命 Consent；客户端在 `Ready` 态持续驱动 DTLS 1.3 Flight 5 重传定时器防单包丢包黑洞；`extract_dtls_server_hello_suite` 严格校检帧长与扩展边界并过滤 `TLS13_HRR_RANDOM`；SRTP 双流各自维护独立 **2048 包 RFC 6479 滑动防重放环**，SRTCP 内置 64-bit 滑动防重放窗口。
+  - **单向上行黑洞与服务端重启自愈**：服务端拒绝无 `USE-CANDIDATE` 的孤儿保活误建会话，并按 RFC 7675 §5.1 在 30s 无认证对端报文时静默回收旧会话；客户端仅凭双向 STUN Consent 应答判定上行活性，丢失应答时按 RFC 5389 §7.2.1 同 `txid` 指数退避重传（频繁换口时自动自适应退避防震荡），确认黑洞后旧端口转入 35s 静默接收态并立即在新端口完成亚秒级重握自愈。
+- **内置双模式 12 项自测与算力体检（`v0.3.5+`）**：`webrtc-cloak selftest` 支持**真实线上远程隧道直测**（`--server-host <IP> --server-port 19643 --psk-file <PATH>`，通过加密带内 `0xFFFE` SRTP 回显探针在不影响线上业务后端的前提下实测真实公网 NAT 映射、DTLS 1.3/1.2 握手、WAN 延迟/抖动/丢包、公网 Path MTU 边界、多端口 NAT 轮换与 7 类主动探测 Silent-Drop 验真，并兼容 `< v0.3.5` 服务端自动降级 `[SKIP]`）以及**离线本地故障注入沙箱**（`--local`），同时内置本机单核/全核加解密与 P-256 证书签发算力体检。
 - **AEAD 密文内层随机填充**：线上传输首字节固定为 `0x90 (P=0)`，`[inner_len: u16 BE] || plaintext || [0..=31B random pad]` 全部位于 AEAD 密文内，大包（`>= 1340B`）自动收窄填充至 `0..=7B` 以适配 `1492B` PPPoE MTU 避免 IP 分片。
-- **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书，支持秒级随机有效期与 High-S/Low-S 签名长度随机化；全平台 `ClientHello` 均完整宣告 3 个 ECDHE-ECDSA AEAD 套件。
+- **动态自签 X.509 证书缓存**：按 worker 缓存 `20–24h` 轮换的无扩展 `CN=WebRTC` 自签 ECDSA P-256 证书（DTLS 1.3 模式下证书在公网 100% 加密不可见）；客户端全平台完整宣告 6 个 DTLS 1.3/1.2 AEAD 套件，并通过多 MTU 预构建配置池打散 ClientHello 长度。
 - **默认单线程无锁 + 可选多核扩展**：默认 `--workers 1` 在主线程运行单个 `mio` 非阻塞事件循环（不启用 `SO_REUSEPORT`），即可并发承载数千 UDP 会话；在 Linux 多核服务器上可按需传入 `--workers <N|auto>` 开启多核横向扩展。
 
 ---
@@ -150,6 +150,7 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
 | :--- | :---: | :--- |
 | `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 | 预置共享密钥（推荐文件或环境变量，避免 `ps` 泄露） |
 | `--cipher <auto\|aes-gcm\|chacha20\|blake2b>` | `auto` | 加密套件；`auto` 经 DTLS 握手按两端 CPU 指令集自动协商 |
+| `--dtls-min-version <auto\|1.2\|1.3>` | `auto` | DTLS 最低版本；`auto`/`1.2` 优先 DTLS 1.3 并无缝兼容旧版 1.2 滚动升级，双端升完后可设为 `1.3` 彻底锁定防降级 |
 | `--workers <1\|N\|auto>` | `1` | 工作线程数；默认 `1` 为单线程模式，Linux 可选多核 `SO_REUSEPORT` |
 | `--keepalive <SECS>` | `5` | RFC 7675 STUN Consent 保活间隔（自动加 `±20%` 抖动；无应答时按 RFC 5389 §7.2.1 同 `txid` 重传 2 次，约 `4.7s` 确认黑洞并自动换口） |
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE` + DTLS `close_notify` 优雅退出 |
@@ -181,7 +182,7 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
 | 编号 | 线上直测场景 | 实测内容与运维价值 |
 | :---: | :--- | :--- |
 | `#01` | **WAN ICE STUN & NAT Mapping** | 实测真实公网 STUN RTT 与运营商分配的外网 `IP:Port`（`XOR-MAPPED-ADDRESS`） |
-| `#02` | **WAN DTLS 1.2 Mutual-Cert HS** | 真实公网 6-Flight 双向证书握手耗时与实际协商加密套件 |
+| `#02` | **WAN DTLS Mutual-Cert HS** | 真实公网 DTLS 1.3/1.2 自动协商双向证书握手耗时、实际协议版本、双 SSRC 状态与加密套件 |
 | `#03` | **WAN Consent RTT/Jitter/Loss** | 连续 `N` 次 RFC 7675 STUN 保活探测，统计真实公网 P50/P95 RTT、抖动与丢包率 |
 | `#04` | **WAN STUN Retransmit Cache** | 验证线上服务端 `SeenTxidCache` 同 `txid` 幂等缓存重传正常 |
 | `#05` | **WAN Server SRTCP Heartbeat** | 校验服务端穿透公网 NAT 下发的 AEAD `Compound SRTCP` 心跳 |

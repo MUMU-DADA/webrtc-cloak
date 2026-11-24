@@ -6,7 +6,7 @@ mod server;
 use crate::client::{run_client, ClientConfig};
 use crate::protocol::{
     combine_session_key, derive_stun_material, detect_cpu_accel, fill_random, CipherPref,
-    CipherSuite, SrtpCloakCipher, DEFAULT_WAN_MTU,
+    CipherSuite, DtlsMinVersion, SrtpCloakCipher, DEFAULT_WAN_MTU,
 };
 use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
@@ -44,15 +44,29 @@ fn parse_cipher_pref(s: &str) -> CipherPref {
     }
 }
 
+fn parse_dtls_min_version(s: &str) -> DtlsMinVersion {
+    match s {
+        "auto" | "1.2" => DtlsMinVersion::Auto,
+        "1.3" => DtlsMinVersion::V13Only,
+        other => {
+            eprintln!(
+                "Unknown --dtls-min-version: {} (expected auto, 1.2, or 1.3)",
+                other
+            );
+            process::exit(2);
+        }
+    }
+}
+
 fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
-         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
-         webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
-         webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--mtu 1488] [--no-color] [--json]"
+         webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
+         webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--no-color] [--json]"
     );
     process::exit(2);
 }
@@ -126,8 +140,9 @@ fn run_bench(count: usize, payload_bytes: usize, suite: CipherSuite) {
         std::hint::black_box(rn);
     }
     let dt = t0.elapsed().as_secs_f64();
-    let total_mb = (count * payload_bytes) as f64 / 1e6;
-    let mbps = ((count * payload_bytes * 8) as f64) / dt / 1e6;
+    let total_bytes = (count as u64) * (payload_bytes as u64);
+    let total_mb = (total_bytes as f64) / 1e6;
+    let mbps = ((total_bytes as f64) * 8.0) / dt / 1e6;
     let kpps = (count as f64) / dt / 1e3;
     println!(
         "[bench-rs/{:17}] wrap+unwrap {}x{}B ({:.2} MB) in {:.4}s -> {:7.1} Mbps ({:6.1} kpps)",
@@ -477,6 +492,11 @@ fn main() {
                         if i >= args.len() { usage(); }
                         opts.cipher_pref = parse_cipher_pref(&args[i]);
                     }
+                    "--dtls-min-version" => {
+                        i += 1;
+                        if i >= args.len() { usage(); }
+                        opts.dtls_min_version = parse_dtls_min_version(&args[i]);
+                    }
                     "--mtu" => {
                         i += 1;
                         if i >= args.len() { usage(); }
@@ -557,6 +577,7 @@ fn main() {
             let mut psk_file: Option<String> = None;
             let mut cipher_pref = CipherPref::Auto;
             let mut dtls_decoy = true;
+            let mut dtls_min_version = DtlsMinVersion::Auto;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
             let mut wan_mtu: usize = DEFAULT_WAN_MTU;
@@ -576,6 +597,7 @@ fn main() {
                     "--psk" => { i += 1; psk = args[i].clone(); }
                     "--psk-file" => { i += 1; psk_file = Some(args[i].clone()); }
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
+                    "--dtls-min-version" => { i += 1; dtls_min_version = parse_dtls_min_version(&args[i]); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
                     "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
@@ -601,6 +623,7 @@ fn main() {
                 psk: psk_bytes,
                 cipher_pref,
                 dtls_decoy,
+                dtls_min_version,
                 workers,
                 max_sessions,
                 wan_mtu,
@@ -625,6 +648,7 @@ fn main() {
             let mut psk_file: Option<String> = None;
             let mut cipher_pref = CipherPref::Auto;
             let mut dtls_required = true;
+            let mut dtls_min_version = DtlsMinVersion::Auto;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
             let mut wan_mtu: usize = DEFAULT_WAN_MTU;
@@ -642,6 +666,7 @@ fn main() {
                     "--psk" => { i += 1; psk = args[i].clone(); }
                     "--psk-file" => { i += 1; psk_file = Some(args[i].clone()); }
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
+                    "--dtls-min-version" => { i += 1; dtls_min_version = parse_dtls_min_version(&args[i]); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
                     "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
@@ -665,6 +690,7 @@ fn main() {
                 psk: psk_bytes,
                 cipher_pref,
                 dtls_required,
+                dtls_min_version,
                 workers,
                 max_sessions,
                 wan_mtu,

@@ -2,8 +2,8 @@
 //!
 //! 1. **Live Remote Mode** (`--server-host <IP|HOST> --server-port <PORT> --psk ...`):
 //!    Connects directly to a real running `webrtc-cloak server` over the real network without
-//!    disrupting existing production sessions. Verifies WAN ICE STUN + NAT mapping, 6-flight
-//!    DTLS 1.2 mutual-cert handshake, WAN Consent RTT/jitter/loss, `SeenTxidCache` retransmit,
+//!    disrupting existing production sessions. Verifies WAN ICE STUN + NAT mapping, DTLS 1.3/1.2
+//!    mutual-cert handshake, WAN Consent RTT/jitter/loss, `SeenTxidCache` retransmit,
 //!    server Compound SRTCP downlink heartbeat, in-band encrypted SRTP (`0xFFFE`) data-plane
 //!    RTT/loss/reorder & real WAN Path MTU probing (`v0.3.5+`), 5-tuple rotation & carrier NAT
 //!    mapping behavior, 7-vector live Silent-Drop security audit, graceful teardown, and local
@@ -17,14 +17,15 @@
 
 use crate::client::{run_client, ClientConfig};
 use crate::protocol::{
-    build_dimpl_config, build_ice_stun_request, combine_session_key, demux_rfc7983,
+    build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, fill_random,
-    generate_ephemeral_webrtc_cert, make_fresh_stun_txid, parse_stun, resolve_srtp_suite,
-    validate_dtls_datagram, CipherPref, CipherSuite, PacketKind, SessionIceParams, SrtpCloakCipher,
-    SrtpFrame, DEFAULT_WAN_MTU, STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS,
+    generate_ephemeral_webrtc_cert, make_fresh_stun_txid, new_dtls_instance, parse_stun,
+    resolve_srtp_suite, validate_dtls_datagram, CipherPref, CipherSuite, DtlsMinVersion,
+    PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame, DEFAULT_WAN_MTU,
+    STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS,
 };
 use crate::server::{run_server, ServerConfig};
-use dimpl::{Dtls, Output as DtlsOutput};
+use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use std::cmp::Ordering as CmpOrdering;
 use std::collections::{BinaryHeap, HashMap, HashSet};
 use std::io::{ErrorKind, Write};
@@ -39,6 +40,7 @@ pub struct SelftestOptions {
     pub server_label: Option<String>,
     pub psk: Option<Vec<u8>>,
     pub cipher_pref: CipherPref,
+    pub dtls_min_version: DtlsMinVersion,
     pub wan_mtu: usize,
     pub probe_count: usize,
     pub active_probes: bool,
@@ -54,6 +56,7 @@ impl Default for SelftestOptions {
             server_label: None,
             psk: None,
             cipher_pref: CipherPref::Auto,
+            dtls_min_version: DtlsMinVersion::Auto,
             wan_mtu: DEFAULT_WAN_MTU,
             probe_count: 20,
             active_probes: true,
@@ -621,6 +624,7 @@ impl ManagedServer {
                 psk,
                 cipher_pref,
                 dtls_required: true,
+                dtls_min_version: DtlsMinVersion::Auto,
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
@@ -680,6 +684,7 @@ impl ManagedClient {
                 psk,
                 cipher_pref,
                 dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::Auto,
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
@@ -1759,7 +1764,7 @@ fn bench_single_suite(suite: CipherSuite, count: usize, payload_bytes: usize) ->
         std::hint::black_box(rn);
     }
     let dt = t0.elapsed().as_secs_f64().max(0.000_001);
-    let mbps = ((count * payload_bytes * 8) as f64) / dt / 1e6;
+    let mbps = (((count as u64) * (payload_bytes as u64) * 8) as f64) / dt / 1e6;
     let kpps = (count as f64) / dt / 1e3;
     (mbps, kpps, integrity_ok)
 }
@@ -1865,7 +1870,8 @@ fn test_12_cpu_multicore_and_p256(opts: &SelftestOptions, hi: &mut Highlights) -
             }
         }
     }
-    let total_bits = (joined * per_core_pkts * payload_bytes * 8) as f64;
+    let total_bits =
+        ((joined as u64) * (per_core_pkts as u64) * (payload_bytes as u64) * 8) as f64;
     let agg_gbps = total_bits / max_dt / 1e9;
     hi.cpu_multicore_gbps = Some(agg_gbps);
 
@@ -1923,9 +1929,12 @@ struct LiveReadySession {
     sock: UdpSocket,
     ice: SessionIceParams,
     dtls: Dtls,
+    dtls_next_timeout: Option<Instant>,
+    is_dtls13: bool,
     cipher: SrtpCloakCipher,
     suite: CipherSuite,
     dl_srtcp_verified: u64,
+    tx_srtp_pkts: u64,
     rx_srtp_pkts: u64,
 }
 
@@ -1982,13 +1991,14 @@ fn remote_dtls_handshake(
     stun: LiveStunOk,
     psk: &[u8],
     cipher_pref: CipherPref,
+    dtls_min_version: DtlsMinVersion,
     wan_mtu: usize,
 ) -> Result<(LiveReadySession, f64), String> {
     let cpu = detect_cpu_accel();
-    let dtls_cfg = build_dimpl_config(cipher_pref, &cpu, true);
+    let dtls_cfg = build_dimpl_config_pool(cipher_pref, &cpu, true, wan_mtu).pick();
     let cert = generate_ephemeral_webrtc_cert();
     let now = Instant::now();
-    let mut dtls = Dtls::new_12(dtls_cfg, cert, now);
+    let mut dtls = new_dtls_instance(dtls_min_version, dtls_cfg, cert, now);
     dtls.set_active(true);
     let _ = dtls.handle_timeout(now);
 
@@ -2001,6 +2011,7 @@ fn remote_dtls_handshake(
     let mut pending_sh_suite: Option<u16> = None;
     let mut dtls_suite_id: Option<u16> = None;
     let mut dtls_km: Option<Vec<u8>> = None;
+    let mut dtls_next_timeout: Option<Instant> = None;
     let mut connected = false;
 
     let t0 = Instant::now();
@@ -2023,7 +2034,10 @@ fn remote_dtls_handshake(
                 DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
                 DtlsOutput::KeyingMaterial(km, _) => dtls_km = Some(km.to_vec()),
                 DtlsOutput::Connected => connected = true,
-                DtlsOutput::Timeout(_) => break,
+                DtlsOutput::Timeout(t) => {
+                    dtls_next_timeout = Some(t);
+                    break;
+                }
                 _ => {}
             }
         }
@@ -2042,7 +2056,7 @@ fn remote_dtls_handshake(
             Ok(n) => {
                 let pkt = &rbuf[..n];
                 if demux_rfc7983(pkt) == PacketKind::Dtls && validate_dtls_datagram(pkt, false) {
-                    if dtls_suite_id.is_none() {
+                    if dtls_suite_id.is_none() && pending_sh_suite.is_none() {
                         if let Some(cs) = extract_dtls_server_hello_suite(pkt) {
                             pending_sh_suite = Some(cs);
                         }
@@ -2056,25 +2070,33 @@ fn remote_dtls_handshake(
     }
 
     if !connected {
-        return Err("DTLS 1.2 handshake timed out after 8s".into());
+        return Err("DTLS handshake timed out after 8s".into());
     }
+    let Some(km) = dtls_km.as_deref().filter(|k| !k.is_empty()) else {
+        return Err("DTLS Connected without SRTP KeyingMaterial (Fail-Closed)".into());
+    };
     let hs_ms = t0.elapsed().as_secs_f64() * 1000.0;
 
+    let is_dtls13 = dtls.protocol_version() == Some(ProtocolVersion::DTLS1_3);
     let uname = stun.ice.username();
     let (stun_key, s_c2s, s_s2c) = derive_stun_material(psk, &stun.txid, &uname);
     let suite = resolve_srtp_suite(cipher_pref, dtls_suite_id, &cpu, false);
-    let final_key = combine_session_key(&stun_key, dtls_km.as_deref());
+    let final_key = combine_session_key(&stun_key, Some(km));
     let mut cipher = SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, suite);
     cipher.set_wan_mtu(wan_mtu);
+    cipher.set_dual_ssrc(is_dtls13);
 
     Ok((
         LiveReadySession {
             sock,
             ice: stun.ice,
             dtls,
+            dtls_next_timeout,
+            is_dtls13,
             cipher,
             suite,
             dl_srtcp_verified: 0,
+            tx_srtp_pkts: 0,
             rx_srtp_pkts: 0,
         },
         hs_ms,
@@ -2082,11 +2104,56 @@ fn remote_dtls_handshake(
 }
 
 impl LiveReadySession {
+    /// H-01 fix: continue driving DTLS 1.3 post-Connected Flight 5 retransmission timer & ACK intake
+    /// so a single lost Flight 5 packet during live WAN selftest recovers cleanly instead of false SKIP/FAIL.
+    fn pump_dtls(&mut self, incoming: Option<&[u8]>) {
+        let now = Instant::now();
+        if let Some(pkt) = incoming {
+            if validate_dtls_datagram(pkt, false) {
+                let _ = self.dtls.handle_packet(pkt);
+            }
+        }
+        if let Some(t) = self.dtls_next_timeout {
+            let rem = t.saturating_duration_since(now);
+            if rem > Duration::from_secs(60) {
+                self.dtls_next_timeout = None;
+            } else if now >= t {
+                if self.dtls.handle_timeout(now).is_err() {
+                    self.dtls_next_timeout = None;
+                    return;
+                }
+            } else if incoming.is_none() {
+                return;
+            }
+        } else if incoming.is_none() {
+            return;
+        }
+        let mut dtls_buf = vec![0u8; 4096];
+        loop {
+            match self.dtls.poll_output(&mut dtls_buf) {
+                DtlsOutput::Packet(p) => {
+                    let _ = self.sock.send(p);
+                }
+                DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
+                DtlsOutput::Timeout(t) => {
+                    if t.saturating_duration_since(now) > Duration::from_secs(60) {
+                        self.dtls_next_timeout = None;
+                    } else {
+                        self.dtls_next_timeout = Some(t);
+                    }
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn send_stun_consent(
         &mut self,
         psk: &[u8],
         timeout_ms: u64,
     ) -> Option<(f64, Vec<u8>, [u8; 12], Vec<u8>)> {
+        self.pump_dtls(None);
         let (req, txid) = build_ice_stun_request(psk, &self.ice, None, false);
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
         let ts = Instant::now();
@@ -2113,6 +2180,9 @@ impl LiveReadySession {
                                 }
                             }
                         }
+                        PacketKind::Dtls => {
+                            self.pump_dtls(Some(pkt));
+                        }
                         PacketKind::Srtcp => {
                             if self.cipher.verify_srtcp(pkt).is_some() {
                                 self.dl_srtcp_verified += 1;
@@ -2121,7 +2191,9 @@ impl LiveReadySession {
                         _ => {}
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    self.pump_dtls(None);
+                }
                 Err(_) => break,
             }
         }
@@ -2135,6 +2207,7 @@ impl LiveReadySession {
         psk: &[u8],
         timeout_ms: u64,
     ) -> Option<(f64, Vec<u8>)> {
+        self.pump_dtls(None);
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
         let ts = Instant::now();
         let _ = self.sock.send(raw_req);
@@ -2155,6 +2228,9 @@ impl LiveReadySession {
                                 }
                             }
                         }
+                        PacketKind::Dtls => {
+                            self.pump_dtls(Some(pkt));
+                        }
                         PacketKind::Srtcp => {
                             if self.cipher.verify_srtcp(pkt).is_some() {
                                 self.dl_srtcp_verified += 1;
@@ -2163,7 +2239,9 @@ impl LiveReadySession {
                         _ => {}
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    self.pump_dtls(None);
+                }
                 Err(_) => break,
             }
         }
@@ -2171,11 +2249,14 @@ impl LiveReadySession {
     }
 
     fn probe_srtp_one(&mut self, payload: &[u8], timeout_ms: u64) -> Option<(f64, usize)> {
+        self.pump_dtls(None);
         let mut wbuf = [0u8; 2048];
         let wn = self.cipher.wrap_probe_into(payload, &mut wbuf)?;
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(30)));
         let ts = Instant::now();
-        let _ = self.sock.send(&wbuf[..wn]);
+        if self.sock.send(&wbuf[..wn]).is_ok() {
+            self.tx_srtp_pkts += 1;
+        }
         let mut rbuf = [0u8; 2048];
         let mut pbuf = [0u8; 2048];
         let deadline = Duration::from_millis(timeout_ms);
@@ -2194,6 +2275,9 @@ impl LiveReadySession {
                                 }
                             }
                         }
+                        PacketKind::Dtls => {
+                            self.pump_dtls(Some(pkt));
+                        }
                         PacketKind::Srtcp => {
                             if self.cipher.verify_srtcp(pkt).is_some() {
                                 self.dl_srtcp_verified += 1;
@@ -2202,7 +2286,9 @@ impl LiveReadySession {
                         _ => {}
                     }
                 }
-                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {
+                    self.pump_dtls(None);
+                }
                 Err(_) => break,
             }
         }
@@ -2210,7 +2296,9 @@ impl LiveReadySession {
     }
 
     fn teardown(&mut self) {
-        let bye = self.cipher.build_srtcp(self.rx_srtp_pkts > 0, true, true);
+        let bye = self
+            .cipher
+            .build_srtcp(self.rx_srtp_pkts > 0, self.tx_srtp_pkts > 0, true);
         let _ = self.sock.send(&bye);
         let mut dtls_buf = vec![0u8; 2048];
         if self.dtls.close().is_ok() {
@@ -2340,21 +2428,37 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
         }
     };
 
-    // #02 WAN DTLS 1.2 Mutual-Cert HS
+    // #02 WAN DTLS Mutual-Cert HS
     let t2 = Instant::now();
     let mut sess_opt: Option<LiveReadySession> = None;
     if let Some(stun_ok) = stun_ok_opt {
-        match remote_dtls_handshake(stun_ok, psk, opts.cipher_pref, opts.wan_mtu) {
+        match remote_dtls_handshake(
+            stun_ok,
+            psk,
+            opts.cipher_pref,
+            opts.dtls_min_version,
+            opts.wan_mtu,
+        ) {
             Ok((sess, hs_ms)) => {
                 hi.negotiated_cipher = Some(sess.suite.name().to_string());
+                let dtls_ver = if sess.is_dtls13 { "DTLS 1.3" } else { "DTLS 1.2" };
                 let r = ScenarioResult {
                     id: 2,
                     code: "wan_dtls",
-                    name: "WAN DTLS 1.2 Mutual-Cert HS",
-                    condition: "6-flight ECDHE + Cookie",
+                    name: "WAN DTLS Mutual-Cert HS",
+                    condition: "Auto 1.3/1.2 + Cookie",
                     status: ScenarioStatus::Pass,
-                    metrics: format!("hs {:.1}ms | {} | Hybrid PFS OK", hs_ms, sess.suite.name()),
-                    detail: format!("negotiated={} total_dtls_ms={:.2}", sess.suite.name(), hs_ms),
+                    metrics: format!(
+                        "hs {:.1}ms | {} | {} | {}",
+                        hs_ms,
+                        dtls_ver,
+                        sess.suite.name(),
+                        if sess.is_dtls13 { "dual-SSRC" } else { "1-SSRC" }
+                    ),
+                    detail: format!(
+                        "dtls={} negotiated={} dual_ssrc={} total_dtls_ms={:.2}",
+                        dtls_ver, sess.suite.name(), sess.is_dtls13, hs_ms
+                    ),
                     elapsed_s: t2.elapsed().as_secs_f64(),
                 };
                 report_step(2, r.name, &r);
@@ -2365,10 +2469,10 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                 let r = ScenarioResult {
                     id: 2,
                     code: "wan_dtls",
-                    name: "WAN DTLS 1.2 Mutual-Cert HS",
-                    condition: "6-flight ECDHE + Cookie",
+                    name: "WAN DTLS Mutual-Cert HS",
+                    condition: "Auto 1.3/1.2 + Cookie",
                     status: ScenarioStatus::Fail,
-                    metrics: "DTLS 1.2 Handshake FAILED".into(),
+                    metrics: "DTLS Handshake FAILED".into(),
                     detail: msg,
                     elapsed_s: t2.elapsed().as_secs_f64(),
                 };
@@ -2380,8 +2484,8 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
         let r = ScenarioResult {
             id: 2,
             code: "wan_dtls",
-            name: "WAN DTLS 1.2 Mutual-Cert HS",
-            condition: "6-flight ECDHE + Cookie",
+            name: "WAN DTLS Mutual-Cert HS",
+            condition: "Auto 1.3/1.2 + Cookie",
             status: ScenarioStatus::Skip,
             metrics: "Skipped (STUN failed)".into(),
             detail: "Requires successful STUN authentication first".into(),
@@ -2622,6 +2726,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                 if let Some(wn) = sess.cipher.wrap_probe_into(&payload, &mut wbuf) {
                     sent_at.insert(seq, Instant::now());
                     if sess.sock.send(&wbuf[..wn]).is_ok() {
+                        sess.tx_srtp_pkts += 1;
                         total_wire_bytes += wn;
                         sent_ok += 1;
                         hi.max_wire_udp = hi.max_wire_udp.max(wn);
@@ -2656,6 +2761,9 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                                     }
                                 }
                             }
+                            PacketKind::Dtls => {
+                                sess.pump_dtls(Some(pkt));
+                            }
                             PacketKind::Srtcp => {
                                 if sess.cipher.verify_srtcp(pkt).is_some() {
                                     sess.dl_srtcp_verified += 1;
@@ -2664,6 +2772,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                             _ => {}
                         }
                     }
+                    sess.pump_dtls(None);
                     if Instant::now() >= next_tick {
                         break;
                     }
@@ -2874,7 +2983,13 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
         let r = match remote_stun_handshake(server_addr, psk) {
             Ok(stun2) => {
                 let mapped2 = stun2.mapped_addr;
-                match remote_dtls_handshake(stun2, psk, opts.cipher_pref, opts.wan_mtu) {
+                match remote_dtls_handshake(
+                    stun2,
+                    psk,
+                    opts.cipher_pref,
+                    opts.dtls_min_version,
+                    opts.wan_mtu,
+                ) {
                     Ok((mut sess2, hs2_ms)) => {
                         sess2.teardown();
                         let nat_note = match (mapped1, mapped2) {
@@ -2897,7 +3012,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                             id: 8,
                             code: "wan_rotate_nat",
                             name: "WAN 5-Tuple Rotate & NAT",
-                            condition: "Fresh port2 + DTLS 1.2",
+                            condition: "Fresh port2 + DTLS Auto",
                             status: ScenarioStatus::Pass,
                             metrics: format!("hs2 {:.0}ms | {}", hs2_ms, nat_note),
                             detail: format!("mapped1={:?} mapped2={:?}", mapped1, mapped2),
@@ -2908,7 +3023,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                         id: 8,
                         code: "wan_rotate_nat",
                         name: "WAN 5-Tuple Rotate & NAT",
-                        condition: "Fresh port2 + DTLS 1.2",
+                        condition: "Fresh port2 + DTLS Auto",
                         status: ScenarioStatus::Fail,
                         metrics: "2nd-port DTLS handshake FAILED".into(),
                         detail: msg,
@@ -2920,7 +3035,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
                 id: 8,
                 code: "wan_rotate_nat",
                 name: "WAN 5-Tuple Rotate & NAT",
-                condition: "Fresh port2 + DTLS 1.2",
+                condition: "Fresh port2 + DTLS Auto",
                 status: ScenarioStatus::Fail,
                 metrics: "2nd-port STUN FAILED".into(),
                 detail: msg,
@@ -2934,7 +3049,7 @@ fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u
             id: 8,
             code: "wan_rotate_nat",
             name: "WAN 5-Tuple Rotate & NAT",
-            condition: "Fresh port2 + DTLS 1.2",
+            condition: "Fresh port2 + DTLS Auto",
             status: ScenarioStatus::Skip,
             metrics: "Skipped (initial session failed)".into(),
             detail: "Requires live server reachability".into(),

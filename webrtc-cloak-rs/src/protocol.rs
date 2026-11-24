@@ -1,29 +1,31 @@
-//! Wire-format protocol primitives for webrtc-cloak V3.1 (Production Freeze):
+//! Wire-format protocol primitives for webrtc-cloak V3.2 (Hardened):
 //!   - RFC 5389 / 8445 STUN ICE Binding Request & Success Response:
 //!     * libwebrtc 4-char Base64 ufrag (zero modulo bias), libwebrtc attribute order
 //!     * Session-constant ICE-CONTROLLING tie-breaker & PRIORITY; USE-CANDIDATE only on nomination
-//!     * Timestamp-masked anti-replay txid (±30s window) + strict RFC 5389 §15.4 MI-then-FP parsing
-//!   - Real RFC 6347 DTLS 1.2 via `dimpl` (pure-Rust Sans-IO, mutual ECDSA P-256 certs,
-//!     HelloVerifyRequest cookie, 3-suite Chrome-ordered ClientHello, real ECDHE/EMS/Finished,
-//!     RFC 5764/7714 KeyingMaterial export -> True PFS, real `close_notify` teardown)
+//!     * Timestamp-masked anti-replay txid (±30s window) + zero-alloc pre-auth strict MI-then-FP parsing
+//!   - Real RFC 9147 DTLS 1.3 + RFC 6347 DTLS 1.2 via `dimpl 0.9.0` (pure-Rust Sans-IO, mutual ECDSA
+//!     P-256 certs, encrypted DTLS 1.3 certs, multi-MTU ClientHello pool, optional strict 1.3 anti-downgrade,
+//!     RFC 5764/7714 KeyingMaterial export -> Fail-Closed Hybrid PFS, real `close_notify` teardown)
 //!   - RFC 3550 / 3711 / 7714 / 8285 SRTP framing:
-//!     * Standard Chrome `0x90` (V=2, P=0, X=1, CC=0) + 8B RFC 8285 `0xBEDE` transport-wide-cc ext
-//!     * Inner-ciphertext length prefix + randomized 0..=31B padding (breaks WG/QUIC alignment
-//!       without plaintext P=1 statistical giveaway!)
-//!     * Pure u64 wall-clock 90,000 Hz 30fps timestamps (zero drift, zero 13.25h wrap, <=1 M=1/frame)
-//!     * 64-packet sliding anti-replay window
+//!     * Standard Chrome `0x90` (V=2, P=0, X=1, CC=0) + 8B RFC 8285 `0xBEDE` global transport-wide-cc ext
+//!     * Dual-SSRC Audio (`PT=111`, 48kHz Opus capped <=50pps) + Video (`PT=96`, 90kHz strict M=1 causality)
+//!     * Orthogonal AEAD Nonce domains (Video `dir`, Audio `dir|0x40` + high-16-bit disjoint SSRC, SRTCP `dir|0x80`)
+//!     * Inner-ciphertext length prefix + randomized 0..=31B padding + 2048-packet RFC 6479 sliding replay rings
 //!   - RFC 3550 §6.1 / 5761 / 7714 §9.1 Compound SRTCP:
 //!     * Plaintext header ALWAYS PT=200(SR) or PT=201(RR), real RC=0/1 matching rx media state
-//!     * Encrypted compound subpackets (SDES + optional FB + encrypted trailing BYE PT=203)
-//!     * Always 16B AEAD/MAC tag + trailing 4B E_SRTCP_Index + 64-packet SRTCP sliding replay window
+//!     * Encrypted compound subpackets (session-constant 13B CNAME SDES + smooth FB + encrypted trailing BYE PT=203)
+//!     * Always 16B AEAD/MAC tag + trailing 4B E_SRTCP_Index (0-based) + 64-packet SRTCP sliding replay window
 
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag as GcmTag};
 use blake2::digest::consts::{U16, U64};
 use blake2::{Blake2bMac, Digest as _};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaNonce, Tag as ChaTag};
-use dimpl::crypto::{rust_crypto, CryptoProvider, Dtls12CipherSuite, SupportedDtls12CipherSuite};
-use dimpl::{Config as DtlsConfig, DtlsCertificate};
+use dimpl::crypto::{
+    rust_crypto, CryptoProvider, Dtls12CipherSuite, Dtls13CipherSuite, SupportedDtls12CipherSuite,
+    SupportedDtls13CipherSuite,
+};
+use dimpl::{Config as DtlsConfig, Dtls, DtlsCertificate};
 use hmac::{Hmac, Mac as _};
 use p256::ecdsa::signature::Signer;
 use p256::ecdsa::{Signature as P256Signature, SigningKey};
@@ -57,6 +59,41 @@ pub const SRTP_TAG_LEN: usize = 16; // Unified 16B tag across AES-GCM, ChaCha20,
 pub const MAX_INNER_UDP_LEN: usize = 65_400; // Hard bound preventing wbuf[65664] overflow
 pub const SRTP_PROBE_MAGIC_LEN: u16 = 0xFFFE; // Reserved > MAX_INNER_UDP_LEN for in-band encrypted selftest echo
 pub const RTP_VIDEO_PT: u8 = 96;
+pub const RTP_AUDIO_PT: u8 = 111; // Chrome Opus dynamic PT (48 kHz)
+/// Hard SRTP 48-bit extended sequence exhaustion ceiling (never wrap Nonce!).
+const MAX_SRTP_EXT_SEQ: u64 = 0xFFFF_FFFF_FF00;
+/// Hard SRTCP 31-bit index exhaustion ceiling (never wrap Nonce!).
+const MAX_SRTCP_IDX: u32 = 0x7FFF_FF00;
+
+/// Minimum allowed DTLS protocol version for handshakes:
+///   - `Auto` (`1.2` / `auto`, default): DTLS 1.3 preferred with seamless DTLS 1.2 fallback for rolling upgrades.
+///   - `V13Only` (`1.3`): Strictly enforces RFC 9147 DTLS 1.3 (`Dtls::new_13`), completely blocking downgrade attacks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtlsMinVersion {
+    Auto,
+    V13Only,
+}
+
+impl DtlsMinVersion {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DtlsMinVersion::Auto => "auto(1.3+1.2)",
+            DtlsMinVersion::V13Only => "1.3-only",
+        }
+    }
+}
+
+pub fn new_dtls_instance(
+    min_ver: DtlsMinVersion,
+    cfg: Arc<DtlsConfig>,
+    cert: DtlsCertificate,
+    now: Instant,
+) -> Dtls {
+    match min_ver {
+        DtlsMinVersion::Auto => Dtls::new_auto(cfg, cert, now),
+        DtlsMinVersion::V13Only => Dtls::new_13(cfg, cert, now),
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SrtpFrame {
@@ -165,12 +202,12 @@ pub enum PacketKind {
     Unknown,
 }
 
-/// RFC 7983 §7 + RFC 5761 §4 demultiplexing (strict valid TLS ContentType 20..=23; full RTCP 192..=223).
+/// RFC 7983 §7 + RFC 5761 §4 demultiplexing (20..=63 covers DTLS 1.2 + RFC 9147 DTLS 1.3 unified ciphertext/ACK; RTCP 192..=223).
 #[inline]
 pub fn demux_rfc7983(data: &[u8]) -> PacketKind {
     match data.first().copied() {
         Some(0..=3) => PacketKind::Stun,
-        Some(20..=23) => PacketKind::Dtls,
+        Some(20..=63) => PacketKind::Dtls,
         Some(128..=191) => {
             if data.len() >= 8 && (192..=223).contains(&data[1]) {
                 PacketKind::Srtcp
@@ -182,51 +219,77 @@ pub fn demux_rfc7983(data: &[u8]) -> PacketKind {
     }
 }
 
-/// Strict pre-validation of DTLS 1.2 datagrams before feeding to `dimpl` (fixes V3-H-01):
-///   - Validates every packed DTLS record's ContentType (20..=23), DTLS version (0xFEFD/0xFEFF),
-///     and exact record boundary lengths.
-///   - Rejects unauthenticated plaintext Epoch=0 Alerts (ct=21, epoch=0) that could DoS handshakes.
-///   - When `ready_only_alert == true` (established Ready session), ONLY permits encrypted
-///     Epoch >= 1 Alert records (ct=21, epoch>=1), silently dropping everything else.
+/// Strict pre-validation of DTLS 1.2 & RFC 9147 DTLS 1.3 datagrams before feeding to `dimpl` (fixes V3-H-01):
+///   - Plaintext / DTLS 1.2 records (20..=23, 26 ACK): validates 13B header, DTLS version (0xFEFD/0xFEFF),
+///     exact record boundaries, rejects unauthenticated plaintext Epoch=0 Alerts, requires >= 18B for epoch>=1.
+///   - DTLS 1.3 Unified Ciphertext records (32..=63, `001C_SL_EE`): validates C==0 (no CID), S/L header lengths,
+///     and minimum 18B AEAD ciphertext length.
+///   - When `ready_only_alert == true`, only permits encrypted Epoch>=1 Alerts (DTLS 1.2), DTLS 1.3 ACK (26),
+///     or DTLS 1.3 Unified Ciphertext records (32..=63, carrying encrypted close_notify/ACK).
 pub fn validate_dtls_datagram(pkt: &[u8], ready_only_alert: bool) -> bool {
-    if pkt.len() < 13 {
+    if pkt.is_empty() {
         return false;
     }
     let mut pos = 0usize;
     let mut rec_count = 0usize;
     while pos < pkt.len() {
-        if pos + 13 > pkt.len() {
-            return false;
+        let b0 = pkt[pos];
+        if (b0 & 0xE0) == 0x20 {
+            // RFC 9147 §4 DTLS 1.3 Unified Ciphertext Header: 001C_SL_EE (32..=63)
+            if (b0 & 0x10) != 0 {
+                return false; // Connection ID (C=1) not supported
+            }
+            let seq_len = if (b0 & 0x08) != 0 { 2usize } else { 1usize };
+            let has_len = (b0 & 0x04) != 0;
+            let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
+            if pos + hdr_len > pkt.len() {
+                return false;
+            }
+            let rec_len = if has_len {
+                u16::from_be_bytes([pkt[pos + 1 + seq_len], pkt[pos + 2 + seq_len]]) as usize
+            } else {
+                pkt.len() - (pos + hdr_len)
+            };
+            if rec_len < 18 || pos + hdr_len + rec_len > pkt.len() {
+                return false;
+            }
+            pos += hdr_len + rec_len;
+        } else {
+            if pos + 13 > pkt.len() {
+                return false;
+            }
+            let ct = b0;
+            let ver_maj = pkt[pos + 1];
+            let ver_min = pkt[pos + 2];
+            let epoch = u16::from_be_bytes([pkt[pos + 3], pkt[pos + 4]]);
+            let rec_len = u16::from_be_bytes([pkt[pos + 11], pkt[pos + 12]]) as usize;
+            if !matches!(ct, 20..=23 | 26) {
+                return false;
+            }
+            if ver_maj != 0xFE || (ver_min != 0xFD && ver_min != 0xFF) {
+                return false;
+            }
+            if rec_len == 0 || pos + 13 + rec_len > pkt.len() {
+                return false;
+            }
+            // Reject unauthenticated plaintext Epoch=0 Alerts during handshake,
+            // and reject plaintext-framed Epoch>=1 ACK (RFC 9147 encrypted ACKs use 0x20..=0x3F).
+            if (ct == 21 && epoch == 0) || (ct == 26 && epoch >= 1) {
+                return false;
+            }
+            // AEAD encrypted DTLS 1.2 records (epoch >= 1) require >= 2B payload + 16B tag
+            if epoch >= 1 && rec_len < 18 {
+                return false;
+            }
+            // In established Ready state, plaintext-framed records may ONLY be DTLS 1.2 encrypted Alerts
+            // (DTLS 1.3 encrypted close_notify / ACK arrive inside 0x20..=0x3F Unified Ciphertext).
+            if ready_only_alert && !(ct == 21 && epoch >= 1) {
+                return false;
+            }
+            pos += 13 + rec_len;
         }
-        let ct = pkt[pos];
-        let ver_maj = pkt[pos + 1];
-        let ver_min = pkt[pos + 2];
-        let epoch = u16::from_be_bytes([pkt[pos + 3], pkt[pos + 4]]);
-        let rec_len = u16::from_be_bytes([pkt[pos + 11], pkt[pos + 12]]) as usize;
-        if !matches!(ct, 20..=23) {
-            return false;
-        }
-        if ver_maj != 0xFE || (ver_min != 0xFD && ver_min != 0xFF) {
-            return false;
-        }
-        if rec_len == 0 || pos + 13 + rec_len > pkt.len() {
-            return false;
-        }
-        // Reject unauthenticated plaintext Epoch=0 Alerts during handshake
-        if ct == 21 && epoch == 0 {
-            return false;
-        }
-        // NEW-L-01: DTLS 1.2 AEAD encrypted records (epoch >= 1) require >= 2B payload + 16B tag
-        if epoch >= 1 && rec_len < 18 {
-            return false;
-        }
-        // In established Ready state (past final-flight retransmit grace), only allow Epoch>=1 encrypted Alerts
-        if ready_only_alert && (ct != 21 || epoch == 0) {
-            return false;
-        }
-        pos += 13 + rec_len;
         rec_count += 1;
-        if rec_count > 16 {
+        if rec_count > 24 {
             return false;
         }
     }
@@ -353,7 +416,7 @@ fn push_stun_attr(buf: &mut Vec<u8>, attr_type: u16, val: &[u8]) {
     }
 }
 
-fn stun_hmac_key(psk: &[u8]) -> [u8; 32] {
+pub fn stun_hmac_key(psk: &[u8]) -> [u8; 32] {
     let mut h = Sha256::new();
     h.update(b"webrtc-cloak:stun-mi:");
     h.update(psk);
@@ -451,11 +514,16 @@ pub struct ParsedStun {
     pub authenticated: bool,
 }
 
-/// Strict RFC 5389 §15.4 + RFC 8445 STUN parser (fixes V3-H-02 trailing-attribute injection):
+/// Strict RFC 5389 §15.4 + RFC 8445 STUN parser (zero heap allocation before HMAC passes!):
 ///   - Rejects any attribute appearing AFTER MESSAGE-INTEGRITY except a single trailing FINGERPRINT.
 ///   - Mandates valid FINGERPRINT at the exact end of packet (`val_end == end`).
 ///   - Enforces valid `ufrag_r:ufrag_l` username format and ±30s timestamp freshness on requests.
 pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
+    let mi_key = stun_hmac_key(psk);
+    parse_stun_with_key(data, psk, &mi_key)
+}
+
+pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option<ParsedStun> {
     if data.len() < 20 {
         return None;
     }
@@ -468,10 +536,9 @@ pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
     let mut txid = [0u8; 12];
     txid.copy_from_slice(&data[8..20]);
 
-    let mi_key = stun_hmac_key(psk);
     let mut pos = 20usize;
     let end = 20 + msg_len;
-    let mut username: Option<String> = None;
+    let mut username_range: Option<(usize, usize)> = None;
     let mut use_candidate = false;
     let mut xor_mapped = None;
     let mut seen_mi = false;
@@ -506,7 +573,7 @@ pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
 
         match attr_type {
             ATTR_USERNAME => {
-                username = Some(String::from_utf8_lossy(val).into_owned());
+                username_range = Some((val_start, val_end));
             }
             ATTR_XOR_MAPPED_ADDRESS => {
                 xor_mapped = decode_xor_mapped_v4(val);
@@ -521,7 +588,7 @@ pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
                     return None;
                 }
                 let mi_hdr_len = ((pos - 20) + 24) as u16;
-                let mut mac = HmacSha1::new_from_slice(&mi_key).expect("HMAC key");
+                let mut mac = HmacSha1::new_from_slice(mi_key).expect("HMAC key");
                 mac.update(&msg_type.to_be_bytes());
                 mac.update(&mi_hdr_len.to_be_bytes());
                 mac.update(&STUN_MAGIC_COOKIE.to_be_bytes());
@@ -540,15 +607,29 @@ pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
     }
 
     let mut auth_ok = seen_mi && mi_ok && fp_ok && pos == end;
-    if auth_ok && msg_type == STUN_BINDING_REQUEST {
-        let valid_uname = username
-            .as_deref()
-            .map(|u| !u.is_empty() && u.len() <= 64 && u.contains(':'))
-            .unwrap_or(false);
-        if !valid_uname || !verify_stun_txid_fresh(psk, &txid) {
-            auth_ok = false;
+    let username = if auth_ok {
+        if let Some((s, e)) = username_range {
+            let raw = &data[s..e];
+            if msg_type == STUN_BINDING_REQUEST {
+                let valid_uname = !raw.is_empty() && raw.len() <= 64 && raw.contains(&b':');
+                if !valid_uname || !verify_stun_txid_fresh(psk, &txid) {
+                    auth_ok = false;
+                    None
+                } else {
+                    Some(String::from_utf8_lossy(raw).into_owned())
+                }
+            } else {
+                Some(String::from_utf8_lossy(raw).into_owned())
+            }
+        } else {
+            if msg_type == STUN_BINDING_REQUEST {
+                auth_ok = false;
+            }
+            None
         }
-    }
+    } else {
+        None
+    };
 
     Some(ParsedStun {
         msg_type,
@@ -745,13 +826,15 @@ impl CertCache {
     }
 }
 
-/// Build a `CryptoProvider` whose 3-suite DTLS 1.2 order prefers ChaCha20 first
-/// while STILL advertising all 3 ECDHE-ECDSA AEAD suites (fixes V3-H-05 single-suite JA4D!).
+/// Build a `CryptoProvider` whose DTLS 1.2 & DTLS 1.3 cipher suite order prefers ChaCha20 first
+/// while STILL advertising all real AEAD suites (zero single-suite JA4D leak!).
 fn chacha_first_provider() -> CryptoProvider {
-    static CHACHA_FIRST_SUITES: OnceLock<&'static [&'static dyn SupportedDtls12CipherSuite]> =
+    static CHACHA_FIRST_SUITES12: OnceLock<&'static [&'static dyn SupportedDtls12CipherSuite]> =
+        OnceLock::new();
+    static CHACHA_FIRST_SUITES13: OnceLock<&'static [&'static dyn SupportedDtls13CipherSuite]> =
         OnceLock::new();
     let mut provider = rust_crypto::default_provider();
-    let suites = *CHACHA_FIRST_SUITES.get_or_init(|| {
+    let suites12 = *CHACHA_FIRST_SUITES12.get_or_init(|| {
         let mut ordered: Vec<&'static dyn SupportedDtls12CipherSuite> = Vec::new();
         for &s in provider.cipher_suites {
             if s.suite() == Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 {
@@ -765,13 +848,54 @@ fn chacha_first_provider() -> CryptoProvider {
         }
         Box::leak(ordered.into_boxed_slice())
     });
-    provider.cipher_suites = suites;
+    let suites13 = *CHACHA_FIRST_SUITES13.get_or_init(|| {
+        let mut ordered: Vec<&'static dyn SupportedDtls13CipherSuite> = Vec::new();
+        for &s in provider.dtls13_cipher_suites {
+            if s.suite() == Dtls13CipherSuite::CHACHA20_POLY1305_SHA256 {
+                ordered.push(s);
+            }
+        }
+        for &s in provider.dtls13_cipher_suites {
+            if s.suite() != Dtls13CipherSuite::CHACHA20_POLY1305_SHA256 {
+                ordered.push(s);
+            }
+        }
+        Box::leak(ordered.into_boxed_slice())
+    });
+    provider.cipher_suites = suites12;
+    provider.dtls13_cipher_suites = suites13;
     provider
 }
 
-/// Build a real `dimpl` DTLS 1.2 Config with mutual client certificate authentication,
-/// stateless HelloVerifyRequest cookie exchange, and FULL 3-suite ClientHello ordering.
-pub fn build_dimpl_config(pref: CipherPref, cpu: &CpuAccelInfo, is_client: bool) -> Arc<DtlsConfig> {
+/// Pre-built pool of `dimpl::Config` instances with varied DTLS MTU targets (zero runtime
+/// `crypto_provider.validate()` overhead while eliminating constant 1150B padded ClientHello spikes
+/// and respecting `--mtu` ceilings on nested/PPPoE links).
+#[derive(Clone)]
+pub struct DtlsConfigPool {
+    configs: Vec<Arc<DtlsConfig>>,
+}
+
+impl DtlsConfigPool {
+    pub fn pick(&self) -> Arc<DtlsConfig> {
+        if self.configs.len() <= 1 {
+            return Arc::clone(&self.configs[0]);
+        }
+        let idx = (rand_u32() as usize) % self.configs.len();
+        Arc::clone(&self.configs[idx])
+    }
+
+    #[cfg(test)]
+    pub fn mtus(&self) -> Vec<usize> {
+        self.configs.iter().map(|c| c.mtu()).collect()
+    }
+}
+
+fn build_single_dimpl_config(
+    pref: CipherPref,
+    cpu: &CpuAccelInfo,
+    is_client: bool,
+    dtls_mtu: usize,
+) -> Arc<DtlsConfig> {
     let want_chacha = match pref {
         CipherPref::Fixed(CipherSuite::ChaCha20Poly1305) => true,
         CipherPref::Auto => !cpu.has_hw_aes_gcm,
@@ -786,34 +910,117 @@ pub fn build_dimpl_config(pref: CipherPref, cpu: &CpuAccelInfo, is_client: bool)
 
     let mut builder = DtlsConfig::builder()
         .with_crypto_provider(provider)
+        .mtu(dtls_mtu)
         .require_client_certificate(true)
         .use_server_cookie(true)
         .flight_start_rto(Duration::from_millis(350))
         .flight_retries(5)
         .handshake_timeout(Duration::from_secs(12));
 
-    // Client ALWAYS advertises all 3 real ECDHE-ECDSA AEAD suites (zero 1-suite JA4D leak!).
-    // Server only restricts allow-list if it must force ChaCha20 when peer put AES first.
+    // Client ALWAYS advertises all real DTLS 1.3 + 1.2 AEAD suites (zero 1-suite JA4D leak!).
+    // Server only restricts allow-list when forcing ChaCha20 or AES-GCM explicitly.
     if !is_client && want_chacha {
-        builder = builder.dtls12_cipher_suites(&[
-            Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
-        ]);
+        builder = builder
+            .dtls12_cipher_suites(&[
+                Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
+            ])
+            .dtls13_cipher_suites(&[Dtls13CipherSuite::CHACHA20_POLY1305_SHA256]);
     } else if !is_client && pref == CipherPref::Fixed(CipherSuite::Aes128Gcm) {
-        builder = builder.dtls12_cipher_suites(&[
-            Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
-            Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384,
-        ]);
+        builder = builder
+            .dtls12_cipher_suites(&[
+                Dtls12CipherSuite::ECDHE_ECDSA_AES128_GCM_SHA256,
+                Dtls12CipherSuite::ECDHE_ECDSA_AES256_GCM_SHA384,
+            ])
+            .dtls13_cipher_suites(&[
+                Dtls13CipherSuite::AES_128_GCM_SHA256,
+                Dtls13CipherSuite::AES_256_GCM_SHA384,
+            ]);
     }
 
     Arc::new(builder.build().expect("dimpl Config build"))
 }
 
-/// Strictly extract negotiated 16-bit TLS cipher suite ID from an unfragmented Epoch=0 ServerHello.
+/// Build a pre-validated pool of `dimpl` DTLS 1.3 / 1.2 Configs clamped to `wan_mtu`.
+pub fn build_dimpl_config_pool(
+    pref: CipherPref,
+    cpu: &CpuAccelInfo,
+    is_client: bool,
+    wan_mtu: usize,
+) -> DtlsConfigPool {
+    let max_dtls_mtu = if wan_mtu > 0 {
+        wan_mtu.saturating_sub(28).min(1360).max(256)
+    } else {
+        1360
+    };
+    if !is_client {
+        return DtlsConfigPool {
+            configs: vec![build_single_dimpl_config(
+                pref,
+                cpu,
+                false,
+                1150.min(max_dtls_mtu),
+            )],
+        };
+    }
+    const CLIENT_MTUS: [usize; 8] = [760, 840, 920, 1000, 1080, 1150, 1240, 1340];
+    let mut mtus: Vec<usize> = CLIENT_MTUS
+        .iter()
+        .map(|&m| m.min(max_dtls_mtu))
+        .collect();
+    mtus.sort_unstable();
+    mtus.dedup();
+    let configs = mtus
+        .into_iter()
+        .map(|m| build_single_dimpl_config(pref, cpu, true, m))
+        .collect();
+    DtlsConfigPool { configs }
+}
+
+/// Build a single `dimpl` DTLS 1.3 / 1.2 Config (default WAN MTU).
+#[allow(dead_code)]
+pub fn build_dimpl_config(pref: CipherPref, cpu: &CpuAccelInfo, is_client: bool) -> Arc<DtlsConfig> {
+    build_single_dimpl_config(pref, cpu, is_client, 1150)
+}
+
+/// RFC 8446 §4.1.3 HelloRetryRequest magic ServerRandom (MUST NOT be mistaken for ServerHello).
+const TLS13_HRR_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
+
+/// Strictly extract negotiated 16-bit TLS cipher suite ID from an unfragmented Epoch=0 ServerHello
+/// (supports both DTLS 1.2 and RFC 9147 DTLS 1.3; rejects RFC 8446 HelloRetryRequest and
+/// malformed/truncated extension framing).
 pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
     let mut pos = 0usize;
-    while pos + 13 <= datagram.len() {
-        let ct = datagram[pos];
-        if datagram[pos + 1] != 0xFE || datagram[pos + 2] != 0xFD {
+    while pos < datagram.len() {
+        let b0 = datagram[pos];
+        if (b0 & 0xE0) == 0x20 {
+            // Skip RFC 9147 DTLS 1.3 unified ciphertext records
+            if (b0 & 0x10) != 0 {
+                return None;
+            }
+            let seq_len = if (b0 & 0x08) != 0 { 2usize } else { 1usize };
+            let has_len = (b0 & 0x04) != 0;
+            let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
+            if pos + hdr_len > datagram.len() {
+                return None;
+            }
+            if has_len {
+                let rlen =
+                    u16::from_be_bytes([datagram[pos + 1 + seq_len], datagram[pos + 2 + seq_len]])
+                        as usize;
+                pos += hdr_len + rlen;
+            } else {
+                break;
+            }
+            continue;
+        }
+        if pos + 13 > datagram.len() {
+            return None;
+        }
+        let ct = b0;
+        if datagram[pos + 1] != 0xFE || (datagram[pos + 2] != 0xFD && datagram[pos + 2] != 0xFF) {
             return None;
         }
         let epoch = u16::from_be_bytes([datagram[pos + 3], datagram[pos + 4]]);
@@ -822,15 +1029,38 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
         if rec_end > datagram.len() {
             return None;
         }
-        if ct == 0x16 && epoch == 0 && rec_len >= 49 {
+        if ct == 0x16 && epoch == 0 && rec_len >= 50 {
             let hs = &datagram[pos + 13..rec_end];
-            // NEW-L-01: HandshakeType=ServerHello(0x02), post-HVR message_seq==1, fragment_offset==0
+            // HandshakeType=ServerHello(0x02), unfragmented (msg_len == frag_len, frag_off == 0),
+            // legacy_version=0xFEFD, NOT HelloRetryRequest, valid compression=0 & exact extensions framing.
+            let msg_len = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;
             let msg_seq = u16::from_be_bytes([hs[4], hs[5]]);
-            if hs[0] == 0x02 && msg_seq == 1 && hs[6] == 0 && hs[7] == 0 && hs[8] == 0 {
+            let frag_off = u32::from_be_bytes([0, hs[6], hs[7], hs[8]]) as usize;
+            let frag_len = u32::from_be_bytes([0, hs[9], hs[10], hs[11]]) as usize;
+            let sh_end = 12usize.saturating_add(frag_len);
+            if hs[0] == 0x02
+                && msg_seq <= 1
+                && frag_off == 0
+                && msg_len == frag_len
+                && sh_end <= hs.len()
+                && hs[12] == 0xFE
+                && hs[13] == 0xFD
+                && &hs[14..46] != &TLS13_HRR_RANDOM
+            {
                 let sid_len = hs[46] as usize;
                 let cs_pos = 47 + sid_len;
-                if cs_pos + 2 <= hs.len() {
-                    return Some(u16::from_be_bytes([hs[cs_pos], hs[cs_pos + 1]]));
+                if cs_pos + 3 <= sh_end && hs[cs_pos + 2] == 0 {
+                    let ext_ok = if cs_pos + 3 == sh_end {
+                        true
+                    } else if cs_pos + 5 <= sh_end {
+                        let ext_len = u16::from_be_bytes([hs[cs_pos + 3], hs[cs_pos + 4]]) as usize;
+                        cs_pos + 5 + ext_len == sh_end
+                    } else {
+                        false
+                    };
+                    if ext_ok {
+                        return Some(u16::from_be_bytes([hs[cs_pos], hs[cs_pos + 1]]));
+                    }
                 }
             }
         }
@@ -839,7 +1069,7 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
     None
 }
 
-/// Map negotiated TLS 1.2 ServerHello cipher suite + local CipherPref to SRTP CipherSuite.
+/// Map negotiated DTLS 1.3 / 1.2 ServerHello cipher suite + local CipherPref to SRTP CipherSuite.
 /// Note: in `--no-dtls-decoy` mode (`dtls_suite_id == None` with `no_dtls == true`),
 /// `CipherPref::Auto` deterministically picks `ChaCha20Poly1305` so heterogeneous CPUs always interop.
 pub fn resolve_srtp_suite(
@@ -855,8 +1085,8 @@ pub fn resolve_srtp_suite(
                 CipherSuite::ChaCha20Poly1305
             } else {
                 match dtls_suite_id {
-                    Some(0xCCA9) => CipherSuite::ChaCha20Poly1305,
-                    Some(0xC02B | 0xC02C) => CipherSuite::Aes128Gcm,
+                    Some(0xCCA9 | 0x1303) => CipherSuite::ChaCha20Poly1305,
+                    Some(0xC02B | 0xC02C | 0x1301 | 0x1302) => CipherSuite::Aes128Gcm,
                     _ => cpu.recommended,
                 }
             }
@@ -911,30 +1141,64 @@ const SRTP_REPLAY_WINDOW: u64 = 2048;     // WireGuard-grade trans-Pacific ECMP 
 /// (e.g. Hysteria 2 over 127.0.0.1) to converge cleanly without fragmented packets.
 pub const DEFAULT_WAN_MTU: usize = 1488;
 
+fn derive_audio_ssrc(session_key: &[u8; 32], video_ssrc: u32) -> u32 {
+    let mut h = Sha256::new();
+    h.update(b"webrtc-cloak-v3-audio-ssrc|");
+    h.update(session_key);
+    h.update(&video_ssrc.to_be_bytes());
+    let d: [u8; 32] = h.finalize().into();
+    let mut s = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
+    // Enforce strict high-16-bit disjointness (`iv[4..6]` in `gcm_nonce`), guaranteeing
+    // 0% Nonce overlap across the entire 2^48 sequence space even without separate direction bits.
+    if s == 0 || (s >> 16) == (video_ssrc >> 16) {
+        s = video_ssrc ^ 0x5A3C_A5C3;
+    }
+    if s == 0 || (s >> 16) == (video_ssrc >> 16) {
+        s = (video_ssrc ^ 0x1357_9BDF) | 1;
+    }
+    s
+}
+
 pub struct SrtpCloakCipher {
     suite: CipherSuite,
     max_wire_udp: usize,
+    dual_ssrc: bool,
     enc_key: [u8; 32],
     mac_key: [u8; 32],
     aes_gcm: Aes128Gcm,
     chacha: ChaCha20Poly1305,
     gcm_salt: [u8; 4],
+    cname: [u8; 13],
     pub ssrc_tx: u32,
     pub ssrc_rx: u32,
+    pub audio_ssrc_tx: u32,
+    pub audio_ssrc_rx: u32,
     tx_dir: u8,
     rx_dir: u8,
     pub tx_ext_seq: u64,
+    audio_tx_ext_seq: u64,
     tx_twcc_seq: u16,
     pad_rng: u64,
     ts_base: u32,
+    audio_ts_base: u32,
     t0: Instant,
-    last_wall_frame: u64,
-    last_marked_frame: u64,
+    video_frame_open: bool,
+    cur_video_ts: u64,
+    last_closed_video_ts: u64,
     frame_pkt_count: u16,
+    frame_pkt_budget: u16,
+    last_audio_frame: u64,
+    last_audio_wall_ms: u64,
+    video_tx_since_rtcp: u64,
+    audio_tx_since_rtcp: u64,
     rx_initialized: bool,
     pub rx_roc: u32,
     rx_highest_seq16: u16,
     rx_replay_ring: [u64; SRTP_REPLAY_RING_WORDS],
+    audio_rx_initialized: bool,
+    audio_rx_roc: u32,
+    audio_rx_highest_seq16: u16,
+    audio_rx_replay_ring: [u64; SRTP_REPLAY_RING_WORDS],
     tx_srtcp_idx: u32,
     rx_srtcp_seen: bool,
     rx_srtcp_highest: u32,
@@ -966,42 +1230,83 @@ impl SrtpCloakCipher {
         let mut gcm_salt = [0u8; 4];
         gcm_salt.copy_from_slice(&enc_key[16..20]);
 
-        let mut r = [0u8; 16];
+        let audio_ssrc_tx = derive_audio_ssrc(session_key, ssrc_tx);
+        let audio_ssrc_rx = derive_audio_ssrc(session_key, ssrc_rx);
+
+        let mut r = [0u8; 37];
         fill_random(&mut r);
         let init_seq = (u16::from_be_bytes([r[0], r[1]]) & 0x7FFF) as u64;
         let ts_base = u32::from_be_bytes([r[2], r[3], r[4], r[5]]);
         let tx_twcc_seq = u16::from_be_bytes([r[6], r[7]]) & 0x7FFF;
         let pad_rng = u64::from_ne_bytes(r[8..16].try_into().unwrap()) | 1;
+        let audio_init_seq = (u16::from_be_bytes([r[16], r[17]]) & 0x7FFF) as u64;
+        let audio_ts_base = u32::from_be_bytes([r[18], r[19], r[20], r[21]]);
+        let init_budget = 8 + ((r[22] as u16) % 11);
+        const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+        let mut cname = [0u8; 13];
+        for i in 0..13 {
+            cname[i] = B64[(r[24 + i] as usize) & 63];
+        }
 
         Self {
             suite,
             max_wire_udp: DEFAULT_WAN_MTU - 28,
+            dual_ssrc: false,
             enc_key,
             mac_key,
             aes_gcm,
             chacha,
             gcm_salt,
+            cname,
             ssrc_tx,
             ssrc_rx,
+            audio_ssrc_tx,
+            audio_ssrc_rx,
             tx_dir: if is_client { DIR_C2S } else { DIR_S2C },
             rx_dir: if is_client { DIR_S2C } else { DIR_C2S },
             tx_ext_seq: init_seq,
+            audio_tx_ext_seq: audio_init_seq,
             tx_twcc_seq,
             pad_rng,
             ts_base,
+            audio_ts_base,
             t0: Instant::now(),
-            last_wall_frame: 0,
-            last_marked_frame: u64::MAX,
+            video_frame_open: false,
+            cur_video_ts: 0,
+            last_closed_video_ts: u64::MAX,
             frame_pkt_count: 0,
+            frame_pkt_budget: init_budget,
+            last_audio_frame: u64::MAX,
+            last_audio_wall_ms: u64::MAX,
+            video_tx_since_rtcp: 0,
+            audio_tx_since_rtcp: 0,
             rx_initialized: false,
             rx_roc: 0,
             rx_highest_seq16: 0,
             rx_replay_ring: [0u64; SRTP_REPLAY_RING_WORDS],
-            tx_srtcp_idx: 1,
+            audio_rx_initialized: false,
+            audio_rx_roc: 0,
+            audio_rx_highest_seq16: 0,
+            audio_rx_replay_ring: [0u64; SRTP_REPLAY_RING_WORDS],
+            tx_srtcp_idx: 0,
             rx_srtcp_seen: false,
             rx_srtcp_highest: 0,
             rx_srtcp_bitmap: 0,
         }
+    }
+
+    /// True if any SRTP 48-bit sequence or SRTCP 31-bit index is approaching exhaustion (must rekey).
+    #[inline]
+    pub fn is_seq_exhausted(&self) -> bool {
+        self.tx_ext_seq >= MAX_SRTP_EXT_SEQ
+            || self.audio_tx_ext_seq >= MAX_SRTP_EXT_SEQ
+            || self.tx_srtcp_idx >= MAX_SRTCP_IDX
+    }
+
+    /// Enable dual-SSRC audio/video stream splitting (`PT=111` 48kHz Opus for `< 256B` small packets
+    /// + `PT=96` 90kHz video for `>= 256B` packets), sharing a single global TWCC transport sequence.
+    pub fn set_dual_ssrc(&mut self, enabled: bool) {
+        self.dual_ssrc = enabled;
     }
 
     /// Configure outer IPv4 WAN MTU ceiling (`0` disables cap for jumbo/loopback testing).
@@ -1023,11 +1328,17 @@ impl SrtpCloakCipher {
     }
 
     #[inline]
-    fn is_replay(&self, ext_seq: u64) -> bool {
-        if !self.rx_initialized {
+    fn is_replay_stream(
+        initialized: bool,
+        roc: u32,
+        highest_seq16: u16,
+        ring: &[u64; SRTP_REPLAY_RING_WORDS],
+        ext_seq: u64,
+    ) -> bool {
+        if !initialized {
             return false;
         }
-        let highest = ((self.rx_roc as u64) << 16) | (self.rx_highest_seq16 as u64);
+        let highest = ((roc as u64) << 16) | (highest_seq16 as u64);
         if ext_seq > highest {
             return false;
         }
@@ -1036,7 +1347,7 @@ impl SrtpCloakCipher {
         }
         let word_idx = ((ext_seq >> 6) as usize) & (SRTP_REPLAY_RING_WORDS - 1);
         let bit_idx = ext_seq & 63;
-        ((self.rx_replay_ring[word_idx] >> bit_idx) & 1) != 0
+        ((ring[word_idx] >> bit_idx) & 1) != 0
     }
 
     #[inline]
@@ -1144,16 +1455,52 @@ impl SrtpCloakCipher {
         h.finalize().into_bytes().into()
     }
 
-    /// Build a strictly RFC 3550 §6.1 + RFC 7714 §9.1 compliant Compound SRTCP packet (fixes V3-H-04):
+    #[inline]
+    fn fill_fast_random(&mut self, buf: &mut [u8]) {
+        let mut i = 0usize;
+        while i < buf.len() {
+            let r = self.next_rng().to_ne_bytes();
+            let take = (buf.len() - i).min(8);
+            buf[i..i + take].copy_from_slice(&r[..take]);
+            i += take;
+        }
+    }
+
+    /// Build a strictly RFC 3550 §6.1 + RFC 7714 §9.1 compliant Compound SRTCP packet (V3.2):
     ///   - Plaintext primary header is ALWAYS PT=200 (SR) or PT=201 (RR) — NEVER plaintext PT=203 (BYE)!
+    ///   - In dual-SSRC mode, matches active media SSRC (avoids claiming SR on an idle Video SSRC when only
+    ///     Audio sent, and periodically reports on Audio SSRC as well).
     ///   - RC=0 when `has_rx_media == false` (SR len=6 / RR len=1), RC=1 when `has_rx_media == true` (SR len=12 / RR len=7).
-    ///   - Encrypted compound body contains primary remainder + valid SDES (PT=202) + optional FB (PT=205/206)
-    ///     + optional trailing BYE (PT=203) subpacket when `include_bye == true`.
-    ///   - Wire layout for ALL suites: `[8B Hdr] || [Ciphertext] || [16B Tag] || [4B E_SRTCP_Index]`.
+    ///   - Encrypted compound body contains primary remainder + session-constant CNAME SDES (PT=202)
+    ///     + smooth randomized FB (PT=205/206) + optional trailing BYE (PT=203) when `include_bye == true`.
+    ///   - Wire layout for ALL suites: `[8B Hdr] || [Ciphertext] || [16B Tag] || [4B E_SRTCP_Index]` (0-based).
     pub fn build_srtcp(&mut self, has_rx_media: bool, is_sender: bool, include_bye: bool) -> Vec<u8> {
-        let pt: u8 = if is_sender { 200 } else { 201 };
+        let video_sent = self.video_tx_since_rtcp > 0;
+        let audio_sent = self.audio_tx_since_rtcp > 0;
+        self.video_tx_since_rtcp = 0;
+        self.audio_tx_since_rtcp = 0;
+
+        let (report_ssrc, effective_sender) = if !self.dual_ssrc || include_bye {
+            // Single-SSRC or teardown: report on primary Video SSRC; avoid ghost SR if only Audio sent
+            let eff = if self.dual_ssrc {
+                is_sender && video_sent
+            } else {
+                is_sender
+            };
+            (self.ssrc_tx, eff)
+        } else if audio_sent && !video_sent {
+            // Pure small-packet direction (e.g. uplink QUIC ACKs): report honestly on Audio SSRC!
+            (self.audio_ssrc_tx, true)
+        } else if video_sent && audio_sent && (self.next_rng() & 3) == 0 {
+            // Both active: ~25% of RTCP reports cover Audio SSRC, ~75% cover Video SSRC
+            (self.audio_ssrc_tx, true)
+        } else {
+            (self.ssrc_tx, is_sender && video_sent)
+        };
+
+        let pt: u8 = if effective_sender { 200 } else { 201 };
         let rc: u8 = if has_rx_media { 1 } else { 0 };
-        let primary_words: u16 = match (is_sender, has_rx_media) {
+        let primary_words: u16 = match (effective_sender, has_rx_media) {
             (true, true) => 12,   // SR + 1 Report Block (52B)
             (true, false) => 6,   // SR + 0 Report Blocks (28B)
             (false, true) => 7,   // RR + 1 Report Block (32B)
@@ -1162,50 +1509,50 @@ impl SrtpCloakCipher {
         let primary_rem_len = ((primary_words as usize) - 1) * 4;
 
         let idx = self.tx_srtcp_idx & 0x7FFF_FFFF;
-        self.tx_srtcp_idx = self.tx_srtcp_idx.wrapping_add(1).max(1);
+        self.tx_srtcp_idx = self.tx_srtcp_idx.saturating_add(1).min(0x7FFF_FFFF);
         let e_idx = 0x8000_0000u32 | idx;
 
         let mut hdr = [0u8; 8];
         hdr[0] = 0x80 | rc;
         hdr[1] = pt;
         hdr[2..4].copy_from_slice(&primary_words.to_be_bytes());
-        hdr[4..8].copy_from_slice(&self.ssrc_tx.to_be_bytes());
+        hdr[4..8].copy_from_slice(&report_ssrc.to_be_bytes());
 
         // Assemble authentic encrypted compound RTCP body:
         let mut body = Vec::with_capacity(primary_rem_len + 96);
         if primary_rem_len > 0 {
             let start = body.len();
             body.resize(start + primary_rem_len, 0);
-            fill_random(&mut body[start..]);
+            self.fill_fast_random(&mut body[start..]);
         }
 
-        // Subpacket 2: SDES (PT=202) with CNAME item (16B total = 3 words + 1)
-        let sdes_len_words: u16 = 5; // 24B SDES chunk
+        // Subpacket 2: strictly RFC 3550 §6.5 compliant SDES (PT=202) with session-constant CNAME + 0x00 END
+        // Layout: [4B hdr] [4B SSRC] [1B type=1] [1B len=13] [13B ASCII CNAME] [1B END=0x00] = 24B (6 words -> len=5)
+        let sdes_len_words: u16 = 5;
         body.extend_from_slice(&[0x81, 202]);
         body.extend_from_slice(&sdes_len_words.to_be_bytes());
-        body.extend_from_slice(&self.ssrc_tx.to_be_bytes());
-        let mut cname = [0u8; 14];
-        fill_random(&mut cname);
+        body.extend_from_slice(&report_ssrc.to_be_bytes());
         body.push(1); // CNAME item type
-        body.push(14);
-        body.extend_from_slice(&cname);
+        body.push(13);
+        body.extend_from_slice(&self.cname);
+        body.push(0); // RFC 3550 §6.5 END item (32-bit aligned at 24B)
 
-        // Optional Subpacket 3: Transport-CC (205) / PSFB (206) randomized length when not BYE
-        if !include_bye && (self.next_rng() & 1) == 1 {
+        // Optional Subpacket 3: Transport-CC (205) / PSFB (206) smooth randomized length (~87.5% when not BYE)
+        if !include_bye && (self.next_rng() & 7) != 0 {
             let fb_pt: u8 = if (self.next_rng() & 1) == 0 { 205 } else { 206 };
-            let fb_words: u16 = 3 + ((self.next_rng() as u16) % 10); // 16..52B
+            let fb_words: u16 = 2 + ((self.next_rng() as u16) % 11); // 12..52B
             body.extend_from_slice(&[0x8F, fb_pt]);
             body.extend_from_slice(&fb_words.to_be_bytes());
             let fb_body_len = (fb_words as usize) * 4;
             let s = body.len();
             body.resize(s + fb_body_len, 0);
-            fill_random(&mut body[s..]);
+            self.fill_fast_random(&mut body[s..]);
         }
 
         // Final Subpacket (if tearing down): RFC 3550 §6.1 BYE (PT=203) MUST be last & encrypted!
         if include_bye {
             body.extend_from_slice(&[0x81, 203, 0x00, 0x01]);
-            body.extend_from_slice(&self.ssrc_tx.to_be_bytes());
+            body.extend_from_slice(&report_ssrc.to_be_bytes());
         }
 
         let mut aad = [0u8; 12];
@@ -1214,7 +1561,7 @@ impl SrtpCloakCipher {
 
         let tag_bytes: [u8; 16] = match self.suite {
             CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(self.tx_dir | 0x80, self.ssrc_tx, idx as u64);
+                let iv = self.gcm_nonce(self.tx_dir | 0x80, report_ssrc, idx as u64);
                 let tag = self
                     .aes_gcm
                     .encrypt_in_place_detached(GcmNonce::from_slice(&iv), &aad, &mut body)
@@ -1222,7 +1569,7 @@ impl SrtpCloakCipher {
                 tag.into()
             }
             CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(self.tx_dir | 0x80, self.ssrc_tx, idx as u64);
+                let iv = self.gcm_nonce(self.tx_dir | 0x80, report_ssrc, idx as u64);
                 let tag = self
                     .chacha
                     .encrypt_in_place_detached(ChaNonce::from_slice(&iv), &aad, &mut body)
@@ -1230,7 +1577,7 @@ impl SrtpCloakCipher {
                 tag.into()
             }
             CipherSuite::Blake2b => {
-                self.xor_keystream(self.tx_dir | 0x80, self.ssrc_tx, idx as u64, &mut body);
+                self.xor_keystream(self.tx_dir | 0x80, report_ssrc, idx as u64, &mut body);
                 self.auth_tag(self.tx_dir | 0x80, &aad, &body, idx)
             }
         };
@@ -1244,6 +1591,7 @@ impl SrtpCloakCipher {
     }
 
     /// Verify an incoming RFC 7714 §9.1 Compound SRTCP packet (with 64-pkt sliding anti-replay).
+    /// Accepts Video SSRC (`ssrc_rx`) and, in dual-SSRC mode, Audio SSRC (`audio_ssrc_rx`).
     /// Returns `Some(has_encrypted_bye)` on success, `None` on failure.
     pub fn verify_srtcp(&mut self, packet: &[u8]) -> Option<bool> {
         if packet.len() < 8 + SRTP_TAG_LEN + 4 {
@@ -1258,7 +1606,7 @@ impl SrtpCloakCipher {
             return None;
         }
         let ssrc = u32::from_be_bytes([packet[4], packet[5], packet[6], packet[7]]);
-        if ssrc != self.ssrc_rx {
+        if ssrc != self.ssrc_rx && !(self.dual_ssrc && ssrc == self.audio_ssrc_rx) {
             return None;
         }
 
@@ -1285,7 +1633,7 @@ impl SrtpCloakCipher {
 
         let ok = match self.suite {
             CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(self.rx_dir | 0x80, self.ssrc_rx, idx as u64);
+                let iv = self.gcm_nonce(self.rx_dir | 0x80, ssrc, idx as u64);
                 self.aes_gcm
                     .decrypt_in_place_detached(
                         GcmNonce::from_slice(&iv),
@@ -1296,7 +1644,7 @@ impl SrtpCloakCipher {
                     .is_ok()
             }
             CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(self.rx_dir | 0x80, self.ssrc_rx, idx as u64);
+                let iv = self.gcm_nonce(self.rx_dir | 0x80, ssrc, idx as u64);
                 self.chacha
                     .decrypt_in_place_detached(
                         ChaNonce::from_slice(&iv),
@@ -1309,7 +1657,7 @@ impl SrtpCloakCipher {
             CipherSuite::Blake2b => {
                 let expected = self.auth_tag(self.rx_dir | 0x80, &aad, &plain, idx);
                 if bool::from(packet[tag_pos..idx_pos].ct_eq(&expected[..])) {
-                    self.xor_keystream(self.rx_dir | 0x80, self.ssrc_rx, idx as u64, &mut plain);
+                    self.xor_keystream(self.rx_dir | 0x80, ssrc, idx as u64, &mut plain);
                     true
                 } else {
                     false
@@ -1399,39 +1747,111 @@ impl SrtpCloakCipher {
             return None;
         }
 
-        let ext_seq = self.tx_ext_seq;
-        self.tx_ext_seq = (self.tx_ext_seq + 1) & 0xFFFF_FFFF_FFFF;
+        if self.tx_ext_seq >= MAX_SRTP_EXT_SEQ || self.audio_tx_ext_seq >= MAX_SRTP_EXT_SEQ {
+            return None; // Never wrap 48-bit SRTP sequence (RFC 3711 / RFC 7714)
+        }
+
+        let elapsed = self.t0.elapsed();
+        let wall_ms = elapsed.as_millis() as u64;
+        let audio_frame = wall_ms / 20;
+        // Jittered audio/video split threshold (180..=307B) + strict RFC 7587 <=50pps Opus cap
+        // (max 1 PT=111 packet per 20ms frame; bursty QUIC ACKs cleanly spill onto PT=96 Video).
+        // Applies uniformly to Data and 0xFFFE Probe frames for zero selftest fingerprint delta.
+        let audio_thresh = 180 + (((rnd >> 24) as usize) & 0x7F);
+        let use_audio = self.dual_ssrc
+            && plaintext.len() < audio_thresh
+            && audio_frame != self.last_audio_frame;
+        let (ext_seq, active_ssrc, pt, ts, marker, tx_domain_dir) = if use_audio {
+            let es = self.audio_tx_ext_seq;
+            self.audio_tx_ext_seq += 1;
+            self.audio_tx_since_rtcp += 1;
+            self.last_audio_frame = audio_frame;
+            // RFC 7587 Opus 48,000 Hz clock quantized to 20ms frames (960 ticks/frame); M=1 on talkspurt start
+            let a_ts = self.audio_ts_base.wrapping_add((audio_frame.wrapping_mul(960)) as u32);
+            let m: u8 = if self.last_audio_wall_ms == u64::MAX
+                || wall_ms.saturating_sub(self.last_audio_wall_ms) >= 200
+            {
+                0x80
+            } else {
+                0x00
+            };
+            self.last_audio_wall_ms = wall_ms;
+            // Orthogonal AEAD Nonce domain (`dir | 0x40`) + high-16-bit disjoint Audio SSRC
+            (es, self.audio_ssrc_tx, RTP_AUDIO_PT, a_ts, m, self.tx_dir | 0x40)
+        } else {
+            let es = self.tx_ext_seq;
+            self.tx_ext_seq += 1;
+            self.video_tx_since_rtcp += 1;
+            // Exact 90,000 Hz wall-clock video framing with STRICT RFC 3550 M=1 causality:
+            // once a packet emits M=1 for timestamp T, NO subsequent packet EVER reuses T!
+            let wall_90k: u64 = ((elapsed.as_nanos() * 90) / 1_000_000) as u64;
+            let (frame_ts, m): (u64, u8) = if !self.video_frame_open {
+                let start_ts = if self.last_closed_video_ts == u64::MAX {
+                    wall_90k
+                } else {
+                    wall_90k.max(self.last_closed_video_ts.wrapping_add(1))
+                };
+                // Sparse small packet after >=28ms gap -> clean single-packet frame (M=1 & close)
+                let sparse_gap = self.last_closed_video_ts == u64::MAX
+                    || start_ts.saturating_sub(self.last_closed_video_ts) >= 2500;
+                if plaintext.len() < 1100 && sparse_gap {
+                    self.last_closed_video_ts = start_ts;
+                    self.frame_pkt_count = 0;
+                    (start_ts, 0x80)
+                } else {
+                    self.video_frame_open = true;
+                    self.cur_video_ts = start_ts;
+                    self.frame_pkt_count = 1;
+                    self.frame_pkt_budget = 8 + (((rnd >> 8) as u16) % 11); // 8..=18 pkts
+                    (start_ts, 0x00)
+                }
+            } else {
+                let age_90k = wall_90k.saturating_sub(self.cur_video_ts);
+                if age_90k >= 6000 {
+                    // Long idle gap (>66ms): abandon old open frame cleanly & start fresh at wall_90k
+                    let start_ts = wall_90k.max(self.cur_video_ts.wrapping_add(1));
+                    if plaintext.len() < 1100 {
+                        self.video_frame_open = false;
+                        self.last_closed_video_ts = start_ts;
+                        self.frame_pkt_count = 0;
+                        (start_ts, 0x80)
+                    } else {
+                        self.cur_video_ts = start_ts;
+                        self.frame_pkt_count = 1;
+                        self.frame_pkt_budget = 8 + (((rnd >> 8) as u16) % 11);
+                        (start_ts, 0x00)
+                    }
+                } else if age_90k >= 2900
+                    || (age_90k >= 1500
+                        && (plaintext.len() < 1100
+                            || self.frame_pkt_count >= self.frame_pkt_budget))
+                {
+                    // Close current frame with M=1 as its FINAL packet; next packet MUST advance TS!
+                    let close_ts = self.cur_video_ts;
+                    self.video_frame_open = false;
+                    self.last_closed_video_ts = close_ts;
+                    self.frame_pkt_count = 0;
+                    (close_ts, 0x80)
+                } else {
+                    self.frame_pkt_count = self.frame_pkt_count.saturating_add(1);
+                    (self.cur_video_ts, 0x00)
+                }
+            };
+            let v_ts = self.ts_base.wrapping_add(frame_ts as u32);
+            (es, self.ssrc_tx, RTP_VIDEO_PT, v_ts, m, self.tx_dir)
+        };
         let roc = ((ext_seq >> 16) & 0xFFFF_FFFF) as u32;
         let seq16 = (ext_seq & 0xFFFF) as u16;
+        // Shared global Transport-Wide CC sequence across both Audio & Video SSRCs (matches Chrome libwebrtc)
         let twcc = self.tx_twcc_seq;
         self.tx_twcc_seq = self.tx_twcc_seq.wrapping_add(1);
 
-        // Pure u64 wall-clock 90,000 Hz 30fps timestamp: exact 90kHz slope at any pps, zero 13.25h wrap!
-        let wall_90k: u64 = ((self.t0.elapsed().as_nanos() * 90) / 1_000_000) as u64;
-        let wall_frame: u64 = wall_90k / 3000;
-        if wall_frame != self.last_wall_frame {
-            self.last_wall_frame = wall_frame;
-            self.frame_pkt_count = 0;
-        }
-        let ts = self.ts_base.wrapping_add((wall_frame.wrapping_mul(3000)) as u32);
-
-        // Emit at most ONE M=1 per wall-clock frame (never forces fake frame jumps!)
-        let marker: u8 = if self.last_marked_frame != wall_frame
-            && (plaintext.len() < 1100 || self.frame_pkt_count >= 12)
-        {
-            self.last_marked_frame = wall_frame;
-            0x80
-        } else {
-            self.frame_pkt_count = self.frame_pkt_count.saturating_add(1);
-            0x00
-        };
-
         // 12B standard Chrome RTP header: 0x90 (V=2, P=0, X=1, CC=0)
         out[0] = 0x90;
-        out[1] = marker | RTP_VIDEO_PT;
+        out[1] = marker | pt;
         out[2..4].copy_from_slice(&seq16.to_be_bytes());
         out[4..8].copy_from_slice(&ts.to_be_bytes());
-        out[8..12].copy_from_slice(&self.ssrc_tx.to_be_bytes());
+        out[8..12].copy_from_slice(&active_ssrc.to_be_bytes());
 
         // 8B RFC 8285 One-Byte Extension Header (0xBEDE, len=1 word, ID=3 L=1 transport-wide-cc)
         out[12] = 0xBE;
@@ -1472,7 +1892,7 @@ impl SrtpCloakCipher {
 
         match self.suite {
             CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(self.tx_dir, self.ssrc_tx, ext_seq);
+                let iv = self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq);
                 let tag = self
                     .aes_gcm
                     .encrypt_in_place_detached(
@@ -1484,7 +1904,7 @@ impl SrtpCloakCipher {
                 out[ct_end..total].copy_from_slice(&tag);
             }
             CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(self.tx_dir, self.ssrc_tx, ext_seq);
+                let iv = self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq);
                 let tag = self
                     .chacha
                     .encrypt_in_place_detached(
@@ -1496,9 +1916,9 @@ impl SrtpCloakCipher {
                 out[ct_end..total].copy_from_slice(&tag);
             }
             CipherSuite::Blake2b => {
-                self.xor_keystream(self.tx_dir, self.ssrc_tx, ext_seq, &mut out[RTP_FULL_HDR_LEN..ct_end]);
+                self.xor_keystream(tx_domain_dir, active_ssrc, ext_seq, &mut out[RTP_FULL_HDR_LEN..ct_end]);
                 let tag = self.auth_tag(
-                    self.tx_dir,
+                    tx_domain_dir,
                     &out[..RTP_FULL_HDR_LEN],
                     &out[RTP_FULL_HDR_LEN..ct_end],
                     roc,
@@ -1544,9 +1964,13 @@ impl SrtpCloakCipher {
 
         let seq16 = u16::from_be_bytes([packet[2], packet[3]]);
         let ssrc = u32::from_be_bytes([packet[8], packet[9], packet[10], packet[11]]);
-        if ssrc != self.ssrc_rx {
+        let is_audio = if ssrc == self.ssrc_rx {
+            false
+        } else if self.dual_ssrc && ssrc == self.audio_ssrc_rx {
+            true
+        } else {
             return None;
-        }
+        };
 
         let rtp_hdr = &packet[..hdr_len];
         let ct_len = packet.len() - hdr_len - SRTP_TAG_LEN;
@@ -1555,33 +1979,61 @@ impl SrtpCloakCipher {
         }
         let ciphertext = &packet[hdr_len..hdr_len + ct_len];
 
+        let (rx_init, rx_roc, rx_highest) = if is_audio {
+            (self.audio_rx_initialized, self.audio_rx_roc, self.audio_rx_highest_seq16)
+        } else {
+            (self.rx_initialized, self.rx_roc, self.rx_highest_seq16)
+        };
+
         let mut candidates = [0u32; 3];
         let mut n_cand = 0usize;
-        if self.rx_initialized {
-            if seq16 < 0x4000 && self.rx_highest_seq16 > 0xC000 {
-                candidates[n_cand] = self.rx_roc.wrapping_add(1);
+        if rx_init {
+            if seq16 < 0x4000 && rx_highest > 0xC000 {
+                candidates[n_cand] = rx_roc.wrapping_add(1);
                 n_cand += 1;
-                candidates[n_cand] = self.rx_roc;
+                candidates[n_cand] = rx_roc;
                 n_cand += 1;
-            } else if seq16 > 0xC000 && self.rx_highest_seq16 < 0x4000 && self.rx_roc > 0 {
-                candidates[n_cand] = self.rx_roc - 1;
+            } else if seq16 > 0xC000 && rx_highest < 0x4000 && rx_roc > 0 {
+                candidates[n_cand] = rx_roc - 1;
                 n_cand += 1;
-                candidates[n_cand] = self.rx_roc;
+                candidates[n_cand] = rx_roc;
                 n_cand += 1;
             } else {
-                candidates[n_cand] = self.rx_roc;
+                candidates[n_cand] = rx_roc;
                 n_cand += 1;
-                candidates[n_cand] = self.rx_roc.wrapping_add(1);
+                candidates[n_cand] = rx_roc.wrapping_add(1);
                 n_cand += 1;
-                if self.rx_roc > 0 {
-                    candidates[n_cand] = self.rx_roc - 1;
+                if rx_roc > 0 {
+                    candidates[n_cand] = rx_roc - 1;
                     n_cand += 1;
                 }
             }
         } else {
-            candidates[0] = self.rx_roc;
+            candidates[0] = rx_roc;
             n_cand = 1;
         }
+
+        let is_replay_cand = |this: &Self, ext_seq: u64| -> bool {
+            if is_audio {
+                Self::is_replay_stream(
+                    this.audio_rx_initialized,
+                    this.audio_rx_roc,
+                    this.audio_rx_highest_seq16,
+                    &this.audio_rx_replay_ring,
+                    ext_seq,
+                )
+            } else {
+                Self::is_replay_stream(
+                    this.rx_initialized,
+                    this.rx_roc,
+                    this.rx_highest_seq16,
+                    &this.rx_replay_ring,
+                    ext_seq,
+                )
+            }
+        };
+
+        let rx_domain_dir = if is_audio { self.rx_dir | 0x40 } else { self.rx_dir };
 
         let decrypted = match self.suite {
             CipherSuite::Aes128Gcm => {
@@ -1591,10 +2043,10 @@ impl SrtpCloakCipher {
                 let mut ok = false;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
-                    if self.is_replay(ext_seq) {
+                    if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let iv = self.gcm_nonce(self.rx_dir, self.ssrc_rx, ext_seq);
+                    let iv = self.gcm_nonce(rx_domain_dir, ssrc, ext_seq);
                     aad[hdr_len..hdr_len + 4].copy_from_slice(&cand.to_be_bytes());
                     out[..ct_len].copy_from_slice(ciphertext);
                     if self
@@ -1607,7 +2059,7 @@ impl SrtpCloakCipher {
                         )
                         .is_ok()
                     {
-                        self.update_rx_seq(cand, seq16);
+                        self.update_rx_seq_stream(is_audio, cand, seq16);
                         ok = true;
                         break;
                     }
@@ -1621,10 +2073,10 @@ impl SrtpCloakCipher {
                 let mut ok = false;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
-                    if self.is_replay(ext_seq) {
+                    if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let iv = self.gcm_nonce(self.rx_dir, self.ssrc_rx, ext_seq);
+                    let iv = self.gcm_nonce(rx_domain_dir, ssrc, ext_seq);
                     aad[hdr_len..hdr_len + 4].copy_from_slice(&cand.to_be_bytes());
                     out[..ct_len].copy_from_slice(ciphertext);
                     if self
@@ -1637,7 +2089,7 @@ impl SrtpCloakCipher {
                         )
                         .is_ok()
                     {
-                        self.update_rx_seq(cand, seq16);
+                        self.update_rx_seq_stream(is_audio, cand, seq16);
                         ok = true;
                         break;
                     }
@@ -1649,10 +2101,10 @@ impl SrtpCloakCipher {
                 let mut matched_roc = None;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
-                    if self.is_replay(ext_seq) {
+                    if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let expected = self.auth_tag(self.rx_dir, rtp_hdr, ciphertext, cand);
+                    let expected = self.auth_tag(rx_domain_dir, rtp_hdr, ciphertext, cand);
                     if bool::from(got_tag.ct_eq(&expected[..])) {
                         matched_roc = Some(cand);
                         break;
@@ -1660,9 +2112,9 @@ impl SrtpCloakCipher {
                 }
                 if let Some(roc) = matched_roc {
                     let ext_seq = ((roc as u64) << 16) | (seq16 as u64);
-                    self.update_rx_seq(roc, seq16);
+                    self.update_rx_seq_stream(is_audio, roc, seq16);
                     out[..ct_len].copy_from_slice(ciphertext);
-                    self.xor_keystream(self.rx_dir, self.ssrc_rx, ext_seq, &mut out[..ct_len]);
+                    self.xor_keystream(rx_domain_dir, ssrc, ext_seq, &mut out[..ct_len]);
                     true
                 } else {
                     false
@@ -1694,36 +2146,51 @@ impl SrtpCloakCipher {
     }
 
     #[inline]
-    fn update_rx_seq(&mut self, roc: u32, seq16: u16) {
+    fn update_rx_seq_stream(&mut self, is_audio: bool, roc: u32, seq16: u16) {
+        let (rx_initialized, rx_roc, rx_highest_seq16, rx_replay_ring) = if is_audio {
+            (
+                &mut self.audio_rx_initialized,
+                &mut self.audio_rx_roc,
+                &mut self.audio_rx_highest_seq16,
+                &mut self.audio_rx_replay_ring,
+            )
+        } else {
+            (
+                &mut self.rx_initialized,
+                &mut self.rx_roc,
+                &mut self.rx_highest_seq16,
+                &mut self.rx_replay_ring,
+            )
+        };
         let ext_seq = ((roc as u64) << 16) | (seq16 as u64);
         let new_block = ext_seq >> 6;
         let bit_mask = 1u64 << (ext_seq & 63);
         let ring_mask = SRTP_REPLAY_RING_WORDS - 1;
 
-        if !self.rx_initialized {
-            self.rx_initialized = true;
-            self.rx_roc = roc;
-            self.rx_highest_seq16 = seq16;
-            self.rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
-            self.rx_replay_ring[(new_block as usize) & ring_mask] = bit_mask;
+        if !*rx_initialized {
+            *rx_initialized = true;
+            *rx_roc = roc;
+            *rx_highest_seq16 = seq16;
+            *rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
+            rx_replay_ring[(new_block as usize) & ring_mask] = bit_mask;
             return;
         }
-        let highest = ((self.rx_roc as u64) << 16) | (self.rx_highest_seq16 as u64);
+        let highest = ((*rx_roc as u64) << 16) | (*rx_highest_seq16 as u64);
         if ext_seq > highest {
             let old_block = highest >> 6;
             let diff_blocks = new_block - old_block;
             if diff_blocks >= SRTP_REPLAY_RING_WORDS as u64 {
-                self.rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
+                *rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
             } else {
                 for b in (old_block + 1)..=new_block {
-                    self.rx_replay_ring[(b as usize) & ring_mask] = 0;
+                    rx_replay_ring[(b as usize) & ring_mask] = 0;
                 }
             }
-            self.rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
-            self.rx_roc = roc;
-            self.rx_highest_seq16 = seq16;
+            rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
+            *rx_roc = roc;
+            *rx_highest_seq16 = seq16;
         } else if highest - ext_seq < SRTP_REPLAY_WINDOW {
-            self.rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
+            rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
         }
     }
 }
@@ -1928,5 +2395,278 @@ mod tests {
             let over_probe = vec![0x5Au8; 1421];
             assert!(cli.wrap_probe_into(&over_probe, &mut wbuf).is_none());
         }
+    }
+
+    #[test]
+    fn dtls13_auto_and_dtls12_fallback_interop() {
+        use dimpl::ProtocolVersion;
+        let cpu = detect_cpu_accel();
+        let cli_cfg = build_dimpl_config(CipherPref::Auto, &cpu, true);
+        let srv_cfg = build_dimpl_config(CipherPref::Auto, &cpu, false);
+        let now = Instant::now();
+
+        let drive = |mut cli: Dtls, mut srv: Dtls| -> (Option<ProtocolVersion>, Option<ProtocolVersion>, Vec<u8>, Vec<u8>) {
+            cli.set_active(true);
+            let _ = cli.handle_timeout(now);
+            let _ = srv.handle_timeout(now);
+            let mut cbuf = vec![0u8; 4096];
+            let mut sbuf = vec![0u8; 4096];
+            let mut c_km = Vec::new();
+            let mut s_km = Vec::new();
+            let mut c_ok = false;
+            let mut s_ok = false;
+            for _ in 0..16 {
+                let mut c_pkts = Vec::new();
+                loop {
+                    match cli.poll_output(&mut cbuf) {
+                        Output::Packet(p) => {
+                            assert!(validate_dtls_datagram(p, false), "client DTLS datagram must pass validator");
+                            c_pkts.push(p.to_vec());
+                        }
+                        Output::KeyingMaterial(km, _) => c_km = km.to_vec(),
+                        Output::Connected => c_ok = true,
+                        Output::Timeout(_) => break,
+                        _ => {}
+                    }
+                }
+                for p in c_pkts {
+                    srv.handle_packet(&p).unwrap();
+                }
+                let mut s_pkts = Vec::new();
+                loop {
+                    match srv.poll_output(&mut sbuf) {
+                        Output::Packet(p) => {
+                            assert!(validate_dtls_datagram(p, false), "server DTLS datagram must pass validator");
+                            s_pkts.push(p.to_vec());
+                        }
+                        Output::KeyingMaterial(km, _) => s_km = km.to_vec(),
+                        Output::Connected => s_ok = true,
+                        Output::Timeout(_) => break,
+                        _ => {}
+                    }
+                }
+                for p in s_pkts {
+                    cli.handle_packet(&p).unwrap();
+                }
+                if c_ok && s_ok {
+                    break;
+                }
+            }
+            assert!(c_ok && s_ok, "DTLS handshake should complete");
+            assert_eq!(c_km, s_km, "Exported SRTP KeyingMaterial must match");
+            assert!(!c_km.is_empty());
+            (cli.protocol_version(), srv.protocol_version(), c_km, s_km)
+        };
+
+        // 1. Auto <-> Auto MUST negotiate DTLS 1.3
+        let (cv1, sv1, _, _) = drive(
+            Dtls::new_auto(Arc::clone(&cli_cfg), generate_ephemeral_webrtc_cert(), now),
+            Dtls::new_auto(Arc::clone(&srv_cfg), generate_ephemeral_webrtc_cert(), now),
+        );
+        assert_eq!(cv1, Some(ProtocolVersion::DTLS1_3));
+        assert_eq!(sv1, Some(ProtocolVersion::DTLS1_3));
+
+        // 2. Auto client <-> legacy DTLS 1.2 server MUST seamlessly fall back to DTLS 1.2
+        let (cv2, sv2, _, _) = drive(
+            Dtls::new_auto(Arc::clone(&cli_cfg), generate_ephemeral_webrtc_cert(), now),
+            Dtls::new_12(Arc::clone(&srv_cfg), generate_ephemeral_webrtc_cert(), now),
+        );
+        assert_eq!(cv2, Some(ProtocolVersion::DTLS1_2));
+        assert_eq!(sv2, Some(ProtocolVersion::DTLS1_2));
+
+        // 3. Legacy DTLS 1.2 client <-> Auto server MUST seamlessly fall back to DTLS 1.2
+        let (cv3, sv3, _, _) = drive(
+            Dtls::new_12(Arc::clone(&cli_cfg), generate_ephemeral_webrtc_cert(), now),
+            Dtls::new_auto(Arc::clone(&srv_cfg), generate_ephemeral_webrtc_cert(), now),
+        );
+        assert_eq!(cv3, Some(ProtocolVersion::DTLS1_2));
+        assert_eq!(sv3, Some(ProtocolVersion::DTLS1_2));
+    }
+
+    #[test]
+    fn dual_ssrc_audio_video_split_and_replay_isolation() {
+        let psk = b"dual-ssrc-test-psk-2026";
+        let txid = make_fresh_stun_txid(psk);
+        let (stun_key, s_c2s, s_s2c) = derive_stun_material(psk, &txid, "av01:av02");
+        let skey = combine_session_key(&stun_key, None);
+        for suite in [
+            CipherSuite::Aes128Gcm,
+            CipherSuite::ChaCha20Poly1305,
+            CipherSuite::Blake2b,
+        ] {
+            let mut cli = SrtpCloakCipher::new(&skey, s_c2s, s_s2c, true, suite);
+            let mut srv = SrtpCloakCipher::new(&skey, s_s2c, s_c2s, false, suite);
+            cli.set_dual_ssrc(true);
+            srv.set_dual_ssrc(true);
+            assert_ne!(cli.ssrc_tx, cli.audio_ssrc_tx);
+            assert_eq!(cli.audio_ssrc_tx, srv.audio_ssrc_rx);
+
+            let mut wbuf = [0u8; 2048];
+            let mut rbuf = [0u8; 2048];
+
+            // Small ACK packet (< 256B) -> Audio SSRC + PT=111 (Opus)
+            let small = vec![0x11u8; 64];
+            let wn_a = cli.wrap_into(&small, &mut wbuf).unwrap();
+            assert_eq!(wbuf[1] & 0x7F, RTP_AUDIO_PT);
+            assert_eq!(u32::from_be_bytes([wbuf[8], wbuf[9], wbuf[10], wbuf[11]]), cli.audio_ssrc_tx);
+            let twcc1 = u16::from_be_bytes([wbuf[17], wbuf[18]]);
+            let rn_a = srv.unwrap_into(&wbuf[..wn_a], &mut rbuf).unwrap();
+            assert_eq!(&rbuf[..rn_a], &small[..]);
+            // Replay of Audio packet MUST be blocked independently
+            assert!(srv.unwrap_into(&wbuf[..wn_a], &mut rbuf).is_none());
+
+            // Large data packet (>= 256B) -> Video SSRC + PT=96, global TWCC increments by +1
+            let large = vec![0x22u8; 1200];
+            let wn_v = cli.wrap_into(&large, &mut wbuf).unwrap();
+            assert_eq!(wbuf[1] & 0x7F, RTP_VIDEO_PT);
+            assert_eq!(u32::from_be_bytes([wbuf[8], wbuf[9], wbuf[10], wbuf[11]]), cli.ssrc_tx);
+            let twcc2 = u16::from_be_bytes([wbuf[17], wbuf[18]]);
+            assert_eq!(twcc2, twcc1.wrapping_add(1));
+            let rn_v = srv.unwrap_into(&wbuf[..wn_v], &mut rbuf).unwrap();
+            assert_eq!(&rbuf[..rn_v], &large[..]);
+            // Replay of Video packet MUST be blocked independently
+            assert!(srv.unwrap_into(&wbuf[..wn_v], &mut rbuf).is_none());
+
+            // High-16-bit SSRC disjointness across full 2^48 Nonce space (P0-5 / M-02)
+            assert_ne!(cli.ssrc_tx >> 16, cli.audio_ssrc_tx >> 16);
+            assert_ne!(cli.ssrc_rx >> 16, cli.audio_ssrc_rx >> 16);
+        }
+    }
+
+    #[test]
+    fn v32_hardening_invariants_crypto_dpi_and_anti_downgrade() {
+        // 1. derive_audio_ssrc high-16-bit disjointness even for adversarial edge SSRCs
+        let key = [0x42u8; 32];
+        for v_ssrc in [0u32, 1, 0x5A3C_A5C3, 0xFFFF_FFFF, 0x1357_9BDF, 0x1234_5678] {
+            let a_ssrc = derive_audio_ssrc(&key, v_ssrc);
+            assert_ne!(a_ssrc, 0);
+            assert_ne!(a_ssrc >> 16, v_ssrc >> 16, "high 16 bits MUST be disjoint for Nonce orthogonality");
+        }
+
+        // 2. validate_dtls_datagram rejects plaintext ct=26 in Ready and epoch>=1 (P0-4 / M-01)
+        let mut fake_ack = [0u8; 32];
+        fake_ack[0] = 26; // plaintext ACK
+        fake_ack[1] = 0xFE;
+        fake_ack[2] = 0xFD;
+        fake_ack[12] = 19; // rec_len = 19
+        assert!(validate_dtls_datagram(&fake_ack, false)); // epoch=0 allowed during handshake
+        assert!(!validate_dtls_datagram(&fake_ack, true)); // MUST be rejected in Ready!
+        fake_ack[4] = 1; // epoch=1 plaintext ct=26 -> rejected always!
+        assert!(!validate_dtls_datagram(&fake_ack, false));
+
+        // 3. extract_dtls_server_hello_suite rejects malformed extensions_len (P0-2 / M-03)
+        let mut bad_sh = vec![0u8; 13 + 54];
+        bad_sh[0] = 0x16;
+        bad_sh[1] = 0xFE;
+        bad_sh[2] = 0xFD;
+        bad_sh[11..13].copy_from_slice(&54u16.to_be_bytes());
+        let hs = &mut bad_sh[13..];
+        hs[0] = 0x02; // ServerHello
+        hs[1..4].copy_from_slice(&[0, 0, 42]); // msg_len = 42
+        hs[9..12].copy_from_slice(&[0, 0, 42]); // frag_len = 42
+        hs[12] = 0xFE;
+        hs[13] = 0xFD;
+        hs[46] = 0; // sid_len = 0
+        hs[47..49].copy_from_slice(&0x1303u16.to_be_bytes());
+        hs[49] = 0; // compression = 0
+        hs[50..52].copy_from_slice(&0xFFFFu16.to_be_bytes()); // MALFORMED extensions_len!
+        assert_eq!(extract_dtls_server_hello_suite(&bad_sh), None);
+        // Valid 2-byte extensions (len=2) succeeds:
+        bad_sh[13 + 50..13 + 52].copy_from_slice(&2u16.to_be_bytes());
+        assert_eq!(extract_dtls_server_hello_suite(&bad_sh), Some(0x1303));
+
+        // 4. Multi-MTU DtlsConfigPool respects --mtu clamping (P1-2 / L-03)
+        let cpu = detect_cpu_accel();
+        let pool_default = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, DEFAULT_WAN_MTU);
+        assert_eq!(pool_default.mtus().len(), 8);
+        let pool_small = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, 1000);
+        assert!(pool_small.mtus().iter().all(|&m| m <= 972));
+
+        // 5. Strict DTLS 1.3 mode (DtlsMinVersion::V13Only) negotiates DTLS 1.3 cleanly
+        let now = Instant::now();
+        let cli_cfg = pool_default.pick();
+        let srv_cfg = build_dimpl_config_pool(CipherPref::Auto, &cpu, false, DEFAULT_WAN_MTU).pick();
+        let mut c13 = new_dtls_instance(DtlsMinVersion::V13Only, cli_cfg, generate_ephemeral_webrtc_cert(), now);
+        let mut s13 = new_dtls_instance(DtlsMinVersion::V13Only, srv_cfg, generate_ephemeral_webrtc_cert(), now);
+        c13.set_active(true);
+        let _ = c13.handle_timeout(now);
+        let _ = s13.handle_timeout(now);
+        let mut buf = vec![0u8; 4096];
+        let (mut c_ok, mut s_ok) = (false, false);
+        for _ in 0..12 {
+            let mut cp = Vec::new();
+            loop {
+                match c13.poll_output(&mut buf) {
+                    Output::Packet(p) => cp.push(p.to_vec()),
+                    Output::Connected => c_ok = true,
+                    Output::Timeout(_) => break,
+                    _ => {}
+                }
+            }
+            for p in cp { s13.handle_packet(&p).unwrap(); }
+            let mut sp = Vec::new();
+            loop {
+                match s13.poll_output(&mut buf) {
+                    Output::Packet(p) => sp.push(p.to_vec()),
+                    Output::Connected => s_ok = true,
+                    Output::Timeout(_) => break,
+                    _ => {}
+                }
+            }
+            for p in sp { c13.handle_packet(&p).unwrap(); }
+            if c_ok && s_ok { break; }
+        }
+        assert!(c_ok && s_ok);
+        assert_eq!(c13.protocol_version(), Some(dimpl::ProtocolVersion::DTLS1_3));
+        assert_eq!(s13.protocol_version(), Some(dimpl::ProtocolVersion::DTLS1_3));
+
+        // 6. Opus <=50pps cap (max 1 PT=111 per 20ms frame) + strict Video M=1 causality + Audio SRTCP!
+        let mut cli = SrtpCloakCipher::new(&key, 0x1122_3344, 0x5566_7788, true, CipherSuite::Aes128Gcm);
+        let mut srv = SrtpCloakCipher::new(&key, 0x5566_7788, 0x1122_3344, false, CipherSuite::Aes128Gcm);
+        cli.set_dual_ssrc(true);
+        srv.set_dual_ssrc(true);
+
+        let mut wbuf = [0u8; 2048];
+        let mut rbuf = [0u8; 2048];
+        let mut audio_cnt = 0usize;
+        let mut video_cnt = 0usize;
+        let mut prev_marked_video_ts: Option<u32> = None;
+        for _ in 0..20 {
+            let small = [0x77u8; 80];
+            let wn = cli.wrap_into(&small, &mut wbuf).unwrap();
+            let pt = wbuf[1] & 0x7F;
+            let m = (wbuf[1] & 0x80) != 0;
+            let ts = u32::from_be_bytes([wbuf[4], wbuf[5], wbuf[6], wbuf[7]]);
+            if pt == RTP_AUDIO_PT {
+                audio_cnt += 1;
+            } else {
+                assert_eq!(pt, RTP_VIDEO_PT);
+                video_cnt += 1;
+                if let Some(closed_ts) = prev_marked_video_ts {
+                    assert_ne!(ts, closed_ts, "Video packet after M=1 MUST NEVER reuse closed timestamp!");
+                }
+                if m {
+                    prev_marked_video_ts = Some(ts);
+                }
+            }
+            assert_eq!(srv.unwrap_into(&wbuf[..wn], &mut rbuf), Some(80));
+        }
+        assert!(audio_cnt >= 1 && audio_cnt <= 2, "Opus cap MUST limit burst to <=1 pkt/20ms (got {})", audio_cnt);
+        assert!(video_cnt >= 18, "Overflow small ACKs MUST spill onto Video SSRC (got {})", video_cnt);
+
+        // 7. Audio-only SRTCP reports on Audio SSRC with 0-based index & verifies cleanly on peer
+        let mut cli2 = SrtpCloakCipher::new(&key, 0x1122_3344, 0x5566_7788, true, CipherSuite::Aes128Gcm);
+        let mut srv2 = SrtpCloakCipher::new(&key, 0x5566_7788, 0x1122_3344, false, CipherSuite::Aes128Gcm);
+        cli2.set_dual_ssrc(true);
+        srv2.set_dual_ssrc(true);
+        let wn = cli2.wrap_into(&[0x33u8; 64], &mut wbuf).unwrap();
+        assert_eq!(wbuf[1] & 0x7F, RTP_AUDIO_PT);
+        assert_eq!(srv2.unwrap_into(&wbuf[..wn], &mut rbuf), Some(64));
+        let rtcp = cli2.build_srtcp(false, true, false);
+        assert_eq!(rtcp[1], 200); // SR on Audio SSRC!
+        assert_eq!(u32::from_be_bytes([rtcp[4], rtcp[5], rtcp[6], rtcp[7]]), cli2.audio_ssrc_tx);
+        assert_eq!(&rtcp[rtcp.len() - 4..], &0x8000_0000u32.to_be_bytes()); // 0-based SRTCP index!
+        assert_eq!(srv2.verify_srtcp(&rtcp), Some(false));
+        assert_eq!(srv2.verify_srtcp(&rtcp), None); // replay blocked!
     }
 }

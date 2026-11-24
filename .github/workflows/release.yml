@@ -196,7 +196,7 @@ jobs:
           tag = sys.argv[1]
           notes = f"""## WebRTC-Cloak {tag} (Production-Freeze)
 
-          Pure-Rust, zero-C-dependency RFC 7983 WebRTC (ICE STUN + DTLS 1.2 `dimpl` + Chrome `0x90` SRTP + Compound SRTCP) single-port UDP encapsulation research prototype.
+          Pure-Rust, zero-C-dependency RFC 7983 WebRTC (ICE STUN + DTLS 1.3/1.2 `dimpl` + Dual-SSRC Chrome `0x90` SRTP + Compound SRTCP) single-port UDP encapsulation research prototype.
 
           ### Included Platforms (16 OS / Arch Builds)
           - **Linux Static musl (zero libc/C dependency)**: `x86_64`, `aarch64`, `armv7hf`, `armv7`, `armhf`, `arm`, `armv5te`, `i686`, `riscv64`, `loongarch64`, `powerpc64le`
@@ -205,15 +205,16 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
-          - **Dual-mode 12-scenario `webrtc-cloak selftest` suite** (`--server-host` live remote mode + `--local` offline fault-injection sandbox, `--cipher`, `--mtu`, `--count`, `--no-probe`, `--no-color`, `--json`):
-            - **Live Remote Mode**: directly audits any running `webrtc-cloak server` over the real Internet (WAN STUN + NAT mapping, 6-flight DTLS 1.2 handshake, Consent RTT/jitter/loss, `SeenTxidCache` retransmit, server Compound SRTCP downlink, in-band encrypted `0xFFFE` SRTP data-plane echo & real WAN Path MTU probing with zero backend interference, 5-tuple rotation & NAT behavior check, 7-vector live Silent-Drop audit, graceful teardown)
-            - **Local Sandbox + CPU Bench**: synthetic blackhole / restart / 35% reorder + 30% duplicate fault-injection lab, plus single-core 3-suite AEAD, all-core scaling, and P-256 ephemeral cert generation benchmarks
-          - **In-band AEAD-encrypted SRTP probe echo (`0xFFFE`)** in `server` (strictly Ready-gated, 1:1 size, zero wire fingerprint difference, never forwarded to backend)
-          - Real 6-flight mutual-certificate ECDSA P-256 DTLS 1.2 (`dimpl 0.9.0`) with Hybrid PFS (`PSK + ECDHE KeyingMaterial`)
-          - Chrome `0x90` (`P=0, X=1, 0xBEDE`) SRTP with inside-AEAD random padding, 2048-packet RFC 6479 replay window & wall-clock 90 kHz timestamps
-          - RFC 3550 compliant Compound SRTCP (`PT=200/201`, encrypted trailing `BYE`), 64-bit sliding anti-replay window, `Closing(250ms)` drain
-          - Default single-threaded `mio` reactor (`--workers 1`, 900+ Mbps on N5105), optional multi-worker `--workers <N|auto>`
-          - Strict RFC 7675 bidirectional STUN consent freshness & silent 5-tuple rotation on asymmetric uplink blackholes or server restarts
+          - **RFC 9147 DTLS 1.3 + DTLS 1.2 Auto-Sense (`dimpl 0.9.0`) & Anti-Downgrade Lock**:
+            - Encrypts mutual ECDSA P-256 certificates inside `0x2e` Unified Ciphertext records and cuts 1 full RTT off WAN handshakes while staying 100% rolling-upgrade compatible with `v0.3.5` DTLS 1.2 peers
+            - Optional `--dtls-min-version 1.3` locks `Dtls::new_13` to eliminate downgrade exposure once both ends run `v0.3.6+`; pre-built multi-MTU `DtlsConfig` pool randomizes ClientHello sizes with zero runtime validation cost; Ready-state Flight 5 retransmit driver prevents single-packet handshake blackholes
+          - **Dual-SSRC Audio/Video SRTP (`PT=111` Opus + `PT=96` Video) & Orthogonal Nonce Domains**:
+            - Jittered small-packet routing (`180..307B`) with RFC 7587 `<= 50 pps` Opus rate cap (overflow ACKs spill smoothly to `PT=96`), strict RFC 3550 Video `M=1` end-of-frame timestamp causality, shared global `0xBEDE` TWCC sequence, and independent 2048-packet RFC 6479 replay rings
+            - Fail-Closed Hybrid PFS (`PSK + ECDHE KeyingMaterial`), high-16-bit disjoint Audio/Video SSRCs + `dir | 0x40` / `dir | 0x80` Nonce domain separation, and sequence exhaustion guard
+          - **Hardened State Machines & Compound SRTCP**:
+            - Zero-alloc pre-auth STUN parser, `Ready`-state DTLS liveness isolation, strict `ServerHello` framing checks, Make-Before-Break `Closing` drain (zero ICMP bounce), adaptive blackhole retry damping, 0-based SRTCP index with session-constant CNAME and dual-SSRC reporting
+          - **Dual-mode 12-scenario `webrtc-cloak selftest` suite** (`--server-host` live remote mode with in-band `0xFFFE` SRTP probe echo + `--local` offline fault-injection sandbox + CPU crypto/P-256 benchmarks)
+          - Default single-threaded `mio` reactor (`--workers 1`), optional multi-worker `--workers <N|auto>`, 32-bit safe arithmetic across all 16 build targets
 
           > **Disclaimer**: Strictly for network protocol learning, academic research, and authorized testing under the MIT License.
           """

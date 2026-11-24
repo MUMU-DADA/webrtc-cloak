@@ -1,19 +1,21 @@
-//! mio-based zero-allocation webrtc-cloak V3.1 client (Production Freeze):
+//! mio-based zero-allocation webrtc-cloak V3.2 client (Hardened):
 //!   - RFC 8445 / 7675 STUN ICE (4:4 Base64 ufrag, session-constant tie-breaker & priority,
-//!     5s±20% Consent Freshness keepalive, strict MI-then-FP parsing)
-//!   - Real RFC 6347 DTLS 1.2 via `dimpl` (3-suite Chrome ClientHello, mutual rotating P-256 certs,
-//!     strict record pre-validation + Ready gating + flight-5-bound ServerHello suite extraction)
-//!   - RFC 3550/7714/8285 SRTP (0x90 header, 0xBEDE ext, encrypted inner length+padding, pure 90kHz clock)
-//!   - RFC 3550 §6.1 / 7714 §9.1 Compound SRTCP + Closing(250ms) drain (zero ICMP bounce)
+//!     5s±20% Consent Freshness keepalive, zero-alloc pre-auth strict MI-then-FP parsing)
+//!   - Real RFC 9147 DTLS 1.3 + RFC 6347 DTLS 1.2 via `dimpl 0.9.0` (multi-MTU ClientHello pool,
+//!     mutual rotating P-256 certs, encrypted DTLS 1.3 certs, optional `--dtls-min-version 1.3`,
+//!     Fail-Closed Hybrid PFS, Flight 5 Ready-state retransmit driver, fail-fast handshake reset)
+//!   - RFC 3550/7714/8285 Dual-SSRC SRTP (PT=111 <=50pps Opus + PT=96 strict M=1 video, 0xBEDE TWCC)
+//!   - RFC 3550 §6.1 / 7714 §9.1 Compound SRTCP + Make-Before-Break Closing drain (zero ICMP bounce)
 
 use crate::protocol::{
-    build_dimpl_config, build_ice_stun_request, combine_session_key, demux_rfc7983,
+    build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite, jitter_duration_ms,
-    make_fresh_stun_txid, parse_stun, rand_duration_range_ms, resolve_srtp_suite,
-    validate_dtls_datagram, CertCache, CipherPref, CipherSuite, PacketKind, SessionIceParams,
-    SrtpCloakCipher, MAX_INNER_UDP_LEN, STUN_BINDING_SUCCESS,
+    make_fresh_stun_txid, new_dtls_instance, parse_stun_with_key, rand_duration_range_ms,
+    resolve_srtp_suite, stun_hmac_key, validate_dtls_datagram, CertCache, CipherPref, CipherSuite,
+    DtlsConfigPool, DtlsMinVersion, PacketKind, SessionIceParams, SrtpCloakCipher,
+    MAX_INNER_UDP_LEN, STUN_BINDING_SUCCESS,
 };
-use dimpl::{Config as DtlsConfig, Dtls, Output as DtlsOutput};
+use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
 use socket2::{Domain, Protocol, Socket, Type};
@@ -39,6 +41,10 @@ const MAX_DRAINING_SESSIONS: usize = 16;
 const ACTIVE_ROTATE_WINDOW_SECS: u64 = 30;
 /// RFC 5389 §7.2.1 STUN consent retries (1 initial + 2 same-txid retransmits = 3 attempts, ~4.7s).
 const KA_MAX_RETRIES: u8 = 2;
+/// Elevated retry count after a recent rotation (<60s) to damp flapping on 20%+ random-loss links.
+const KA_MAX_RETRIES_DAMPED: u8 = 4;
+const MAX_PENDING_BYTES: usize = 256 * 1024;
+const MAX_DTLS_RESETS: u8 = 3;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -47,6 +53,7 @@ pub struct ClientConfig {
     pub psk: Vec<u8>,
     pub cipher_pref: CipherPref,
     pub dtls_decoy: bool,
+    pub dtls_min_version: DtlsMinVersion,
     pub workers: usize,
     pub max_sessions: usize,
     pub wan_mtu: usize,
@@ -87,17 +94,20 @@ struct ClientSession {
     ka_txid: Option<[u8; 12]>,
     ka_pkt: Vec<u8>,
     ka_retries: u8,
+    ka_max_retries: u8,
     ka_rto_at: Option<Instant>,
     stun_key: Option<[u8; 32]>,
     ssrc_c2s: u32,
     ssrc_s2c: u32,
     dtls: Option<Dtls>,
+    dtls_resets: u8,
     pending_sh_suite: Option<u16>,
     dtls_suite_id: Option<u16>,
     dtls_km: Option<Vec<u8>>,
     active_cipher: Option<CipherSuite>,
     cipher: Option<SrtpCloakCipher>,
     pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
     tx_pkts: u64,
     tx_pkts_at_last_rtcp: u64,
     tx_bytes: u64,
@@ -113,6 +123,7 @@ fn make_udp_socket(
     bind_addr: SocketAddr,
     connect_to: Option<SocketAddr>,
     reuse_port: bool,
+    buf_bytes: usize,
 ) -> std::io::Result<MioUdpSocket> {
     let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
     let _ = sock.set_reuse_address(true);
@@ -122,8 +133,8 @@ fn make_udp_socket(
     }
     #[cfg(not(unix))]
     let _ = reuse_port;
-    let _ = sock.set_recv_buffer_size(8 * 1024 * 1024);
-    let _ = sock.set_send_buffer_size(8 * 1024 * 1024);
+    let _ = sock.set_recv_buffer_size(buf_bytes);
+    let _ = sock.set_send_buffer_size(buf_bytes);
     sock.set_nonblocking(true)?;
     sock.bind(&bind_addr.into())?;
     if let Some(target) = connect_to {
@@ -149,7 +160,7 @@ fn drain_client_dtls(
     now: Instant,
     candidate_sh_suite: Option<u16>,
 ) -> bool {
-    if sess.dtls_suite_id.is_none() {
+    if sess.dtls_suite_id.is_none() && sess.pending_sh_suite.is_none() {
         if let Some(cs) = candidate_sh_suite {
             sess.pending_sh_suite = Some(cs);
         }
@@ -203,8 +214,23 @@ fn drain_client_dtls(
 
     if connected_now && sess.state == HandshakeState::DtlsHandshake {
         if let Some(stun_key) = sess.stun_key {
+            let Some(km) = sess.dtls_km.as_deref().filter(|k| !k.is_empty()) else {
+                log(
+                    worker_id,
+                    &format!(
+                        "DTLS Connected without SRTP KeyingMaterial up_sport={} (Fail-Closed!)",
+                        sess.local_port
+                    ),
+                );
+                return true;
+            };
+            let is_dtls13 = sess
+                .dtls
+                .as_ref()
+                .and_then(|d| d.protocol_version())
+                == Some(ProtocolVersion::DTLS1_3);
             let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
-            let final_key = combine_session_key(&stun_key, sess.dtls_km.as_deref());
+            let final_key = combine_session_key(&stun_key, Some(km));
             sess.active_cipher = Some(chosen);
             let mut c = SrtpCloakCipher::new(
                 &final_key,
@@ -214,6 +240,7 @@ fn drain_client_dtls(
                 chosen,
             );
             c.set_wan_mtu(cfg.wan_mtu);
+            c.set_dual_ssrc(is_dtls13);
             sess.cipher = Some(c);
             sess.state = HandshakeState::Ready;
             sess.ready_at = Some(now);
@@ -226,6 +253,7 @@ fn drain_client_dtls(
             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
 
             let mut flushed = 0usize;
+            sess.pending_bytes = 0;
             if let Some(ref mut cipher) = sess.cipher {
                 while let Some(raw) = sess.pending.pop_front() {
                     if let Some(wn) = cipher.wrap_into(&raw, wbuf) {
@@ -241,9 +269,11 @@ fn drain_client_dtls(
             log(
                 worker_id,
                 &format!(
-                    "DTLS 1.2 (dimpl mutual-cert PFS) OK -> READY up_sport={} cipher={} total_hs={:.2}ms flushed={}",
+                    "DTLS {} (dimpl mutual-cert PFS) OK -> READY up_sport={} cipher={} dual_ssrc={} total_hs={:.2}ms flushed={}",
+                    if is_dtls13 { "1.3" } else { "1.2" },
                     sess.local_port,
                     chosen.name(),
+                    is_dtls13,
                     total_ms,
                     flushed
                 ),
@@ -257,7 +287,7 @@ fn drain_client_dtls(
 fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
     if sess.state == HandshakeState::Ready {
         let has_rx = sess.rx_pkts > 0;
-        let is_sender = sess.tx_pkts > 0;
+        let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
         if let Some(ref mut cipher) = sess.cipher {
             let bye = cipher.build_srtcp(has_rx, is_sender, true);
             let _ = sess.upstream.send(&bye);
@@ -282,14 +312,15 @@ fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
 pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
-    let dtls_cfg = build_dimpl_config(cfg.cipher_pref, &cpu, true);
+    let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, true, cfg.wan_mtu);
     if !cfg.quiet {
         println!(
-            "[client-rs] V3.1 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-1.2(3-suite,mutual-cert,pfs)",
+            "[client-rs] V3.2 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs)",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
-            workers
+            workers,
+            cfg.dtls_min_version.as_str()
         );
     }
     #[cfg(not(target_os = "linux"))]
@@ -298,20 +329,20 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     }
 
     if workers == 1 {
-        return run_client_worker(0, cfg, false, dtls_cfg);
+        return run_client_worker(0, cfg, false, dtls_pool);
     }
 
     let mut handles = Vec::with_capacity(workers - 1);
     for wid in 1..workers {
         let c = cfg.clone();
-        let dc = Arc::clone(&dtls_cfg);
+        let dp = dtls_pool.clone();
         handles.push(std::thread::spawn(move || {
-            if let Err(e) = run_client_worker(wid, c, true, dc) {
+            if let Err(e) = run_client_worker(wid, c, true, dp) {
                 eprintln!("[client-rs#{}] error: {}", wid, e);
             }
         }));
     }
-    let res = run_client_worker(0, cfg, true, dtls_cfg);
+    let res = run_client_worker(0, cfg, true, dtls_pool);
     for h in handles {
         let _ = h.join();
     }
@@ -332,6 +363,7 @@ fn spawn_client_session(
     retry_dur: Duration,
     ka_base_ms: u64,
     idle_dur: Duration,
+    ka_max_retries: u8,
 ) -> Option<Token> {
     // Bound silent receive-only draining sockets so prolonged blackholes cannot leak FDs.
     let mut draining: Vec<(Token, Instant)> = sessions_by_token
@@ -385,7 +417,7 @@ fn spawn_client_session(
     }
 
     let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false) {
+    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, 2 * 1024 * 1024) {
         Ok(s) => s,
         Err(e) => {
             log(worker_id, &format!("upstream socket error: {}", e));
@@ -394,7 +426,10 @@ fn spawn_client_session(
     };
     let local_port = up.local_addr().map(|a| a.port()).unwrap_or(0);
     let tok = Token(*next_token_id);
-    *next_token_id += 1;
+    *next_token_id = next_token_id.wrapping_add(1);
+    if *next_token_id == 0 {
+        *next_token_id = 1;
+    }
     if poll.registry().register(&mut up, tok, Interest::READABLE).is_err() {
         return None;
     }
@@ -430,17 +465,20 @@ fn spawn_client_session(
         ka_txid: None,
         ka_pkt: Vec::new(),
         ka_retries: 0,
+        ka_max_retries,
         ka_rto_at: None,
         stun_key: None,
         ssrc_c2s: 0,
         ssrc_s2c: 0,
         dtls: None,
+        dtls_resets: 0,
         pending_sh_suite: None,
         dtls_suite_id: None,
         dtls_km: None,
         active_cipher: None,
         cipher: None,
         pending: VecDeque::with_capacity(64),
+        pending_bytes: 0,
         tx_pkts: 0,
         tx_pkts_at_last_rtcp: 0,
         tx_bytes: 0,
@@ -460,20 +498,27 @@ fn run_client_worker(
     worker_id: usize,
     cfg: ClientConfig,
     reuse_port: bool,
-    dtls_cfg: Arc<DtlsConfig>,
+    dtls_pool: DtlsConfigPool,
 ) -> std::io::Result<()> {
     CLIENT_QUIET.with(|q| q.set(cfg.quiet));
     let mut poll = Poll::new()?;
     let mut events = Events::with_capacity(256);
 
-    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port)?;
+    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, 8 * 1024 * 1024)?;
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
 
     let mut sessions_by_token: HashMap<Token, ClientSession> = HashMap::new();
     let mut token_by_client: HashMap<SocketAddr, Token> = HashMap::new();
+    let mut last_rotation_by_client: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut next_token_id: usize = 1;
     let mut cert_cache = CertCache::new();
+    let stun_mi_key = stun_hmac_key(&cfg.psk);
+    let max_inner_pending = if cfg.wan_mtu > 0 {
+        cfg.wan_mtu.saturating_sub(28 + 38).min(MAX_INNER_UDP_LEN)
+    } else {
+        MAX_INNER_UDP_LEN
+    };
 
     let mut rbuf = vec![0u8; 65536];
     let mut wbuf = vec![0u8; 65536 + 128];
@@ -556,6 +601,89 @@ fn run_client_worker(
                     }
                 }
                 HandshakeState::Ready => {
+                    // H-01 fix: DTLS 1.3 Client emits Output::Connected upon sending Flight 5 (Cert+CV+Fin)
+                    // while keeping its Flight 5 retransmission timer armed until server ACK arrives.
+                    // Drive near-term (<60s) dtls_next_timeout in Ready state so a single lost Flight 5
+                    // recovers within ~350ms instead of stalling 25s!
+                    if let Some(t) = sess.dtls_next_timeout {
+                        let rem = t.saturating_duration_since(now);
+                        if rem > Duration::from_secs(60) {
+                            // dimpl entered 10-year IDLE_INTERVAL after receiving server ACK
+                            sess.dtls_next_timeout = None;
+                        } else if now >= t {
+                            let err = if let Some(ref mut dtls) = sess.dtls {
+                                dtls.handle_timeout(now).is_err()
+                            } else {
+                                true
+                            };
+                            if err {
+                                if sess.rx_pkts > 0 || sess.srtcp_rx > 0 {
+                                    // Server is already Ready (only server's DTLS 1.3 ACK packet was lost)
+                                    sess.dtls_next_timeout = None;
+                                } else {
+                                    log(
+                                        worker_id,
+                                        &format!(
+                                            "DTLS 1.3 Flight 5 unacknowledged (0 rx) up_sport={} -> rotating",
+                                            sess.local_port
+                                        ),
+                                    );
+                                    sess.dtls_next_timeout = None;
+                                    sess.state = HandshakeState::Closing(
+                                        now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                    );
+                                    to_rotate.push((tok, sess.client_addr, true));
+                                    continue;
+                                }
+                            } else if drain_client_dtls(
+                                worker_id,
+                                sess,
+                                &mut dtls_buf,
+                                &mut wbuf,
+                                &cfg,
+                                &cpu,
+                                now,
+                                None,
+                            ) {
+                                sess.state = HandshakeState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                );
+                                continue;
+                            }
+                        } else if rem < wait {
+                            wait = rem.max(Duration::from_millis(5));
+                        }
+                    }
+
+                    // Sequence/Nonce exhaustion or silent data-plane deadlock guard (e.g. --keepalive 0)
+                    let seq_exhausted = sess
+                        .cipher
+                        .as_ref()
+                        .map(|c| c.is_seq_exhausted())
+                        .unwrap_or(false);
+                    let dl_deadlock = sess.tx_pkts >= 3
+                        && sess.rx_pkts == 0
+                        && sess.srtcp_rx == 0
+                        && sess
+                            .ready_at
+                            .map(|r| now.duration_since(r) > Duration::from_secs(15))
+                            .unwrap_or(false);
+                    if seq_exhausted || dl_deadlock {
+                        log(
+                            worker_id,
+                            &format!(
+                                "{} up_sport={} -> rotating to fresh session",
+                                if seq_exhausted { "SRTP/SRTCP seq ceiling reached" } else { "Zero authenticated downlink SRTP/SRTCP after 15s" },
+                                sess.local_port
+                            ),
+                        );
+                        graceful_teardown_client(sess, &mut dtls_buf);
+                        sess.state =
+                            HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+                        to_rotate.push((tok, sess.client_addr, true));
+                        continue;
+                    }
+
                     if now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_client(sess, &mut dtls_buf);
                         sess.state = HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
@@ -568,7 +696,7 @@ fn run_client_worker(
                         if sess.ka_txid.is_some() {
                             if let Some(rto_at) = sess.ka_rto_at {
                                 if now >= rto_at {
-                                    if sess.ka_retries < KA_MAX_RETRIES {
+                                    if sess.ka_retries < sess.ka_max_retries {
                                         sess.ka_retries += 1;
                                         // Retransmit the EXACT same STUN transaction (same txid) with
                                         // jittered exponential RTO backoff matching RFC 5389 / libwebrtc.
@@ -586,8 +714,8 @@ fn run_client_worker(
                                             worker_id,
                                             &format!(
                                                 "RFC 7675 consent lost ({}/{} STUN unanswered) client={} up_sport={} -> draining {}s{}",
-                                                KA_MAX_RETRIES + 1,
-                                                KA_MAX_RETRIES + 1,
+                                                sess.ka_max_retries + 1,
+                                                sess.ka_max_retries + 1,
                                                 sess.client_addr,
                                                 sess.local_port,
                                                 BLACKHOLE_DRAIN_SECS,
@@ -655,6 +783,19 @@ fn run_client_worker(
             if token_by_client.get(&client_addr) == Some(&old_tok) {
                 token_by_client.remove(&client_addr);
             }
+            let recently_rotated = last_rotation_by_client
+                .get(&client_addr)
+                .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+                .unwrap_or(false);
+            last_rotation_by_client.insert(client_addr, now);
+            if last_rotation_by_client.len() > 1024 {
+                last_rotation_by_client.retain(|_, &mut t| now.duration_since(t) < Duration::from_secs(60));
+            }
+            let next_ka_retries = if recently_rotated {
+                KA_MAX_RETRIES_DAMPED
+            } else {
+                KA_MAX_RETRIES
+            };
             if active_recently {
                 let _ = spawn_client_session(
                     worker_id,
@@ -669,6 +810,7 @@ fn run_client_worker(
                     retry_dur,
                     ka_base_ms,
                     idle_dur,
+                    next_ka_retries,
                 );
             }
         }
@@ -727,6 +869,15 @@ fn run_client_worker(
                     let tok = if let Some(&existing) = token_by_client.get(&client_addr) {
                         existing
                     } else {
+                        let recently_rotated = last_rotation_by_client
+                            .get(&client_addr)
+                            .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+                            .unwrap_or(false);
+                        let ka_retries = if recently_rotated {
+                            KA_MAX_RETRIES_DAMPED
+                        } else {
+                            KA_MAX_RETRIES
+                        };
                         match spawn_client_session(
                             worker_id,
                             client_addr,
@@ -740,6 +891,7 @@ fn run_client_worker(
                             retry_dur,
                             ka_base_ms,
                             idle_dur,
+                            ka_retries,
                         ) {
                             Some(t) => t,
                             None => continue,
@@ -749,8 +901,12 @@ fn run_client_worker(
                     if let Some(sess) = sessions_by_token.get_mut(&tok) {
                         sess.last_data_active = now;
                         if sess.state != HandshakeState::Ready {
-                            if sess.pending.len() < 256 {
+                            if n <= max_inner_pending
+                                && sess.pending.len() < 256
+                                && sess.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                            {
                                 sess.pending.push_back(rbuf[..n].to_vec());
+                                sess.pending_bytes += n;
                             }
                         } else if let Some(ref mut cipher) = sess.cipher {
                             if let Some(wn) = cipher.wrap_into(&rbuf[..n], &mut wbuf) {
@@ -769,15 +925,26 @@ fn run_client_worker(
                         Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                         Err(_) => break,
                     };
+                    let pkt = &rbuf[..n];
                     if matches!(sess.state, HandshakeState::Closing(_)) {
-                        // Silently absorb trailing close_notify/BYE to avoid ICMP Port Unreachable!
+                        // Make-Before-Break silent drain (P1-5): still deliver authenticated in-flight
+                        // downlink SRTP to local app while transmitting ZERO packets to WAN (zero ICMP bounce!).
+                        if demux_rfc7983(pkt) == PacketKind::Srtp {
+                            if let Some(ref mut cipher) = sess.cipher {
+                                if let Some(pn) = cipher.unwrap_into(pkt, &mut wbuf) {
+                                    if listen_sock.send_to(&wbuf[..pn], sess.client_addr).is_ok() {
+                                        sess.rx_pkts += 1;
+                                        sess.rx_bytes += pn as u64;
+                                    }
+                                }
+                            }
+                        }
                         continue;
                     }
-                    let pkt = &rbuf[..n];
 
                     match demux_rfc7983(pkt) {
                         PacketKind::Stun => {
-                            if let Some(parsed) = parse_stun(pkt, &cfg.psk) {
+                            if let Some(parsed) = parse_stun_with_key(pkt, &cfg.psk, &stun_mi_key) {
                                 if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
                                     if sess.state == HandshakeState::StunWait && parsed.txid == sess.stun_txid {
                                         let rtt_ms = sess.created_at.elapsed().as_secs_f64() * 1000.0;
@@ -800,7 +967,12 @@ fn run_client_worker(
                                         );
                                         if cfg.dtls_decoy {
                                             let cert = cert_cache.get(now);
-                                            let mut dtls = Dtls::new_12(Arc::clone(&dtls_cfg), cert, now);
+                                            let mut dtls = new_dtls_instance(
+                                                cfg.dtls_min_version,
+                                                dtls_pool.pick(),
+                                                cert,
+                                                now,
+                                            );
                                             dtls.set_active(true);
                                             let _ = dtls.handle_timeout(now);
                                             sess.dtls = Some(dtls);
@@ -834,6 +1006,7 @@ fn run_client_worker(
                                             sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
                                             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
                                             let mut flushed = 0usize;
+                                            sess.pending_bytes = 0;
                                             if let Some(ref mut cipher) = sess.cipher {
                                                 while let Some(raw) = sess.pending.pop_front() {
                                                     if let Some(wn) = cipher.wrap_into(&raw, &mut wbuf) {
@@ -873,7 +1046,7 @@ fn run_client_worker(
                             }
                         }
                         PacketKind::Dtls => {
-                            // V3-H-01 fix: strict DTLS pre-validation + Ready gating + NEVER kill on handle_packet Err!
+                            // V3.2: strict DTLS pre-validation + Ready gating + Fail-Fast reset in DtlsHandshake
                             let ready_only_alert = sess.state == HandshakeState::Ready
                                 && sess
                                     .ready_at
@@ -890,7 +1063,9 @@ fn run_client_worker(
                             };
                             let mut dtls_err = false;
                             if let Some(ref mut dtls) = sess.dtls {
-                                let _ = dtls.handle_timeout(now);
+                                if sess.dtls_next_timeout.map(|t| now >= t).unwrap_or(false) {
+                                    let _ = dtls.handle_timeout(now);
+                                }
                                 if dtls.handle_packet(pkt).is_err() {
                                     dtls_err = true;
                                 }
@@ -903,6 +1078,40 @@ fn run_client_worker(
                                 if sess.state == HandshakeState::Ready {
                                     // Keep established SRTP tunnel alive; drop corrupted DTLS handle only
                                     sess.dtls = None;
+                                    sess.dtls_next_timeout = None;
+                                } else if sess.state == HandshakeState::DtlsHandshake {
+                                    // P0-4: dimpl Err during handshake means transcript/state is fatally poisoned.
+                                    // Fail-fast reset (up to MAX_DTLS_RESETS) instead of stalling 12s!
+                                    if sess.dtls_resets < MAX_DTLS_RESETS {
+                                        sess.dtls_resets += 1;
+                                        sess.pending_sh_suite = None;
+                                        sess.dtls_suite_id = None;
+                                        sess.dtls_km = None;
+                                        let cert = cert_cache.get(now);
+                                        let mut fresh = new_dtls_instance(
+                                            cfg.dtls_min_version,
+                                            dtls_pool.pick(),
+                                            cert,
+                                            now,
+                                        );
+                                        fresh.set_active(true);
+                                        let _ = fresh.handle_timeout(now);
+                                        sess.dtls = Some(fresh);
+                                        let _ = drain_client_dtls(
+                                            worker_id,
+                                            sess,
+                                            &mut dtls_buf,
+                                            &mut wbuf,
+                                            &cfg,
+                                            &cpu,
+                                            now,
+                                            None,
+                                        );
+                                    } else {
+                                        sess.state = HandshakeState::Closing(
+                                            now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                        );
+                                    }
                                 }
                                 continue;
                             }
@@ -1033,6 +1242,7 @@ mod tests {
                 psk: srv_psk,
                 cipher_pref: CipherPref::Auto,
                 dtls_required: true,
+                dtls_min_version: DtlsMinVersion::Auto,
                 workers: 1,
                 max_sessions: 64,
                 wan_mtu: 1488,
@@ -1148,6 +1358,7 @@ mod tests {
                 psk: cli_psk,
                 cipher_pref: CipherPref::Auto,
                 dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::Auto,
                 workers: 1,
                 max_sessions: 64,
                 wan_mtu: 1488,
@@ -1231,6 +1442,127 @@ mod tests {
         assert!(
             downlink_srtcp_during_blackhole.load(Ordering::SeqCst) >= 1,
             "test should verify server was still sending downlink SRTCP during asymmetric blackhole"
+        );
+    }
+
+    /// H-01 regression test: drop the client's DTLS 1.3 Flight 5 (0x2e encrypted Cert+CV+Fin) packet
+    /// ONCE on the wire — client is ALREADY in HandshakeState::Ready and MUST drive dtls_next_timeout
+    /// to retransmit Flight 5 and complete the tunnel within ~1.5s (not 25s blackout!).
+    #[test]
+    fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
+        let psk = b"v036-h01-flight5-loss-regression-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                    let _ = echo_sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        // Relay that drops the VERY FIRST client->server DTLS 1.3 Unified Ciphertext packet (0x20..=0x3F = Flight 5!)
+        let dropped_f5 = Arc::new(AtomicBool::new(false));
+        let relay_dropped_f5 = Arc::clone(&dropped_f5);
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let usock = UdpSocket::bind("127.0.0.1:0").unwrap();
+            usock.set_nonblocking(true).unwrap();
+            usock.connect(srv_addr).unwrap();
+            let mut cli_addr: Option<SocketAddr> = None;
+            let mut buf = [0u8; 4096];
+            loop {
+                while let Ok((n, peer)) = relay_front.recv_from(&mut buf) {
+                    cli_addr = Some(peer);
+                    let pkt = &buf[..n];
+                    // Drop the first DTLS 1.3 Unified Ciphertext (b0 in 0x20..=0x3F) from client = Flight 5!
+                    if !pkt.is_empty()
+                        && (pkt[0] & 0xE0) == 0x20
+                        && !relay_dropped_f5.swap(true, Ordering::SeqCst)
+                    {
+                        continue;
+                    }
+                    let _ = usock.send(pkt);
+                }
+                if let Some(ca) = cli_addr {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], ca);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: 1488,
+                retry_ms: 200,
+                max_retries: 8,
+                keepalive_secs: 5,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        thread::sleep(Duration::from_millis(80));
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+
+        let t0 = Instant::now();
+        let mut ok = false;
+        let mut rbuf = [0u8; 256];
+        while t0.elapsed() < Duration::from_secs(3) {
+            let _ = app.send(b"PING_F5_RECOVER");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PING_F5_RECOVER" {
+                    ok = true;
+                    break;
+                }
+            }
+        }
+        assert!(dropped_f5.load(Ordering::SeqCst), "relay should have intercepted DTLS 1.3 Flight 5");
+        assert!(
+            ok,
+            "client MUST retransmit dropped DTLS 1.3 Flight 5 from Ready state and recover within 3s!"
         );
     }
 }
