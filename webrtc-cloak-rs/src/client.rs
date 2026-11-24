@@ -54,6 +54,8 @@ pub struct ClientConfig {
     pub cipher_pref: CipherPref,
     pub dtls_decoy: bool,
     pub dtls_min_version: DtlsMinVersion,
+    /// Optional proactive Make-Before-Break 5-tuple rotation interval in seconds (`0` = disabled).
+    pub rotate_interval_secs: u64,
     pub workers: usize,
     pub max_sessions: usize,
     pub wan_mtu: usize,
@@ -89,6 +91,9 @@ struct ClientSession {
     next_keepalive_at: Instant,
     next_srtcp_at: Instant,
     dtls_next_timeout: Option<Instant>,
+    is_standby: bool,
+    standby_spawned: bool,
+    rotate_at: Option<Instant>,
     retries: u32,
     /// In-flight RFC 7675 STUN consent check transaction (RFC 5389 §7.2.1 same-txid retransmission).
     ka_txid: Option<[u8; 12]>,
@@ -251,6 +256,9 @@ fn drain_client_dtls(
             sess.ka_rto_at = None;
             sess.next_keepalive_at = now + jitter_duration_ms(cfg.keepalive_secs * 1000);
             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
+            if cfg.rotate_interval_secs > 0 && !sess.is_standby {
+                sess.rotate_at = Some(now + jitter_duration_ms(cfg.rotate_interval_secs * 1000));
+            }
 
             let mut flushed = 0usize;
             sess.pending_bytes = 0;
@@ -357,6 +365,7 @@ fn spawn_client_session(
     poll: &mut Poll,
     sessions_by_token: &mut HashMap<Token, ClientSession>,
     token_by_client: &mut HashMap<SocketAddr, Token>,
+    standby_by_client: &mut HashMap<SocketAddr, Token>,
     next_token_id: &mut usize,
     dtls_buf: &mut Vec<u8>,
     now: Instant,
@@ -364,6 +373,7 @@ fn spawn_client_session(
     ka_base_ms: u64,
     idle_dur: Duration,
     ka_max_retries: u8,
+    is_standby: bool,
 ) -> Option<Token> {
     // Bound silent receive-only draining sockets so prolonged blackholes cannot leak FDs.
     let mut draining: Vec<(Token, Instant)> = sessions_by_token
@@ -441,8 +451,12 @@ fn spawn_client_session(
     log(
         worker_id,
         &format!(
-            "new session client={} -> up_sport={} target={} ufrag={}",
-            client_addr, local_port, cfg.server_addr, ice.username()
+            "new {}session client={} -> up_sport={} target={} ufrag={}",
+            if is_standby { "standby(MBB) " } else { "" },
+            client_addr,
+            local_port,
+            cfg.server_addr,
+            ice.username()
         ),
     );
 
@@ -461,6 +475,9 @@ fn spawn_client_session(
         next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
         next_srtcp_at: now + rand_duration_range_ms(250, 600),
         dtls_next_timeout: None,
+        is_standby,
+        standby_spawned: false,
+        rotate_at: None,
         retries: 0,
         ka_txid: None,
         ka_pkt: Vec::new(),
@@ -489,7 +506,11 @@ fn spawn_client_session(
         srtcp_rx: 0,
         auth_drops: 0,
     };
-    token_by_client.insert(client_addr, tok);
+    if is_standby {
+        standby_by_client.insert(client_addr, tok);
+    } else {
+        token_by_client.insert(client_addr, tok);
+    }
     sessions_by_token.insert(tok, sess);
     Some(tok)
 }
@@ -510,6 +531,7 @@ fn run_client_worker(
 
     let mut sessions_by_token: HashMap<Token, ClientSession> = HashMap::new();
     let mut token_by_client: HashMap<SocketAddr, Token> = HashMap::new();
+    let mut standby_by_client: HashMap<SocketAddr, Token> = HashMap::new();
     let mut last_rotation_by_client: HashMap<SocketAddr, Instant> = HashMap::new();
     let mut next_token_id: usize = 1;
     let mut cert_cache = CertCache::new();
@@ -542,6 +564,22 @@ fn run_client_worker(
     loop {
         if let Some(ref s) = cfg.stop {
             if s.load(Ordering::Relaxed) {
+                let mut torn = 0usize;
+                for sess in sessions_by_token.values_mut() {
+                    if sess.state == HandshakeState::Ready {
+                        graceful_teardown_client(sess, &mut dtls_buf);
+                        torn += 1;
+                    }
+                }
+                if torn > 0 {
+                    log(
+                        worker_id,
+                        &format!(
+                            "shutdown signal: sent graceful SRTCP BYE + DTLS close_notify to {} active session(s)",
+                            torn
+                        ),
+                    );
+                }
                 return Ok(());
             }
         }
@@ -549,6 +587,7 @@ fn run_client_worker(
         let mut wait = Duration::from_millis(150);
         let mut to_close: Vec<(Token, &'static str)> = Vec::new();
         let mut to_rotate: Vec<(Token, SocketAddr, bool)> = Vec::new();
+        let mut to_spawn_standby: Vec<SocketAddr> = Vec::new();
 
         for (&tok, sess) in sessions_by_token.iter_mut() {
             match sess.state {
@@ -684,6 +723,29 @@ fn run_client_worker(
                         continue;
                     }
 
+                    // Proactive Make-Before-Break scheduled 5-tuple rotation (--rotate-interval > 0)
+                    if !sess.is_standby && !sess.standby_spawned {
+                        if let Some(rot_at) = sess.rotate_at {
+                            if now >= rot_at {
+                                let active_recently = now.duration_since(sess.last_data_active)
+                                    <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                if active_recently {
+                                    sess.standby_spawned = true;
+                                    to_spawn_standby.push(sess.client_addr);
+                                } else {
+                                    sess.rotate_at = Some(
+                                        now + jitter_duration_ms(cfg.rotate_interval_secs * 1000),
+                                    );
+                                }
+                            } else {
+                                let rem = rot_at.saturating_duration_since(now);
+                                if rem < wait {
+                                    wait = rem.max(Duration::from_millis(20));
+                                }
+                            }
+                        }
+                    }
+
                     if now.duration_since(sess.last_data_active) > idle_dur {
                         graceful_teardown_client(sess, &mut dtls_buf);
                         sess.state = HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
@@ -779,6 +841,28 @@ fn run_client_worker(
             }
         }
 
+        for client_addr in to_spawn_standby {
+            if !standby_by_client.contains_key(&client_addr) {
+                let _ = spawn_client_session(
+                    worker_id,
+                    client_addr,
+                    &cfg,
+                    &mut poll,
+                    &mut sessions_by_token,
+                    &mut token_by_client,
+                    &mut standby_by_client,
+                    &mut next_token_id,
+                    &mut dtls_buf,
+                    now,
+                    retry_dur,
+                    ka_base_ms,
+                    idle_dur,
+                    KA_MAX_RETRIES,
+                    true,
+                );
+            }
+        }
+
         for (old_tok, client_addr, active_recently) in to_rotate {
             if token_by_client.get(&client_addr) == Some(&old_tok) {
                 token_by_client.remove(&client_addr);
@@ -804,6 +888,7 @@ fn run_client_worker(
                     &mut poll,
                     &mut sessions_by_token,
                     &mut token_by_client,
+                    &mut standby_by_client,
                     &mut next_token_id,
                     &mut dtls_buf,
                     now,
@@ -811,6 +896,7 @@ fn run_client_worker(
                     ka_base_ms,
                     idle_dur,
                     next_ka_retries,
+                    false,
                 );
             }
         }
@@ -820,6 +906,18 @@ fn run_client_worker(
                 let _ = poll.registry().deregister(&mut sess.upstream);
                 if token_by_client.get(&sess.client_addr) == Some(&tok) {
                     token_by_client.remove(&sess.client_addr);
+                }
+                if standby_by_client.get(&sess.client_addr) == Some(&tok) {
+                    standby_by_client.remove(&sess.client_addr);
+                    // Standby MBB handshake failed -> postpone retry without impacting live primary!
+                    if let Some(&prim_tok) = token_by_client.get(&sess.client_addr) {
+                        if let Some(prim) = sessions_by_token.get_mut(&prim_tok) {
+                            prim.standby_spawned = false;
+                            if cfg.rotate_interval_secs > 0 {
+                                prim.rotate_at = Some(now + Duration::from_secs(60));
+                            }
+                        }
+                    }
                 }
                 log(
                     worker_id,
@@ -832,7 +930,7 @@ fn run_client_worker(
             }
         }
 
-        if cfg.stop.is_some() && wait > Duration::from_millis(20) {
+        if cfg.stop.is_some() && cfg.quiet && wait > Duration::from_millis(20) {
             wait = Duration::from_millis(20);
         }
         if let Err(e) = poll.poll(&mut events, Some(wait)) {
@@ -843,6 +941,8 @@ fn run_client_worker(
         }
 
         let now = Instant::now();
+        let mut standby_promoted: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut graceful_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
         for ev in events.iter() {
             if ev.token() == LISTEN_TOKEN {
                 loop {
@@ -885,6 +985,7 @@ fn run_client_worker(
                             &mut poll,
                             &mut sessions_by_token,
                             &mut token_by_client,
+                            &mut standby_by_client,
                             &mut next_token_id,
                             &mut dtls_buf,
                             now,
@@ -892,6 +993,7 @@ fn run_client_worker(
                             ka_base_ms,
                             idle_dur,
                             ka_retries,
+                            false,
                         ) {
                             Some(t) => t,
                             None => continue,
@@ -1005,6 +1107,16 @@ fn run_client_worker(
                                             sess.ka_rto_at = None;
                                             sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
                                             sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
+                                            if cfg.rotate_interval_secs > 0 && !sess.is_standby {
+                                                sess.rotate_at = Some(
+                                                    now + jitter_duration_ms(
+                                                        cfg.rotate_interval_secs * 1000,
+                                                    ),
+                                                );
+                                            }
+                                            if sess.is_standby {
+                                                standby_promoted.push((ev.token(), sess.client_addr));
+                                            }
                                             let mut flushed = 0usize;
                                             sess.pending_bytes = 0;
                                             if let Some(ref mut cipher) = sess.cipher {
@@ -1115,6 +1227,7 @@ fn run_client_worker(
                                 }
                                 continue;
                             }
+                            let was_ready = sess.state == HandshakeState::Ready;
                             if drain_client_dtls(
                                 worker_id,
                                 sess,
@@ -1125,7 +1238,17 @@ fn run_client_worker(
                                 now,
                                 candidate_sh,
                             ) {
+                                let active_recently = now.duration_since(sess.last_data_active)
+                                    <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                 sess.state = HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+                                if was_ready && !sess.is_standby && active_recently {
+                                    graceful_reconnects.push((ev.token(), sess.client_addr));
+                                }
+                            } else if !was_ready
+                                && sess.state == HandshakeState::Ready
+                                && sess.is_standby
+                            {
+                                standby_promoted.push((ev.token(), sess.client_addr));
                             }
                         }
                         PacketKind::Srtcp => {
@@ -1136,10 +1259,17 @@ fn run_client_worker(
                                         // Note: do NOT refresh uplink consent liveness from unsolicited server
                                         // SRTCP — only STUN Binding Success proves uplink reaches the server.
                                         if has_bye {
-                                            // V3-M-05: enter brief Closing drain to absorb trailing close_notify!
+                                            // V3-M-05 + v0.3.7: enter brief Closing drain to absorb close_notify,
+                                            // and immediately reconnect on fresh 5-tuple if active (sub-second server restart!).
+                                            let active_recently = now
+                                                .duration_since(sess.last_data_active)
+                                                <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                             sess.state = HandshakeState::Closing(
                                                 now + Duration::from_millis(CLOSING_DRAIN_MS),
                                             );
+                                            if !sess.is_standby && active_recently {
+                                                graceful_reconnects.push((ev.token(), sess.client_addr));
+                                            }
                                         }
                                     } else {
                                         sess.auth_drops += 1;
@@ -1171,6 +1301,74 @@ fn run_client_worker(
                         }
                     }
                 }
+            }
+        }
+
+        // Atomic 0ms Make-Before-Break standby promotion
+        for (new_tok, client_addr) in standby_promoted {
+            if standby_by_client.get(&client_addr) == Some(&new_tok) {
+                standby_by_client.remove(&client_addr);
+            }
+            let new_port = match sessions_by_token.get_mut(&new_tok) {
+                Some(new_sess) if new_sess.state == HandshakeState::Ready => {
+                    new_sess.is_standby = false;
+                    new_sess.standby_spawned = false;
+                    if cfg.rotate_interval_secs > 0 {
+                        new_sess.rotate_at =
+                            Some(now + jitter_duration_ms(cfg.rotate_interval_secs * 1000));
+                    }
+                    new_sess.local_port
+                }
+                _ => continue,
+            };
+            if let Some(old_tok) = token_by_client.insert(client_addr, new_tok) {
+                if old_tok != new_tok {
+                    if let Some(old_sess) = sessions_by_token.get_mut(&old_tok) {
+                        if old_sess.state == HandshakeState::Ready {
+                            log(
+                                worker_id,
+                                &format!(
+                                    "MBB 0ms rotation complete client={} old_sport={} -> new_sport={} (draining old 5s)",
+                                    client_addr, old_sess.local_port, new_port
+                                ),
+                            );
+                            graceful_teardown_client(old_sess, &mut dtls_buf);
+                            old_sess.state =
+                                HandshakeState::Closing(now + Duration::from_secs(5));
+                        }
+                    }
+                }
+            }
+        }
+
+        // Fast sub-second reconnect when server sends graceful BYE/close_notify (e.g. SIGTERM restart)
+        for (old_tok, client_addr) in graceful_reconnects {
+            if token_by_client.get(&client_addr) == Some(&old_tok) {
+                token_by_client.remove(&client_addr);
+                log(
+                    worker_id,
+                    &format!(
+                        "peer sent graceful BYE/close_notify on active client={} -> fast-reconnecting fresh 5-tuple",
+                        client_addr
+                    ),
+                );
+                let _ = spawn_client_session(
+                    worker_id,
+                    client_addr,
+                    &cfg,
+                    &mut poll,
+                    &mut sessions_by_token,
+                    &mut token_by_client,
+                    &mut standby_by_client,
+                    &mut next_token_id,
+                    &mut dtls_buf,
+                    now,
+                    retry_dur,
+                    ka_base_ms,
+                    idle_dur,
+                    KA_MAX_RETRIES,
+                    false,
+                );
             }
         }
 
@@ -1359,6 +1557,7 @@ mod tests {
                 cipher_pref: CipherPref::Auto,
                 dtls_decoy: true,
                 dtls_min_version: DtlsMinVersion::Auto,
+                rotate_interval_secs: 0,
                 workers: 1,
                 max_sessions: 64,
                 wan_mtu: 1488,
@@ -1535,6 +1734,7 @@ mod tests {
                 cipher_pref: CipherPref::Auto,
                 dtls_decoy: true,
                 dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
                 workers: 1,
                 max_sessions: 16,
                 wan_mtu: 1488,
@@ -1573,6 +1773,305 @@ mod tests {
         assert!(
             ok,
             "client MUST retransmit dropped DTLS 1.3 Flight 5 from Ready state and recover within 3s!"
+        );
+    }
+
+    /// v0.3.7 #7 regression test: graceful server shutdown (stop flag / SIGTERM) broadcasts
+    /// encrypted SRTCP BYE + DTLS close_notify so client fast-reconnects in <1.5s (not 5-7s!).
+    #[test]
+    fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
+        let psk = b"v037-sigterm-bye-fast-reconnect-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                    let _ = echo_sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+
+        let stop1 = Arc::new(AtomicBool::new(false));
+        let stop1_c = Arc::clone(&stop1);
+        let srv_psk1 = psk.clone();
+        let srv1_handle = thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk1,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::Auto,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: Some(stop1_c),
+            });
+        });
+
+        let first_port = Arc::new(AtomicU16::new(0));
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let r_first = Arc::clone(&first_port);
+        let r_latest = Arc::clone(&latest_port);
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    let _ = r_first.compare_exchange(0, cport, Ordering::SeqCst, Ordering::SeqCst);
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(&buf[..n]);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        // Long keepalive (30s) proves recovery comes from server BYE/close_notify, NOT STUN consent timeout!
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::Auto,
+                rotate_interval_secs: 0,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 30,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+
+        let mut rbuf = [0u8; 256];
+        let mut ready = false;
+        let t_init = Instant::now();
+        while t_init.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"PING_BEFORE_SHUTDOWN");
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"PING_BEFORE_SHUTDOWN" => {
+                    ready = true;
+                    break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => thread::sleep(Duration::from_millis(40)),
+            }
+        }
+        assert!(ready, "initial tunnel should come up");
+        let port1 = first_port.load(Ordering::SeqCst);
+        assert_ne!(port1, 0);
+
+        // Trigger graceful server shutdown (SIGTERM equivalent) and spawn replacement server on same port
+        let t_restart = Instant::now();
+        stop1.store(true, Ordering::SeqCst);
+        let _ = srv1_handle.join();
+
+        let srv_psk2 = psk.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk2,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::Auto,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        // Must recover via graceful BYE fast-reconnect well before the 30s keepalive!
+        let mut recovered = false;
+        while t_restart.elapsed() < Duration::from_secs(3) {
+            let _ = app.send(b"PING_AFTER_BYE");
+            if let Ok(n) = app.recv(&mut rbuf) {
+                if &rbuf[..n] == b"PING_AFTER_BYE" && latest_port.load(Ordering::SeqCst) != port1 {
+                    recovered = true;
+                    break;
+                }
+            }
+            thread::sleep(Duration::from_millis(30));
+        }
+        assert!(
+            recovered,
+            "client MUST fast-reconnect on server graceful BYE well under 3s (keepalive=30s)!"
+        );
+    }
+
+    /// v0.3.7 #8 regression test: proactive Make-Before-Break scheduled 5-tuple rotation
+    /// (`--rotate-interval 2`) switches to a fresh UDP port with ZERO dropped packets!
+    #[test]
+    fn proactive_mbb_scheduled_rotation_zero_loss() {
+        let psk = b"v037-mbb-zero-loss-rotation-psk".to_vec();
+        let backend_port = reserve_free_port();
+        let server_port = reserve_free_port();
+        let relay_port = reserve_free_port();
+        let client_port = reserve_free_port();
+
+        let echo_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+        thread::spawn(move || {
+            let mut buf = [0u8; 4096];
+            loop {
+                if let Ok((n, peer)) = echo_sock.recv_from(&mut buf) {
+                    let _ = echo_sock.send_to(&buf[..n], peer);
+                }
+            }
+        });
+
+        let srv_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+                backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+                psk: srv_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::Auto,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                wire_audit_file: None,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        let first_port = Arc::new(AtomicU16::new(0));
+        let latest_port = Arc::new(AtomicU16::new(0));
+        let r_first = Arc::clone(&first_port);
+        let r_latest = Arc::clone(&latest_port);
+        let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+        relay_front.set_nonblocking(true).unwrap();
+        thread::spawn(move || {
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+            let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+            let mut buf = [0u8; 4096];
+            loop {
+                while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
+                    let cport = cli_addr.port();
+                    let _ = r_first.compare_exchange(0, cport, Ordering::SeqCst, Ordering::SeqCst);
+                    r_latest.store(cport, Ordering::SeqCst);
+                    let entry = upstreams.entry(cport).or_insert_with(|| {
+                        let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                        s.set_nonblocking(true).unwrap();
+                        s.connect(srv_addr).unwrap();
+                        (s, cli_addr)
+                    });
+                    let _ = entry.0.send(&buf[..n]);
+                }
+                for (usock, cli_addr) in upstreams.values() {
+                    while let Ok(n) = usock.recv(&mut buf) {
+                        let _ = relay_front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+                thread::sleep(Duration::from_millis(2));
+            }
+        });
+
+        let cli_psk = psk.clone();
+        thread::spawn(move || {
+            let _ = run_client(ClientConfig {
+                listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+                server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+                psk: cli_psk,
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::Auto,
+                rotate_interval_secs: 2, // triggers MBB rotation at 1.6s..2.4s!
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: 1488,
+                retry_ms: 150,
+                max_retries: 8,
+                keepalive_secs: 30,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 3600,
+                quiet: true,
+                stop: None,
+            });
+        });
+
+        let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+        app.connect(("127.0.0.1", client_port)).unwrap();
+
+        let mut rbuf = [0u8; 256];
+        let mut ready = false;
+        let t_init = Instant::now();
+        while t_init.elapsed() < Duration::from_secs(5) {
+            let _ = app.send(b"MBB_WARMUP");
+            match app.recv(&mut rbuf) {
+                Ok(n) if &rbuf[..n] == b"MBB_WARMUP" => {
+                    ready = true;
+                    break;
+                }
+                Err(e) if matches!(e.kind(), ErrorKind::WouldBlock | ErrorKind::TimedOut) => {}
+                _ => thread::sleep(Duration::from_millis(40)),
+            }
+        }
+        assert!(ready, "initial tunnel should come up");
+        let port1 = first_port.load(Ordering::SeqCst);
+        assert_ne!(port1, 0);
+
+        // Stream 160 packets (1 every 20ms = 3.2s) spanning the 2s±20% MBB cutover window!
+        let mut ok_cnt = 0usize;
+        for seq in 0..160u32 {
+            let msg = format!("MBB_SEQ_{:04}", seq);
+            app.send(msg.as_bytes()).unwrap();
+            let n = app.recv(&mut rbuf).expect("MBB rotation MUST deliver with zero packet loss!");
+            assert_eq!(&rbuf[..n], msg.as_bytes());
+            ok_cnt += 1;
+            thread::sleep(Duration::from_millis(20));
+        }
+        let port2 = latest_port.load(Ordering::SeqCst);
+        assert_eq!(ok_cnt, 160);
+        assert_ne!(
+            port2, port1,
+            "proactive MBB rotation MUST switch off port {} to a fresh 5-tuple within 3.2s!",
+            port1
         );
     }
 }

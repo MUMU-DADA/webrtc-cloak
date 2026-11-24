@@ -36,6 +36,7 @@
 │   └── pages.yml                          # 自动部署交互原理演示页至 GitHub Pages
 ├── LICENSE                                # MIT 开源许可证
 ├── README.md                              # 项目说明、协议架构与构建文档
+├── SPEC.md                                # V3.2 / v0.3.7 线格式、密码学与状态机协议规范
 ├── .gitignore                             # 忽略构建产物、密钥文件与抓包日志
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示网页（离线/Pages 双用）
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
@@ -151,6 +152,7 @@ WEBRTC_CLOAK_PSK="YOUR_TEST_PSK" ./webrtc-cloak client \
 | `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 | 预置共享密钥（推荐文件或环境变量，避免 `ps` 泄露） |
 | `--cipher <auto\|aes-gcm\|chacha20\|blake2b>` | `auto` | 加密套件；`auto` 经 DTLS 握手按两端 CPU 指令集自动协商 |
 | `--dtls-min-version <auto\|1.2\|1.3>` | `auto` | DTLS 最低版本；`auto`/`1.2` 优先 DTLS 1.3 并无缝兼容旧版 1.2 滚动升级，双端升完后可设为 `1.3` 彻底锁定防降级 |
+| `--rotate-interval <SECS>` | `0`（关闭） | 客户端可选定时 Make-Before-Break 无感五元组滚动轮换间隔（加 `±20%` 抖动，后台预握新五元组并 0ms 零丢包切换，刷新 PFS 密钥；适合 Hysteria 2 / WireGuard 等支持源端口迁移的上层协议） |
 | `--workers <1\|N\|auto>` | `1` | 工作线程数；默认 `1` 为单线程模式，Linux 可选多核 `SO_REUSEPORT` |
 | `--keepalive <SECS>` | `5` | RFC 7675 STUN Consent 保活间隔（自动加 `±20%` 抖动；无应答时按 RFC 5389 §7.2.1 同 `txid` 重传 2 次，约 `4.7s` 确认黑洞并自动换口） |
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE` + DTLS `close_notify` 优雅退出 |

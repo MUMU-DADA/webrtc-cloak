@@ -13,8 +13,18 @@ use crate::server::{run_server, ServerConfig};
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::process;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
 use std::time::{Duration, Instant};
+
+fn install_shutdown_handler() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&stop);
+    let _ = ctrlc::set_handler(move || {
+        flag.store(true, Ordering::SeqCst);
+    });
+    stop
+}
 
 fn parse_workers(s: &str) -> usize {
     if s == "auto" {
@@ -62,7 +72,7 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
@@ -578,6 +588,7 @@ fn main() {
             let mut cipher_pref = CipherPref::Auto;
             let mut dtls_decoy = true;
             let mut dtls_min_version = DtlsMinVersion::Auto;
+            let mut rotate_interval_secs: u64 = 0;
             let mut workers: usize = 1;
             let mut max_sessions: usize = 4096;
             let mut wan_mtu: usize = DEFAULT_WAN_MTU;
@@ -598,6 +609,7 @@ fn main() {
                     "--psk-file" => { i += 1; psk_file = Some(args[i].clone()); }
                     "--cipher" => { i += 1; cipher_pref = parse_cipher_pref(&args[i]); }
                     "--dtls-min-version" => { i += 1; dtls_min_version = parse_dtls_min_version(&args[i]); }
+                    "--rotate-interval" => { i += 1; rotate_interval_secs = args[i].parse().unwrap(); }
                     "--workers" => { i += 1; workers = parse_workers(&args[i]); }
                     "--max-sessions" => { i += 1; max_sessions = args[i].parse::<usize>().unwrap().max(1); }
                     "--mtu" => { i += 1; wan_mtu = args[i].parse::<usize>().unwrap(); }
@@ -617,6 +629,7 @@ fn main() {
             let psk_bytes = resolve_psk(psk, psk_file);
             let listen_addr: SocketAddr = format!("{}:{}", listen_host, listen_port).parse().unwrap();
             let server_addr: SocketAddr = format!("{}:{}", server_host, server_port).parse().unwrap();
+            let stop = install_shutdown_handler();
             if let Err(e) = run_client(ClientConfig {
                 listen_addr,
                 server_addr,
@@ -624,6 +637,7 @@ fn main() {
                 cipher_pref,
                 dtls_decoy,
                 dtls_min_version,
+                rotate_interval_secs,
                 workers,
                 max_sessions,
                 wan_mtu,
@@ -633,7 +647,7 @@ fn main() {
                 idle_timeout_secs,
                 stats_interval_secs,
                 quiet: false,
-                stop: None,
+                stop: Some(stop),
             }) {
                 eprintln!("client error: {}", e);
                 process::exit(1);
@@ -684,6 +698,7 @@ fn main() {
             let psk_bytes = resolve_psk(psk, psk_file);
             let listen_addr: SocketAddr = format!("{}:{}", listen_host, listen_port).parse().unwrap();
             let backend_addr: SocketAddr = format!("{}:{}", backend_host, backend_port).parse().unwrap();
+            let stop = install_shutdown_handler();
             if let Err(e) = run_server(ServerConfig {
                 listen_addr,
                 backend_addr,
@@ -698,7 +713,7 @@ fn main() {
                 stats_interval_secs,
                 wire_audit_file,
                 quiet: false,
-                stop: None,
+                stop: Some(stop),
             }) {
                 eprintln!("server error: {}", e);
                 process::exit(1);

@@ -500,6 +500,22 @@ fn run_server_worker(
     loop {
         if let Some(ref s) = cfg.stop {
             if s.load(Ordering::Relaxed) {
+                let mut torn = 0usize;
+                for sess in sessions_by_token.values_mut() {
+                    if sess.state == ServerState::Ready {
+                        graceful_teardown_server(sess, &listen_sock, &mut dtls_buf, &mut audit_pkt);
+                        torn += 1;
+                    }
+                }
+                if torn > 0 {
+                    log(
+                        worker_id,
+                        &format!(
+                            "shutdown signal: sent graceful SRTCP BYE + DTLS close_notify to {} active session(s)",
+                            torn
+                        ),
+                    );
+                }
                 return Ok(());
             }
         }
@@ -612,7 +628,7 @@ fn run_server_worker(
             }
         }
 
-        if cfg.stop.is_some() && wait > Duration::from_millis(20) {
+        if cfg.stop.is_some() && cfg.quiet && wait > Duration::from_millis(20) {
             wait = Duration::from_millis(20);
         }
         if let Err(e) = poll.poll(&mut events, Some(wait)) {

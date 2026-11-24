@@ -685,6 +685,7 @@ impl ManagedClient {
                 cipher_pref,
                 dtls_decoy: true,
                 dtls_min_version: DtlsMinVersion::Auto,
+                rotate_interval_secs: 0,
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
