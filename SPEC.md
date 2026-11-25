@@ -22,7 +22,7 @@ All protocol layers share a single UDP 5-tuple and are demultiplexed strictly by
 
 ### 2.1 Transaction ID (`txid`, 12 bytes)
 - `txid[0..8]`: 8 random bytes from OS CSPRNG.
-- `txid[8..12]`: `unix_secs_u32_be ^ SHA256("webrtc-cloak:txid-mask:" || psk || txid[0..8])[0..4]`.
+- `txid[8..12]`: `unix_secs_u32_be ^ SHA256("webrtc-cloak:txid-ts:" || psk || txid[0..8])[0..4]`.
 - Server accepts Binding Requests only if `|now - unix_secs| <= 30s` **after** `MESSAGE-INTEGRITY` verification passes.
 
 ### 2.2 Attributes & Strict RFC 5389 §15.4 Parsing
@@ -56,7 +56,7 @@ All protocol layers share a single UDP 5-tuple and are demultiplexed strictly by
 6. `enc_key = SHA256(session_key || "|enc")`, `mac_key = SHA256(session_key || "|mac")`, `gcm_salt = enc_key[16..20]`.
 7. `audio_ssrc = SHA256("webrtc-cloak-v3-audio-ssrc|" || session_key || BE32(video_ssrc))[0..4]`, constrained so `audio_ssrc != 0` and `(audio_ssrc >> 16) != (video_ssrc >> 16)`.
 
-*(Note: A future breaking protocol revision `V4` may migrate step 5–6 to RFC 5869 HKDF-Extract/Expand while keeping `V3.x` rolling-upgrade wire compatibility intact.)*
+*(Note: Steps 5–6 retain SHA-256 binding to preserve zero-downtime rolling-upgrade compatibility with `v0.3.x`, while V4-introduced subkeys—per-session `mi_key_mig` and MBB `handover` proofs—use RFC 5869 HKDF-SHA256.)*
 
 ### 4.2 Orthogonal 96-bit AEAD Nonce Layout
 ```text

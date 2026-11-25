@@ -1,0 +1,112 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="960" height="535" viewBox="0 0 960 535" role="img" aria-label="WebRTC-Cloak Dual-SSRC Wire Stealth and Anti-Probe Profile">
+  <defs>
+    <linearGradient id="stBg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b1120"/>
+      <stop offset="100%" stop-color="#0f172a"/>
+    </linearGradient>
+    <linearGradient id="audFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbbf24" stop-opacity="0.45"/>
+      <stop offset="100%" stop-color="#fbbf24" stop-opacity="0.04"/>
+    </linearGradient>
+    <linearGradient id="vidFill" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#34d399" stop-opacity="0.32"/>
+      <stop offset="100%" stop-color="#34d399" stop-opacity="0.03"/>
+    </linearGradient>
+    <linearGradient id="dtlsGrad" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#0ea5e9"/>
+      <stop offset="100%" stop-color="#10b981"/>
+    </linearGradient>
+    <style>
+      .sans { font-family: ui-sans-serif, -apple-system, BlinkMacSystemFont, "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", "Segoe UI", sans-serif; }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace; }
+    </style>
+  </defs>
+  <rect x="0" y="0" width="960" height="535" rx="16" fill="url(#stBg)"/>
+  <rect x="1" y="1" width="958" height="533" rx="15" fill="none" stroke="#1e293b" stroke-width="1.5"/>
+  <circle cx="34" cy="30" r="5" fill="#a78bfa"/>
+  <text x="48" y="36" class="sans" font-size="18" font-weight="700" fill="#f8fafc">协议隐蔽性、双 SSRC 包长分布与抗探测验真 · Stealth &amp; DPI Profile</text>
+  <text x="48" y="56" class="sans" font-size="11.5" fill="#94a3b8">实抓 2,040 包混合流 (DTLS 1.3 · --mtu 1488) + 严苛 NAT 5 包截断实测对照 + 主动探测零泄漏验真</text>
+  <rect x="772" y="18" width="164" height="28" rx="14" fill="#221740" stroke="#a78bfa" stroke-opacity="0.5"/>
+  <text x="854" y="36" class="mono" font-size="11" font-weight="600" fill="#c4b5fd" text-anchor="middle">Dual-SSRC · 0B Leak</text>
+  <rect x="24" y="74" width="912" height="232" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.2"/>
+  <text x="42" y="98" class="sans" font-size="13.5" font-weight="700" fill="#e2e8f0">1. 外层 IPv4 包长分布折线图：裸固定包长 UDP 尖刺 vs Cloak 双 SSRC 展宽 (20B 分箱 · 0–1520B)</text>
+  <text x="42" y="114" class="sans" font-size="10.2" fill="#64748b">原始 7 个离散固定包长经 AEAD 内层随机填充展宽为 168 种长度；1200B→32 种、1400B→8 种；40 个 1452B 超限探针全拦截</text>
+  <line x1="42" y1="130" x2="58" y2="130" stroke="#fb7185" stroke-width="1.8" stroke-dasharray="3,2"/>
+  <text x="64" y="134" class="sans" font-size="10" fill="#fda4af">裸内层 UDP (7 个尖峰)</text>
+  <line x1="202" y1="130" x2="218" y2="130" stroke="#fbbf24" stroke-width="2.4"/>
+  <text x="224" y="134" class="sans" font-size="10" fill="#fde68a">Cloak Audio SSRC (PT=111 Opus · 45.0 pps ≤50)</text>
+  <line x1="512" y1="130" x2="528" y2="130" stroke="#34d399" stroke-width="2.4"/>
+  <text x="534" y="134" class="sans" font-size="10" fill="#6ee7b7">Cloak Video SSRC (PT=96 · AEAD 展宽)</text>
+  <line x1="76" y1="274.0" x2="912" y2="274.0" stroke="#1e293b" stroke-dasharray="3,4"/>
+  <text x="68" y="277.5" class="mono" font-size="9" fill="#64748b" text-anchor="end">0</text>
+  <line x1="76" y1="242.0" x2="912" y2="242.0" stroke="#1e293b" stroke-dasharray="3,4"/>
+  <text x="68" y="245.5" class="mono" font-size="9" fill="#64748b" text-anchor="end">170</text>
+  <line x1="76" y1="210.0" x2="912" y2="210.0" stroke="#1e293b" stroke-dasharray="3,4"/>
+  <text x="68" y="213.5" class="mono" font-size="9" fill="#64748b" text-anchor="end">340</text>
+  <line x1="76" y1="178.0" x2="912" y2="178.0" stroke="#1e293b" stroke-dasharray="3,4"/>
+  <text x="68" y="181.5" class="mono" font-size="9" fill="#64748b" text-anchor="end">510</text>
+  <line x1="76" y1="146.0" x2="912" y2="146.0" stroke="#1e293b" stroke-dasharray="3,4"/>
+  <text x="68" y="149.5" class="mono" font-size="9" fill="#64748b" text-anchor="end">680</text>
+  <text x="76.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">0B</text>
+  <text x="186.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">200B</text>
+  <text x="296.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">400B</text>
+  <text x="406.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">600B</text>
+  <text x="516.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">800B</text>
+  <text x="626.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">1000B</text>
+  <text x="736.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">1200B</text>
+  <text x="846.0" y="290" class="mono" font-size="9" fill="#64748b" text-anchor="middle">1400B</text>
+  <text x="894.4" y="290" class="mono" font-size="8.8" font-weight="700" fill="#38bdf8" text-anchor="middle">1488B</text>
+  <rect x="894.4" y="146" width="17.6" height="128" fill="#f43f5e" fill-opacity="0.10"/>
+  <line x1="894.4" y1="146" x2="894.4" y2="274" stroke="#38bdf8" stroke-width="1.6" stroke-dasharray="4,3"/>
+  <path d="M81.5,274.0 L92.5,274.0 L103.5,274.0 L114.5,274.0 L125.5,274.0 L136.5,274.0 L147.5,274.0 L158.5,274.0 L169.5,256.9 L180.5,263.3 L191.5,274.0 L202.5,263.1 L213.5,257.2 L224.5,274.0 L235.5,274.0 L246.5,274.0 L257.5,274.0 L268.5,274.0 L279.5,274.0 L290.5,274.0 L301.5,274.0 L312.5,274.0 L323.5,274.0 L334.5,274.0 L345.5,274.0 L356.5,274.0 L367.5,274.0 L378.5,255.7 L389.5,250.8 L400.5,274.0 L411.5,274.0 L422.5,274.0 L433.5,274.0 L444.5,274.0 L455.5,274.0 L466.5,274.0 L477.5,274.0 L488.5,274.0 L499.5,274.0 L510.5,274.0 L521.5,274.0 L532.5,274.0 L543.5,274.0 L554.5,274.0 L565.5,274.0 L576.5,255.9 L587.5,254.4 L598.5,274.0 L609.5,274.0 L620.5,274.0 L631.5,274.0 L642.5,274.0 L653.5,274.0 L664.5,274.0 L675.5,274.0 L686.5,274.0 L697.5,274.0 L708.5,274.0 L719.5,274.0 L730.5,274.0 L741.5,274.0 L752.5,274.0 L763.5,274.0 L774.5,223.7 L785.5,207.6 L796.5,274.0 L807.5,274.0 L818.5,274.0 L829.5,274.0 L840.5,274.0 L851.5,274.0 L862.5,274.0 L873.5,274.0 L884.5,191.2 L895.5,274.0 L906.5,274.0 L906.5,274.0 L81.5,274.0 Z" fill="url(#vidFill)"/>
+  <path d="M81.5,274.0 L92.5,274.0 L103.5,274.0 L114.5,274.0 L125.5,274.0 L136.5,274.0 L147.5,274.0 L158.5,274.0 L169.5,262.9 L180.5,264.0 L191.5,274.0 L202.5,265.0 L213.5,261.8 L224.5,274.0 L235.5,274.0 L246.5,274.0 L257.5,274.0 L268.5,274.0 L279.5,274.0 L290.5,274.0 L301.5,274.0 L312.5,274.0 L323.5,274.0 L334.5,274.0 L345.5,274.0 L356.5,274.0 L367.5,274.0 L378.5,274.0 L389.5,274.0 L400.5,274.0 L411.5,274.0 L422.5,274.0 L433.5,274.0 L444.5,274.0 L455.5,274.0 L466.5,274.0 L477.5,274.0 L488.5,274.0 L499.5,274.0 L510.5,274.0 L521.5,274.0 L532.5,274.0 L543.5,274.0 L554.5,274.0 L565.5,274.0 L576.5,274.0 L587.5,274.0 L598.5,274.0 L609.5,274.0 L620.5,274.0 L631.5,274.0 L642.5,274.0 L653.5,274.0 L664.5,274.0 L675.5,274.0 L686.5,274.0 L697.5,274.0 L708.5,274.0 L719.5,274.0 L730.5,274.0 L741.5,274.0 L752.5,274.0 L763.5,274.0 L774.5,274.0 L785.5,274.0 L796.5,274.0 L807.5,274.0 L818.5,274.0 L829.5,274.0 L840.5,274.0 L851.5,274.0 L862.5,274.0 L873.5,274.0 L884.5,274.0 L895.5,274.0 L906.5,274.0 L906.5,274.0 L81.5,274.0 Z" fill="url(#audFill)"/>
+  <path d="M81.5,274.0 L92.5,274.0 L103.5,274.0 L114.5,274.0 L125.5,274.0 L136.5,274.0 L147.5,225.1 L158.5,274.0 L169.5,274.0 L180.5,225.1 L191.5,274.0 L202.5,274.0 L213.5,274.0 L224.5,274.0 L235.5,274.0 L246.5,274.0 L257.5,274.0 L268.5,274.0 L279.5,274.0 L290.5,274.0 L301.5,274.0 L312.5,274.0 L323.5,274.0 L334.5,274.0 L345.5,274.0 L356.5,232.6 L367.5,274.0 L378.5,274.0 L389.5,274.0 L400.5,274.0 L411.5,274.0 L422.5,274.0 L433.5,274.0 L444.5,274.0 L455.5,274.0 L466.5,274.0 L477.5,274.0 L488.5,274.0 L499.5,274.0 L510.5,274.0 L521.5,274.0 L532.5,274.0 L543.5,274.0 L554.5,236.4 L565.5,274.0 L576.5,274.0 L587.5,274.0 L598.5,274.0 L609.5,274.0 L620.5,274.0 L631.5,274.0 L642.5,274.0 L653.5,274.0 L664.5,274.0 L675.5,274.0 L686.5,274.0 L697.5,274.0 L708.5,274.0 L719.5,274.0 L730.5,274.0 L741.5,274.0 L752.5,157.3 L763.5,274.0 L774.5,274.0 L785.5,274.0 L796.5,274.0 L807.5,274.0 L818.5,274.0 L829.5,274.0 L840.5,274.0 L851.5,274.0 L862.5,191.2 L873.5,274.0 L884.5,274.0 L895.5,266.5 L906.5,274.0" fill="none" stroke="#fb7185" stroke-width="1.5" stroke-dasharray="3,2" stroke-opacity="0.85"/>
+  <path d="M81.5,274.0 L92.5,274.0 L103.5,274.0 L114.5,274.0 L125.5,274.0 L136.5,274.0 L147.5,274.0 L158.5,274.0 L169.5,256.9 L180.5,263.3 L191.5,274.0 L202.5,263.1 L213.5,257.2 L224.5,274.0 L235.5,274.0 L246.5,274.0 L257.5,274.0 L268.5,274.0 L279.5,274.0 L290.5,274.0 L301.5,274.0 L312.5,274.0 L323.5,274.0 L334.5,274.0 L345.5,274.0 L356.5,274.0 L367.5,274.0 L378.5,255.7 L389.5,250.8 L400.5,274.0 L411.5,274.0 L422.5,274.0 L433.5,274.0 L444.5,274.0 L455.5,274.0 L466.5,274.0 L477.5,274.0 L488.5,274.0 L499.5,274.0 L510.5,274.0 L521.5,274.0 L532.5,274.0 L543.5,274.0 L554.5,274.0 L565.5,274.0 L576.5,255.9 L587.5,254.4 L598.5,274.0 L609.5,274.0 L620.5,274.0 L631.5,274.0 L642.5,274.0 L653.5,274.0 L664.5,274.0 L675.5,274.0 L686.5,274.0 L697.5,274.0 L708.5,274.0 L719.5,274.0 L730.5,274.0 L741.5,274.0 L752.5,274.0 L763.5,274.0 L774.5,223.7 L785.5,207.6 L796.5,274.0 L807.5,274.0 L818.5,274.0 L829.5,274.0 L840.5,274.0 L851.5,274.0 L862.5,274.0 L873.5,274.0 L884.5,191.2 L895.5,274.0 L906.5,274.0" fill="none" stroke="#34d399" stroke-width="2.2" stroke-linejoin="round"/>
+  <path d="M81.5,274.0 L92.5,274.0 L103.5,274.0 L114.5,274.0 L125.5,274.0 L136.5,274.0 L147.5,274.0 L158.5,274.0 L169.5,262.9 L180.5,264.0 L191.5,274.0 L202.5,265.0 L213.5,261.8 L224.5,274.0 L235.5,274.0 L246.5,274.0 L257.5,274.0 L268.5,274.0 L279.5,274.0 L290.5,274.0 L301.5,274.0 L312.5,274.0 L323.5,274.0 L334.5,274.0 L345.5,274.0 L356.5,274.0 L367.5,274.0 L378.5,274.0 L389.5,274.0 L400.5,274.0 L411.5,274.0 L422.5,274.0 L433.5,274.0 L444.5,274.0 L455.5,274.0 L466.5,274.0 L477.5,274.0 L488.5,274.0 L499.5,274.0 L510.5,274.0 L521.5,274.0 L532.5,274.0 L543.5,274.0 L554.5,274.0 L565.5,274.0 L576.5,274.0 L587.5,274.0 L598.5,274.0 L609.5,274.0 L620.5,274.0 L631.5,274.0 L642.5,274.0 L653.5,274.0 L664.5,274.0 L675.5,274.0 L686.5,274.0 L697.5,274.0 L708.5,274.0 L719.5,274.0 L730.5,274.0 L741.5,274.0 L752.5,274.0 L763.5,274.0 L774.5,274.0 L785.5,274.0 L796.5,274.0 L807.5,274.0 L818.5,274.0 L829.5,274.0 L840.5,274.0 L851.5,274.0 L862.5,274.0 L873.5,274.0 L884.5,274.0 L895.5,274.0 L906.5,274.0" fill="none" stroke="#fbbf24" stroke-width="2.2" stroke-linejoin="round"/>
+  <text x="205.2" y="239.2" class="sans" font-size="9.2" font-weight="600" fill="#fde68a">Opus 音频分流</text>
+  <text x="205.2" y="250.5" class="mono" font-size="8.8" fill="#fbbf24">45.0 pps (≤50 硬限)</text>
+  <text x="733.8" y="162.0" class="sans" font-size="9" font-weight="600" fill="#fda4af" text-anchor="end">裸 1200B 单峰 (620 包)</text>
+  <text x="797.6" y="213.8" class="sans" font-size="8.8" font-weight="600" fill="#6ee7b7" text-anchor="start">Cloak 展宽</text>
+  <text x="797.6" y="224.7" class="mono" font-size="8.5" fill="#34d399" text-anchor="start">32 种长度</text>
+  <rect x="756.4" y="144" width="134" height="30" rx="5" fill="#0c263d" fill-opacity="0.94" stroke="#38bdf8" stroke-opacity="0.55"/>
+  <text x="823.4" y="156" class="mono" font-size="8.6" font-weight="700" fill="#38bdf8" text-anchor="middle">MTU 1488B 防分片红线</text>
+  <text x="823.4" y="168" class="sans" font-size="8.2" fill="#bae6fd" text-anchor="middle">40×1452B 拦截 · 0 超限</text>
+  <rect x="24" y="320" width="448" height="198" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.2"/>
+  <text x="42" y="345" class="sans" font-size="13" font-weight="700" fill="#e2e8f0">2. 严苛 NAT「5 包截断」实网放行率对照</text>
+  <text x="42" y="361" class="sans" font-size="10" fill="#64748b">同链路独立新五元组 A/B 实测：裸高熵 UDP 第 6 包截断 vs STUN 握手全通</text>
+  <text x="42" y="386" class="sans" font-size="10.5" font-weight="600" fill="#cbd5e1">裸高熵随机 UDP (15×1260B)</text>
+  <text x="454" y="386" class="mono" font-size="10" font-weight="700" fill="#fda4af" text-anchor="end">5 / 15 (33% · 第 6 包截断)</text>
+  <rect x="42" y="392" width="412" height="9" rx="4.5" fill="#1e293b"/>
+  <rect x="42" y="392" width="137.2" height="9" rx="4.5" fill="#f43f5e"/>
+  <text x="42" y="419" class="sans" font-size="10.5" font-weight="600" fill="#cbd5e1">裸原生 QUIC 首包 (10×1200B)</text>
+  <text x="454" y="419" class="mono" font-size="10" font-weight="700" fill="#fdba74" text-anchor="end">5 / 10 (50% · 第 6 包截断)</text>
+  <rect x="42" y="425" width="412" height="9" rx="4.5" fill="#1e293b"/>
+  <rect x="42" y="425" width="206.0" height="9" rx="4.5" fill="#fb923c"/>
+  <text x="42" y="452" class="sans" font-size="10.5" font-weight="600" fill="#cbd5e1">ICE STUN + QUIC 混合流 (18 包)</text>
+  <text x="454" y="452" class="mono" font-size="10" font-weight="700" fill="#7dd3fc" text-anchor="end">18 / 18 (100% 全通)</text>
+  <rect x="42" y="458" width="412" height="9" rx="4.5" fill="#1e293b"/>
+  <rect x="42" y="458" width="412.0" height="9" rx="4.5" fill="#38bdf8"/>
+  <text x="42" y="485" class="sans" font-size="10.5" font-weight="600" fill="#cbd5e1">WebRTC-Cloak 连续百包 / 长流</text>
+  <text x="454" y="485" class="mono" font-size="10" font-weight="700" fill="#6ee7b7" text-anchor="end">102 / 102 (100% · 0 截断)</text>
+  <rect x="42" y="491" width="412" height="9" rx="4.5" fill="#1e293b"/>
+  <rect x="42" y="491" width="412.0" height="9" rx="4.5" fill="#34d399"/>
+  <rect x="488" y="320" width="448" height="198" rx="12" fill="#111827" stroke="#1e293b" stroke-width="1.2"/>
+  <text x="506" y="345" class="sans" font-size="13" font-weight="700" fill="#e2e8f0">3. DTLS 1.3 证书加密加速与主动探测静默验真</text>
+  <text x="506" y="361" class="sans" font-size="10" fill="#64748b">跨洋 ~160ms RTT 实测握手对比 + 恶意探测零指纹响应</text>
+  <text x="506" y="385" class="sans" font-size="10.5" font-weight="600" fill="#94a3b8">DTLS 1.2 (v0.3.5 · 证书明文可见)</text>
+  <text x="918" y="385" class="mono" font-size="10.5" font-weight="700" fill="#94a3b8" text-anchor="end">853 ms</text>
+  <rect x="506" y="392" width="412" height="10" rx="5" fill="#1e293b"/>
+  <rect x="506" y="392" width="351.4" height="10" rx="5" fill="#64748b"/>
+  <text x="506" y="424" class="sans" font-size="10.5" font-weight="600" fill="#e2e8f0">DTLS 1.3 (V4.0 · 双向证书 100% 加密)</text>
+  <text x="918" y="424" class="mono" font-size="10.5" font-weight="700" fill="#34d399" text-anchor="end">667 ms (-22% · 省 1 RTT)</text>
+  <rect x="506" y="431" width="412" height="10" rx="5" fill="#1e293b"/>
+  <rect x="506" y="431" width="274.8" height="10" rx="5" fill="url(#dtlsGrad)"/>
+  <rect x="506" y="454" width="200" height="52" rx="8" fill="#0f172a" stroke="#1e293b"/>
+  <text x="518" y="470" class="sans" font-size="9.5" fill="#94a3b8">主动探测零泄漏 (selftest #09)</text>
+  <text x="518" y="487" class="mono" font-size="13" font-weight="700" fill="#34d399">0 B Silent Drop</text>
+  <text x="518" y="500" class="sans" font-size="9" fill="#64748b">实网 7/7 · 沙箱 8/8 零响应</text>
+  <rect x="718" y="454" width="200" height="52" rx="8" fill="#0f172a" stroke="#1e293b"/>
+  <text x="730" y="470" class="sans" font-size="9.5" fill="#94a3b8">包长指纹维度扩展 (实测)</text>
+  <text x="730" y="487" class="mono" font-size="13" font-weight="700" fill="#c4b5fd">7 → 168 种长度</text>
+  <text x="730" y="500" class="sans" font-size="9" fill="#64748b">最大 1473B ≤ 1488B · 0 分片</text>
+</svg>
