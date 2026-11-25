@@ -8,16 +8,23 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+/// 服务端缓存的单条 STUN 应答报文最大字节数（标准 IPv4 Binding Success 固定 64B）。
+const STUN_CACHED_REPLY_MAX_LEN: usize = 64;
+/// 跨 worker 共享 STUN 事务 ID 防重放缓存条目存活时间（秒）。
 const SEEN_TXID_TTL: Duration = Duration::from_secs(90);
-const RETRANSMIT_WINDOW: Duration = Duration::from_secs(8);
+/// 合法同端同 txid UDP 丢包重传的缓存应答有效窗口（秒）。
+const SEEN_TXID_RETRANSMIT_WINDOW: Duration = Duration::from_secs(8);
+/// 单条 STUN txid 在重传窗口内允许返回缓存应答的最大次数。
 const MAX_STUN_RETRANSMITS: u8 = 6;
+/// 共享 STUN 事务 ID 防重放缓存最大条目数。
 const SEEN_TXID_CAP: usize = 65_536;
+/// 单个 worker 跨线程非所有权移交控制指令队列上限，防内存耗尽。
 const MAX_WORKER_CMD_QUEUE: usize = 4096;
 
 pub(super) enum TxidCheck {
     Fresh,
     /// Genuine same-peer short-window UDP retry (bounded <= 6x): resend exact cached 64B reply!
-    Retransmit([u8; 64], u8),
+    Retransmit([u8; STUN_CACHED_REPLY_MAX_LEN], u8),
     /// Cross-IP replay, post-close replay, or exceeded retries -> Silent Drop!
     Rejected,
 }
@@ -25,7 +32,7 @@ pub(super) enum TxidCheck {
 struct TxidEntry {
     peer: SocketAddr,
     seen_at: Instant,
-    cached_reply: [u8; 64],
+    cached_reply: [u8; STUN_CACHED_REPLY_MAX_LEN],
     cached_len: u8,
     retransmits: u8,
 }
@@ -70,7 +77,7 @@ impl SeenTxidCache {
         if let Some(entry) = self.map.get_mut(&txid) {
             if entry.peer == peer
                 && same_session_active
-                && now.duration_since(entry.seen_at) <= RETRANSMIT_WINDOW
+                && now.duration_since(entry.seen_at) <= SEEN_TXID_RETRANSMIT_WINDOW
                 && entry.retransmits < MAX_STUN_RETRANSMITS
             {
                 entry.retransmits += 1;
@@ -94,8 +101,8 @@ impl SeenTxidCache {
                 break;
             }
         }
-        let mut buf = [0u8; 64];
-        let clen = resp.len().min(64);
+        let mut buf = [0u8; STUN_CACHED_REPLY_MAX_LEN];
+        let clen = resp.len().min(STUN_CACHED_REPLY_MAX_LEN);
         buf[..clen].copy_from_slice(&resp[..clen]);
         self.map.insert(
             txid,

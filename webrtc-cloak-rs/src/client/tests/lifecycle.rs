@@ -2,9 +2,8 @@
 
 use super::reserve_free_port;
 use crate::client::{run_client, ClientConfig, KA_MAX_RETRIES};
-use crate::protocol::{
-    demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind, STUN_BINDING_REQUEST,
-};
+use crate::constants::STUN_BINDING_REQUEST;
+use crate::protocol::{demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind};
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use std::collections::HashMap;

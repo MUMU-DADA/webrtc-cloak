@@ -2,8 +2,12 @@
 
 use super::{reserve_free_port, tune_socket, XorShift64};
 use crate::client::{run_client, ClientConfig};
+use crate::constants::{
+    CTRL_FRAME_BUF_LEN, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS,
+    STUN_BINDING_REQUEST, UDP_RECV_BUF_LEN,
+};
 use crate::protocol::{
-    demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind, STUN_BINDING_REQUEST,
+    demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind,
 };
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
@@ -50,7 +54,7 @@ impl EchoBackend {
         let stop_flag = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; UDP_RECV_BUF_LEN];
             while !stop_flag.load(Ordering::Relaxed) {
                 match sock.recv_from(&mut buf) {
                     Ok((n, peer)) => {
@@ -217,7 +221,7 @@ impl ImpairmentProxy {
             let mut seq_gen: u64 = 0;
             let mut dropped_ka_txid: Option<[u8; 12]> = None;
             let mut bh_first_ka_txid: Option<[u8; 12]> = None;
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; UDP_RECV_BUF_LEN];
 
             while !stop_flag.load(Ordering::Relaxed) {
                 let mut did_work = false;
@@ -524,7 +528,7 @@ impl ManagedServer {
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
-                idle_timeout_secs: 120,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
                 stats_interval_secs: 3600,
                 wire_audit_file: None,
                 telemetry: TelemetryConfig::default(),
@@ -584,14 +588,14 @@ impl ManagedClient {
                 dtls_min_version: DtlsMinVersion::Auto,
                 rotate_interval_secs: 0,
                 rotate_max_bytes: 0,
-                rotate_cooldown_secs: 60,
+                rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
                 retry_ms,
                 max_retries: 12,
                 keepalive_secs,
-                idle_timeout_secs: 120,
+                idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
                 stats_interval_secs: 3600,
                 telemetry: TelemetryConfig::default(),
                 quiet: true,
@@ -629,7 +633,7 @@ pub(super) fn connect_app(client_port: u16, timeout_ms: u64) -> UdpSocket {
 pub(super) fn handshake_app(app: &UdpSocket, max_wait: Duration) -> Option<f64> {
     let t0 = Instant::now();
     let ping = b"HANDSHAKE_PROBE_V034";
-    let mut rbuf = [0u8; 256];
+    let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
     let _ = app.set_read_timeout(Some(Duration::from_millis(120)));
     let _ = app.send(ping);
     while t0.elapsed() < max_wait {

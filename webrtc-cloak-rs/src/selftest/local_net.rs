@@ -7,6 +7,9 @@ use super::harness::{
 use super::{
     percentile, reserve_free_port, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions,
 };
+use crate::constants::{
+    CTRL_FRAME_BUF_LEN, DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN, SRTP_DATA_MIN_WIRE_LEN,
+};
 use crate::protocol::fill_random;
 use std::collections::HashSet;
 use std::sync::atomic::Ordering;
@@ -46,7 +49,7 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
     let payload_len = 1200usize;
     let count = 60usize;
     let mut pkt = vec![0u8; payload_len];
-    let mut rbuf = vec![0u8; 4096];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
     let mut rtts_ms = Vec::with_capacity(count);
     let mut ok = 0usize;
     app.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
@@ -84,7 +87,7 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
     hi.overhead_bytes = Some(delta_b);
     hi.max_wire_udp = hi.max_wire_udp.max(after.max_wire_udp);
 
-    let max_allowed = opts.wan_mtu.saturating_sub(28);
+    let max_allowed = opts.wan_mtu.saturating_sub(IPV4_UDP_HDR_LEN);
     let passed = ok == count
         && after.stun_pkts >= 2
         && after.dtls_pkts >= 4
@@ -133,7 +136,7 @@ pub(super) fn test_02_transpacific_latency(opts: &SelftestOptions, hi: &mut High
     // Avoid double-sending during slow WAN handshake: wait up to 4s with 1s read timeout
     let hs_t0 = Instant::now();
     let ping = b"WAN_HANDSHAKE_PROBE";
-    let mut rbuf = vec![0u8; 4096];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
     let mut hs_ms = None;
     let _ = app.send(ping);
     while hs_t0.elapsed() < Duration::from_secs(4) {
@@ -244,7 +247,7 @@ pub(super) fn test_03_random_loss(opts: &SelftestOptions, hi: &mut Highlights) -
     app.set_nonblocking(true).unwrap();
 
     let mut received = HashSet::<u64>::new();
-    let mut rbuf = vec![0u8; 4096];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
 
     for seq in 0..total {
         pkt[4..12].copy_from_slice(&seq.to_be_bytes());
@@ -344,7 +347,7 @@ pub(super) fn test_04_reorder_and_replay(opts: &SelftestOptions, hi: &mut Highli
     let mut rx_client_dups = 0u64;
     let mut rx_out_of_order = 0u64;
     let mut max_seq_seen: Option<u64> = None;
-    let mut rbuf = vec![0u8; 4096];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
 
     let pkt_len = pkt.len();
     let mut drain_app = |rx_u: &mut HashSet<u64>, dups: &mut u64, ooo: &mut u64, max_s: &mut Option<u64>| {
@@ -436,16 +439,16 @@ pub(super) fn test_05_mtu_guard(opts: &SelftestOptions, hi: &mut Highlights) -> 
         };
     }
 
-    let max_wire_allowed = opts.wan_mtu.saturating_sub(28);
+    let max_wire_allowed = opts.wan_mtu.saturating_sub(IPV4_UDP_HDR_LEN);
     // Exact max inner payload = max_wire_allowed - 38 (20B RTP+BEDE + 2B len + 16B tag)
-    let exact_edge = max_wire_allowed.saturating_sub(38);
+    let exact_edge = max_wire_allowed.saturating_sub(SRTP_DATA_MIN_WIRE_LEN);
     let oversize = exact_edge + 30; // e.g., 1452B when WAN MTU = 1488
 
     let probe = |len: usize| -> bool {
         let mut p = vec![0u8; len];
         p[..4].copy_from_slice(b"MTU:");
         fill_random(&mut p[4..]);
-        let mut rb = vec![0u8; 4096];
+        let mut rb = vec![0u8; DTLS_IO_BUF_LEN];
         app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         let _ = app.send(&p);
         match app.recv(&mut rb) {
@@ -512,7 +515,7 @@ pub(super) fn test_06_single_stun_drop(opts: &SelftestOptions, hi: &mut Highligh
     }
 
     let port1 = proxy.first_port.load(Ordering::SeqCst);
-    let mut rbuf = [0u8; 256];
+    let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
     let wait_t0 = Instant::now();
     let mut ping_ok = 0u64;
     while wait_t0.elapsed() < Duration::from_secs(5) {

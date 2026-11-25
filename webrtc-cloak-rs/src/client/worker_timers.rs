@@ -4,25 +4,67 @@ use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_sess
 use super::worker::ClientWorker;
 use super::{
     cancel_standby_for_client, is_client_in_trickle, log, make_udp_socket, HandshakeState,
-    OldPathDrain, ACTIVE_ROTATE_WINDOW_SECS, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS,
-    KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS, POST_BYE_CLOSING_DRAIN_MS,
-    TRICKLE_MBB_5MIN_BYTES,
+    OldPathDrain, ACTIVE_ROTATE_WINDOW_SECS, CLIENT_HANDOVER_MIN_RETRY_MS,
+    CLIENT_MIG_ECHO_INTERVAL_MS, CLIENT_SRTCP_ACTIVE_MAX_MS, CLIENT_SRTCP_ACTIVE_MIN_MS,
+    KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS, RECENT_ROTATION_DAMP_SECS,
+    SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
+};
+use crate::constants::{
+    BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS,
+    POST_BYE_CLOSING_DRAIN_MS, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
+    SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, SRTP_HANDOVER_MAGIC,
+    SRTP_PATH_CHALLENGE_MAGIC, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
+    WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
 };
 use crate::protocol::{
     build_ice_stun_request, build_ice_stun_request_with_key, rand_duration_range_ms,
-    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC,
 };
 use mio::{Interest, Token};
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+/// 客户端轮换历史记录表最大容量，超过后清理过期条目。
+const MAX_ROTATION_HISTORY_ENTRIES: usize = 1024;
+/// 5 分钟滑动窗口内低于该字节数（64 KiB，约 218 B/s）时暂停定时 MBB 轮换。
+const TRICKLE_MBB_5MIN_BYTES: u64 = 64 * 1024;
+/// STUN 保活首次 RTO 最小等待时间（毫秒）。
+const KA_RTO_INITIAL_MIN_MS: u64 = 950;
+/// STUN 保活首次 RTO 最大等待时间（毫秒）。
+const KA_RTO_INITIAL_MAX_MS: u64 = 1250;
+/// STUN 保活第 1 次重传后 RTO 最小等待时间（毫秒）。
+const KA_RTO_RETRY1_MIN_MS: u64 = 1400;
+/// STUN 保活第 1 次重传后 RTO 最大等待时间（毫秒）。
+const KA_RTO_RETRY1_MAX_MS: u64 = 1800;
+/// STUN 保活后续重传 RTO 最小等待时间（毫秒）。
+const KA_RTO_RETRY2_MIN_MS: u64 = 1800;
+/// STUN 保活后续重传 RTO 最大等待时间（毫秒）。
+const KA_RTO_RETRY2_MAX_MS: u64 = 2200;
+/// 判定静默下行死锁所需的最小已发送数据包数。
+const CLIENT_DL_DEADLOCK_MIN_TX_PKTS: u64 = 3;
+/// 发送数据后零下行认证包触发自动轮换的死锁保护时长（秒）。
+const CLIENT_DL_DEADLOCK_SECS: u64 = 15;
+/// MBB `0xFFFC` 交接请求最大重传次数（覆盖跨洋 DTLS 1.3 Flight 5 丢失恢复时间）。
+const CLIENT_HANDOVER_MAX_RETRIES: u8 = 4;
+/// 1-RTT ICE 迁移 STUN 请求最大重传次数，超限后回退为完整新建会话。
+const CLIENT_MIGRATION_MAX_RETRIES: u8 = 2;
+/// 细流状态下挂起 MBB 轮换后的最小复检间隔（毫秒）。
+const CLIENT_MBB_TRICKLE_RECHECK_MIN_MS: u64 = 60_000;
+/// 细流状态下挂起 MBB 轮换后的最大复检间隔（毫秒）。
+const CLIENT_MBB_TRICKLE_RECHECK_MAX_MS: u64 = 180_000;
+/// MBB 备选会话握手失败后的最小重试退避间隔（毫秒）。
+const CLIENT_MBB_FAIL_BACKOFF_MIN_MS: u64 = 45_000;
+/// MBB 备选会话握手失败后的最大重试退避间隔（毫秒）。
+const CLIENT_MBB_FAIL_BACKOFF_MAX_MS: u64 = 90_000;
+/// MBB 定时轮换检查的最小 poll 步进下限（毫秒）。
+const WORKER_MIN_ROTATE_WAIT_MS: u64 = 20;
+
 impl ClientWorker {
     pub(super) fn process_timers(&mut self, now: Instant) -> (Duration, Vec<(Token, SocketAddr)>) {
     let mut wait = if self.sessions_by_token.is_empty() && self.pending_reconnects.is_empty() {
-        Duration::from_secs(5)
+        Duration::from_secs(WORKER_IDLE_POLL_SECS)
     } else {
-        Duration::from_secs(1)
+        Duration::from_secs(WORKER_ACTIVE_POLL_SECS)
     };
     let mut to_close: Vec<(Token, &'static str)> = Vec::new();
     let mut to_rotate: Vec<(Token, SocketAddr, bool)> = Vec::new();
@@ -52,7 +94,7 @@ impl ClientWorker {
         } else {
             let rem = pr.at.saturating_duration_since(now);
             if rem < wait {
-                wait = rem.max(Duration::from_millis(5));
+                wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
             }
         }
     }
@@ -99,7 +141,7 @@ impl ClientWorker {
                 } else {
                     let rem = sess.next_retry_at.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(5));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                     }
                 }
             }
@@ -130,7 +172,7 @@ impl ClientWorker {
                     } else {
                         let rem = t.saturating_duration_since(now);
                         if rem < wait {
-                            wait = rem.max(Duration::from_millis(5));
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                         }
                     }
                 }
@@ -139,7 +181,7 @@ impl ClientWorker {
                 // Drive DTLS 1.3 Flight 5 retransmit timer if still armed while awaiting 0xFFFC Ack
                 if let Some(t) = sess.dtls_next_timeout {
                     let rem = t.saturating_duration_since(now);
-                    if rem > Duration::from_secs(60) {
+                    if rem > Duration::from_secs(DTLS_IDLE_TIMEOUT_THRESHOLD_SECS) {
                         sess.dtls_next_timeout = None;
                     } else if now >= t {
                         let err = if let Some(ref mut dtls) = sess.dtls {
@@ -166,14 +208,14 @@ impl ClientWorker {
                             continue;
                         }
                     } else if rem < wait {
-                        wait = rem.max(Duration::from_millis(5));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                     }
                 }
                 if let Some(rt) = sess.handover_retry_at {
                     if now >= rt {
                         // P0-5 fix: 4 retries x ~380ms (~1.5s) covers >=2 full DTLS 1.3 Flight 5 RTOs
                         // on 180ms trans-Pacific WAN while old primary keeps running with 0ms stall!
-                        if sess.handover_retries < 4 {
+                        if sess.handover_retries < CLIENT_HANDOVER_MAX_RETRIES {
                             sess.handover_retries += 1;
                             if let (Some(ref payload), Some(ref mut cipher)) =
                                 (&sess.handover_payload, &mut sess.cipher)
@@ -188,8 +230,11 @@ impl ClientWorker {
                                     }
                                 }
                             }
-                            sess.handover_retry_at =
-                                Some(now + self.retry_dur.max(Duration::from_millis(380)));
+                            sess.handover_retry_at = Some(
+                                now + self
+                                    .retry_dur
+                                    .max(Duration::from_millis(CLIENT_HANDOVER_MIN_RETRY_MS)),
+                            );
                         } else {
                             // P0-5 fix: Only fall back to legacy v0.3.8 promotion if peer proved live
                             // (authenticated SRTCP/SRTP or DTLS 1.3 Flight 5 ACK received); otherwise
@@ -219,7 +264,7 @@ impl ClientWorker {
                     } else {
                         let rem = rt.saturating_duration_since(now);
                         if rem < wait {
-                            wait = rem.max(Duration::from_millis(5));
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                         }
                     }
                 }
@@ -227,7 +272,7 @@ impl ClientWorker {
             HandshakeState::Migrating => {
                 if let Some(rt) = sess.mig_retry_at {
                     if now >= rt {
-                        if sess.mig_retries < 2 {
+                        if sess.mig_retries < CLIENT_MIGRATION_MAX_RETRIES {
                             sess.mig_retries += 1;
                             if let Some(mk) = sess.mi_key_mig {
                                 // Fresh txid on each retry prevents an on-path spoofed-IP racer from stalling us!
@@ -262,7 +307,7 @@ impl ClientWorker {
                     } else {
                         let rem = rt.saturating_duration_since(now);
                         if rem < wait {
-                            wait = rem.max(Duration::from_millis(5));
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                         }
                     }
                 }
@@ -291,12 +336,12 @@ impl ClientWorker {
                                 sess.mig_echo_next_at = None;
                             } else {
                                 sess.mig_echo_next_at =
-                                    Some(now + Duration::from_millis(250));
+                                    Some(now + Duration::from_millis(CLIENT_MIG_ECHO_INTERVAL_MS));
                             }
                         } else {
                             let rem = next_at.saturating_duration_since(now);
                             if rem < wait {
-                                wait = rem.max(Duration::from_millis(10));
+                                wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                             }
                         }
                     }
@@ -307,7 +352,7 @@ impl ClientWorker {
                 // recovers within ~350ms instead of stalling 25s!
                 if let Some(t) = sess.dtls_next_timeout {
                     let rem = t.saturating_duration_since(now);
-                    if rem > Duration::from_secs(60) {
+                    if rem > Duration::from_secs(DTLS_IDLE_TIMEOUT_THRESHOLD_SECS) {
                         // dimpl entered 10-year IDLE_INTERVAL after receiving server ACK
                         sess.dtls_next_timeout = None;
                     } else if now >= t {
@@ -351,7 +396,7 @@ impl ClientWorker {
                             continue;
                         }
                     } else if rem < wait {
-                        wait = rem.max(Duration::from_millis(5));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                     }
                 }
 
@@ -361,12 +406,14 @@ impl ClientWorker {
                     .as_ref()
                     .map(|c| c.is_seq_exhausted())
                     .unwrap_or(false);
-                let dl_deadlock = sess.tx_pkts >= 3
+                let dl_deadlock = sess.tx_pkts >= CLIENT_DL_DEADLOCK_MIN_TX_PKTS
                     && sess.rx_pkts == 0
                     && sess.srtcp_rx == 0
                     && sess
                         .ready_at
-                        .map(|r| now.duration_since(r) > Duration::from_secs(15))
+                        .map(|r| {
+                            now.duration_since(r) > Duration::from_secs(CLIENT_DL_DEADLOCK_SECS)
+                        })
                         .unwrap_or(false);
                 if seq_exhausted || dl_deadlock {
                     log(
@@ -403,8 +450,9 @@ impl ClientWorker {
                             let obs_secs = sess
                                 .ready_at
                                 .map_or(1, |r| now.duration_since(r).as_secs().max(1))
-                                .min(300);
-                            let threshold_bytes = (TRICKLE_MBB_5MIN_BYTES * obs_secs) / 300;
+                                .min(TRICKLE_WINDOW_5MIN_SECS);
+                            let threshold_bytes =
+                                (TRICKLE_MBB_5MIN_BYTES * obs_secs) / TRICKLE_WINDOW_5MIN_SECS;
                             let recent_bytes = sess.rate_5min.bytes_in_window(now);
                             let active_traffic = now.duration_since(sess.last_data_active)
                                 <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS)
@@ -416,7 +464,10 @@ impl ClientWorker {
                             } else {
                                 // Background trickle keepalives only -> suspend MBB churn and re-check later!
                                 let recheck = if self.cfg.rotate_interval_secs >= 60 {
-                                    rand_duration_range_ms(60_000, 180_000)
+                                    rand_duration_range_ms(
+                                        CLIENT_MBB_TRICKLE_RECHECK_MIN_MS,
+                                        CLIENT_MBB_TRICKLE_RECHECK_MAX_MS,
+                                    )
                                 } else {
                                     Duration::from_secs(self.cfg.rotate_interval_secs.max(1))
                                 };
@@ -425,7 +476,7 @@ impl ClientWorker {
                         } else {
                             let rem = rot_at.saturating_duration_since(now);
                             if rem < wait {
-                                wait = rem.max(Duration::from_millis(20));
+                                wait = rem.max(Duration::from_millis(WORKER_MIN_ROTATE_WAIT_MS));
                             }
                         }
                     }
@@ -452,9 +503,15 @@ impl ClientWorker {
                                     let _ = sess.upstream.send(&sess.ka_pkt);
                                     sess.ka_sent_at = Some(now);
                                     let next_rto = if sess.ka_retries == 1 {
-                                        rand_duration_range_ms(1400, 1800)
+                                        rand_duration_range_ms(
+                                            KA_RTO_RETRY1_MIN_MS,
+                                            KA_RTO_RETRY1_MAX_MS,
+                                        )
                                     } else {
-                                        rand_duration_range_ms(1800, 2200)
+                                        rand_duration_range_ms(
+                                            KA_RTO_RETRY2_MIN_MS,
+                                            KA_RTO_RETRY2_MAX_MS,
+                                        )
                                     };
                                     sess.ka_rto_at = Some(now + next_rto);
                                 } else {
@@ -521,7 +578,7 @@ impl ClientWorker {
                             } else {
                                 let rem = rto_at.saturating_duration_since(now);
                                 if rem < wait {
-                                    wait = rem.max(Duration::from_millis(10));
+                                    wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                                 }
                             }
                         }
@@ -532,18 +589,24 @@ impl ClientWorker {
                         sess.ka_pkt = pkt;
                         sess.ka_retries = 0;
                         sess.ka_sent_at = Some(now);
-                        sess.ka_rto_at = Some(now + rand_duration_range_ms(950, 1250));
+                        sess.ka_rto_at = Some(
+                            now + rand_duration_range_ms(
+                                KA_RTO_INITIAL_MIN_MS,
+                                KA_RTO_INITIAL_MAX_MS,
+                            ),
+                        );
                     } else {
                         let rem = sess.next_keepalive_at.saturating_duration_since(now);
                         if rem < wait {
-                            wait = rem.max(Duration::from_millis(10));
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                         }
                     }
                 }
                 if now >= sess.next_srtcp_at {
                     let in_trickle = is_client_in_trickle(sess, now);
                     let is_active_media = !in_trickle
-                        && now.duration_since(sess.last_data_active) <= Duration::from_secs(3);
+                        && now.duration_since(sess.last_data_active)
+                            <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
                     let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
                     let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
                     sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
@@ -556,16 +619,19 @@ impl ClientWorker {
                     }
                     sess.next_srtcp_at = now
                         + if is_active_media {
-                            rand_duration_range_ms(900, 1900)
+                            rand_duration_range_ms(
+                                CLIENT_SRTCP_ACTIVE_MIN_MS,
+                                CLIENT_SRTCP_ACTIVE_MAX_MS,
+                            )
                         } else if !in_trickle {
-                            rand_duration_range_ms(3500, 6500)
+                            rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
                         } else {
-                            rand_duration_range_ms(20_000, 40_000)
+                            rand_duration_range_ms(SRTCP_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS)
                         };
                 } else {
                     let rem = sess.next_srtcp_at.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(10));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                     }
                 }
             }
@@ -578,7 +644,7 @@ impl ClientWorker {
                 } else {
                     let rem = bye_at.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(10));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                     }
                 }
             }
@@ -588,7 +654,7 @@ impl ClientWorker {
                 } else {
                     let rem = deadline.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(10));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                     }
                 }
             }
@@ -610,11 +676,11 @@ impl ClientWorker {
         );
         let recently_rotated = self.last_rotation_by_client
             .get(&client_addr)
-            .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+            .map(|&t| now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS))
             .unwrap_or(false);
         self.last_rotation_by_client.insert(client_addr, now);
         let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let new_up = match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, 2 * 1024 * 1024) {
+        let new_up = match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_2MIB) {
             Ok(s) => s,
             Err(_) => continue,
         };
@@ -721,11 +787,13 @@ impl ClientWorker {
         );
         let recently_rotated = self.last_rotation_by_client
             .get(&client_addr)
-            .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+            .map(|&t| now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS))
             .unwrap_or(false);
         self.last_rotation_by_client.insert(client_addr, now);
-        if self.last_rotation_by_client.len() > 1024 {
-            self.last_rotation_by_client.retain(|_, &mut t| now.duration_since(t) < Duration::from_secs(60));
+        if self.last_rotation_by_client.len() > MAX_ROTATION_HISTORY_ENTRIES {
+            self.last_rotation_by_client.retain(|_, &mut t| {
+                now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS)
+            });
         }
         let next_ka_retries = if recently_rotated {
             KA_MAX_RETRIES_DAMPED
@@ -804,8 +872,12 @@ impl ClientWorker {
                         if let Some(prim) = self.sessions_by_token.get_mut(&owner_tok) {
                             prim.standby_spawned = false;
                             if self.cfg.rotate_interval_secs > 0 {
-                                prim.rotate_at =
-                                    Some(now + rand_duration_range_ms(45_000, 90_000));
+                                prim.rotate_at = Some(
+                                    now + rand_duration_range_ms(
+                                        CLIENT_MBB_FAIL_BACKOFF_MIN_MS,
+                                        CLIENT_MBB_FAIL_BACKOFF_MAX_MS,
+                                    ),
+                                );
                             }
                         }
                     }

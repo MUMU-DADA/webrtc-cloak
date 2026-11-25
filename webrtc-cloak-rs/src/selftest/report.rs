@@ -1,6 +1,7 @@
 //! 自测结果终端美化表格渲染与 JSON 报告输出。
 
 use super::{Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
+use crate::constants::IPV4_UDP_HDR_LEN;
 use crate::protocol::CipherPref;
 
 pub(super) struct Palette {
@@ -416,7 +417,7 @@ pub(super) fn print_pretty_report(
                 "Wire Overhead (1200B): {}  |  Max Wire UDP: {}B / {}B  |  Loopback Goodput: {}",
                 ov_str,
                 hi.max_wire_udp,
-                opts.wan_mtu.saturating_sub(28),
+                opts.wan_mtu.saturating_sub(IPV4_UDP_HDR_LEN),
                 gp_str
             ),
             format!(

@@ -2,7 +2,7 @@
 
 use super::{
     round_n, EventsPayload, LinkPayload, SessionsPayload, StatusPayload, TelemetryHub,
-    TelemetryInner,
+    TelemetryInner, HEALTH_CODE_CRITICAL,
 };
 use std::io::Write;
 use std::path::Path;
@@ -104,7 +104,7 @@ impl TelemetryInner {
     }
 
     pub(super) fn is_critical(&mut self, now: Instant) -> bool {
-        self.compute_view(now).health_code == 0
+        self.compute_view(now).health_code == HEALTH_CODE_CRITICAL
     }
 }
 

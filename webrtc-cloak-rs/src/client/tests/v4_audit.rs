@@ -112,9 +112,9 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
                 let pkt = &buf[..n];
                 if demux_rfc7983(pkt) == PacketKind::Srtp && n >= 12 {
                     let pt = pkt[1] & 0x7F;
-                    if pt == crate::protocol::RTP_VIDEO_PT {
+                    if pt == crate::constants::RTP_VIDEO_PT {
                         r_vlens.lock().unwrap().push(n);
-                    } else if pt == crate::protocol::RTP_AUDIO_PT {
+                    } else if pt == crate::constants::RTP_AUDIO_PT {
                         let ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
                         if let Some((prev_ts, prev_t)) = last_audio_ts_c2s {
                             if prev_ts == ts && now.duration_since(prev_t) < Duration::from_millis(18) {

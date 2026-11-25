@@ -22,6 +22,44 @@ pub use stun::{
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+/// RFC 7983 首字节 `0..=3` 归类为 STUN 报文。
+const DEMUX_STUN_MAX: u8 = 3;
+/// RFC 7983 首字节 `20..=63` 归类为 DTLS 1.2/1.3 报文（下界）。
+const DEMUX_DTLS_MIN: u8 = 20;
+/// RFC 7983 首字节 `20..=63` 归类为 DTLS 1.2/1.3 报文（上界）。
+const DEMUX_DTLS_MAX: u8 = 63;
+/// RFC 7983 首字节 `128..=191` 归类为 RTP/RTCP 报文（下界）。
+const DEMUX_RTP_MIN: u8 = 128;
+/// RFC 7983 首字节 `128..=191` 归类为 RTP/RTCP 报文（上界）。
+const DEMUX_RTP_MAX: u8 = 191;
+/// RFC 5761 次字节 `192..=223` 归类为 SRTCP 报文（下界）。
+const DEMUX_RTCP_PT_MIN: u8 = 192;
+/// RFC 5761 次字节 `192..=223` 归类为 SRTCP 报文（上界）。
+const DEMUX_RTCP_PT_MAX: u8 = 223;
+/// 对数正态时长分布标准差参数（打破矩形抖动边界指纹）。
+const LOGNORMAL_DUR_SIGMA: f64 = 0.45;
+/// 对数正态时长分布最小倍率下限（0.35x）。
+const LOGNORMAL_DUR_MIN: f64 = 0.35;
+/// 对数正态时长分布最大倍率上限（2.80x）。
+const LOGNORMAL_DUR_MAX: f64 = 2.80;
+/// 对数正态字节预算分布标准差参数。
+const LOGNORMAL_BUDGET_SIGMA: f64 = 0.35;
+/// 对数正态字节预算分布最小倍率下限（0.50x）。
+const LOGNORMAL_BUDGET_MIN: f64 = 0.50;
+/// 对数正态字节预算分布最大倍率上限（1.85x）。
+const LOGNORMAL_BUDGET_MAX: f64 = 1.85;
+/// 标准 64 字符 Base64 字母表，用于生成无模偏差的 ICE ufrag 与 RTCP CNAME。
+pub(super) const BASE64_ALPHABET: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+/// RTP/RTCP 首字节版本号掩码（高 2 位）。
+pub(super) const RTP_V2_MASK: u8 = 0xC0;
+/// RTP/RTCP 版本 2 对应位值（`10xxxxxx`）。
+pub(super) const RTP_V2_BITS: u8 = 0x80;
+/// RTCP 明文主报头长度（字节）。
+pub(super) const RTCP_HDR_LEN: usize = 8;
+/// SDES CNAME 固定 ASCII 长度（13 字节，使 SDES 子包精确对齐 24B）。
+pub(super) const RTCP_CNAME_LEN: usize = 13;
+
 static SHUTDOWN_WAKERS: OnceLock<Mutex<Vec<Arc<mio::Waker>>>> = OnceLock::new();
 
 /// Register a worker `mio::Waker` to be notified immediately upon `SIGTERM`/`SIGINT`.
@@ -42,22 +80,6 @@ pub fn trigger_shutdown_wakers() {
         }
     }
 }
-
-pub const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-pub const STUN_BINDING_REQUEST: u16 = 0x0001;
-pub const STUN_BINDING_SUCCESS: u16 = 0x0101;
-pub const STUN_MAX_SKEW_SECS: i64 = 30;
-
-pub const RTP_FIXED_HDR_LEN: usize = 12;
-pub const RTP_EXT_LEN: usize = 8; // 4B 0xBEDE header + 4B one-byte transport-wide-cc extension
-pub const RTP_FULL_HDR_LEN: usize = RTP_FIXED_HDR_LEN + RTP_EXT_LEN; // 20B
-pub const SRTP_TAG_LEN: usize = 16; // Unified 16B tag across AES-GCM, ChaCha20, and BLAKE2b-128
-pub const MAX_INNER_UDP_LEN: usize = 65_400; // Hard bound preventing wbuf[65664] overflow
-pub const SRTP_PROBE_MAGIC_LEN: u16 = 0xFFFE; // Reserved > MAX_INNER_UDP_LEN for in-band encrypted selftest echo
-pub const SRTP_PATH_CHALLENGE_MAGIC: u16 = 0xFFFD; // V4: in-band encrypted 1-RTT ICE migration challenge/response/confirm
-pub const SRTP_HANDOVER_MAGIC: u16 = 0xFFFC; // V4: in-band encrypted MBB backend_sock atomic handover request/ack
-pub const RTP_VIDEO_PT: u8 = 96;
-pub const RTP_AUDIO_PT: u8 = 111; // Chrome Opus dynamic PT (48 kHz)
 
 /// Minimum allowed DTLS protocol version for handshakes:
 ///   - `Auto` (`1.2` / `auto`, default): DTLS 1.3 preferred with seamless DTLS 1.2 fallback for rolling upgrades.
@@ -175,10 +197,6 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
 }
 
 
-pub const DIR_C2S: u8 = 0;
-pub const DIR_S2C: u8 = 1;
-
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketKind {
     Stun,
@@ -192,10 +210,12 @@ pub enum PacketKind {
 #[inline]
 pub fn demux_rfc7983(data: &[u8]) -> PacketKind {
     match data.first().copied() {
-        Some(0..=3) => PacketKind::Stun,
-        Some(20..=63) => PacketKind::Dtls,
-        Some(128..=191) => {
-            if data.len() >= 8 && (192..=223).contains(&data[1]) {
+        Some(0..=DEMUX_STUN_MAX) => PacketKind::Stun,
+        Some(DEMUX_DTLS_MIN..=DEMUX_DTLS_MAX) => PacketKind::Dtls,
+        Some(DEMUX_RTP_MIN..=DEMUX_RTP_MAX) => {
+            if data.len() >= RTCP_HDR_LEN
+                && (DEMUX_RTCP_PT_MIN..=DEMUX_RTCP_PT_MAX).contains(&data[1])
+            {
                 PacketKind::Srtcp
             } else {
                 PacketKind::Srtp
@@ -257,7 +277,7 @@ pub fn lognormal_duration_ms(median_ms: u64) -> Duration {
     if median_ms == 0 {
         return Duration::from_millis(0);
     }
-    let f = lognormal_factor(0.45, 0.35, 2.80);
+    let f = lognormal_factor(LOGNORMAL_DUR_SIGMA, LOGNORMAL_DUR_MIN, LOGNORMAL_DUR_MAX);
     let ms = ((median_ms as f64) * f).round().max(1.0) as u64;
     Duration::from_millis(ms)
 }
@@ -268,7 +288,11 @@ pub fn rand_byte_budget(base_bytes: u64) -> u64 {
     if base_bytes == 0 {
         return 0;
     }
-    let f = lognormal_factor(0.35, 0.50, 1.85);
+    let f = lognormal_factor(
+        LOGNORMAL_BUDGET_SIGMA,
+        LOGNORMAL_BUDGET_MIN,
+        LOGNORMAL_BUDGET_MAX,
+    );
     ((base_bytes as f64) * f).round().max(1.0) as u64
 }
 
@@ -325,10 +349,11 @@ impl RollingByteWindow {
 
 /// Chrome/libwebrtc 4-char ICE ufrag from the 64-char Base64 alphabet (zero modulo bias).
 pub fn rand_ufrag_chrome() -> String {
-    const ALPHA: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut raw = [0u8; 4];
     fill_random(&mut raw);
-    raw.iter().map(|&b| ALPHA[(b & 0x3F) as usize] as char).collect()
+    raw.iter()
+        .map(|&b| BASE64_ALPHABET[(b & 0x3F) as usize] as char)
+        .collect()
 }
 
 pub fn unix_secs() -> u32 {
@@ -337,10 +362,4 @@ pub fn unix_secs() -> u32 {
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0)
 }
-
-
-/// Default outer IPv4 WAN MTU ceiling (1488B < 1492B PPPoE -> max outer UDP payload 1460B).
-/// Eliminates IPv4 UDP fragmentation on PPPoE/CGNAT links and forces inner QUIC DPLPMTUD
-/// (e.g. Hysteria 2 over 127.0.0.1) to converge cleanly without fragmented packets.
-pub const DEFAULT_WAN_MTU: usize = 1488;
 

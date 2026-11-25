@@ -5,6 +5,7 @@ mod export;
 mod tests;
 
 use self::export::{handle_http_request, write_atomic_file};
+use crate::constants::TELEMETRY_DEFAULT_INTERVAL_SECS;
 use serde::Serialize;
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -14,10 +15,42 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tiny_http::Server as HttpServer;
 
-const STUN_LOSS_WINDOW: usize = 20;
-const RECENT_EVENT_CAP: usize = 8;
-const WINDOW_10M: Duration = Duration::from_secs(600);
-const MIN_FILE_FLUSH_GAP: Duration = Duration::from_millis(250);
+/// `--status-interval` 允许的最小刷新间隔（秒）。
+const TELEMETRY_INTERVAL_MIN_SECS: u64 = 1;
+/// `--status-interval` 允许的最大刷新间隔（秒）。
+const TELEMETRY_INTERVAL_MAX_SECS: u64 = 60;
+/// 计算外层 STUN 丢包率的最近探测结果滑动窗口大小（条）。
+const TELEMETRY_STUN_LOSS_WINDOW: usize = 20;
+/// JSON 状态报告中保留的最近关键事件历史条数上限。
+const TELEMETRY_RECENT_EVENT_CAP: usize = 8;
+/// 统计黑洞、1-RTT 迁移及未认证静默丢弃计数的滑动时间窗（10 分钟）。
+const TELEMETRY_SLIDING_WINDOW: Duration = Duration::from_secs(600);
+/// 非强制触发时状态 JSON 文件最小原子写入间隔（毫秒），防止突发事件频繁落盘。
+const TELEMETRY_MIN_FILE_FLUSH_GAP: Duration = Duration::from_millis(250);
+/// 遥测只读 HTTP 服务接收请求的轮询超时（毫秒），确保退出信号快速响应。
+const TELEMETRY_HTTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+/// 计算实时吞吐 Mbps 所需的最小采样时间差（秒）。
+const TELEMETRY_MIN_RATE_DT_SECS: f64 = 0.5;
+/// 计入 STUN RTT 统计的单样本合法上限（毫秒），过滤异常尖刺。
+const TELEMETRY_MAX_VALID_RTT_MS: f64 = 60_000.0;
+/// STUN RTT 指数加权移动平均（EWMA）新样本权重系数。
+const TELEMETRY_RTT_EWMA_ALPHA: f64 = 0.25;
+/// 10 分钟内黑洞次数达到该阈值时判定链路健康状态为 `critical`。
+const TELEMETRY_HEALTH_CRITICAL_BLACKHOLES: usize = 2;
+/// STUN 滑动丢包率达到该百分比时判定链路健康状态为 `critical`。
+const TELEMETRY_HEALTH_CRITICAL_LOSS_PCT: f64 = 15.0;
+/// STUN 滑动丢包率达到该百分比时判定链路健康状态为 `degraded`。
+const TELEMETRY_HEALTH_DEGRADED_LOSS_PCT: f64 = 2.0;
+/// STUN 抖动达到该毫秒阈值时判定链路健康状态为 `degraded`。
+const TELEMETRY_HEALTH_DEGRADED_JITTER_MS: f64 = 30.0;
+/// Prometheus `webrtc_cloak_health_code` 数值编码：`critical`。
+pub(super) const HEALTH_CODE_CRITICAL: u8 = 0;
+/// Prometheus `webrtc_cloak_health_code` 数值编码：`idle`。
+const HEALTH_CODE_IDLE: u8 = 1;
+/// Prometheus `webrtc_cloak_health_code` 数值编码：`degraded`。
+const HEALTH_CODE_DEGRADED: u8 = 2;
+/// Prometheus `webrtc_cloak_health_code` 数值编码：`good`。
+const HEALTH_CODE_GOOD: u8 = 3;
 
 #[derive(Clone, Default)]
 pub struct TelemetryConfig {
@@ -36,9 +69,10 @@ impl TelemetryConfig {
     #[inline]
     pub fn interval(&self) -> Duration {
         let s = if self.status_interval_secs == 0 {
-            5
+            TELEMETRY_DEFAULT_INTERVAL_SECS
         } else {
-            self.status_interval_secs.clamp(1, 60)
+            self.status_interval_secs
+                .clamp(TELEMETRY_INTERVAL_MIN_SECS, TELEMETRY_INTERVAL_MAX_SECS)
         };
         Duration::from_secs(s)
     }
@@ -194,7 +228,7 @@ pub(super) fn round_n(v: f64, scale: f64) -> f64 {
 
 fn prune_times(q: &mut VecDeque<Instant>, now: Instant) {
     while let Some(&t) = q.front() {
-        if now.saturating_duration_since(t) > WINDOW_10M {
+        if now.saturating_duration_since(t) > TELEMETRY_SLIDING_WINDOW {
             q.pop_front();
         } else {
             break;
@@ -204,7 +238,7 @@ fn prune_times(q: &mut VecDeque<Instant>, now: Instant) {
 
 fn prune_unauth(q: &mut VecDeque<(Instant, u64)>, now: Instant) {
     while let Some(&(t, _)) = q.front() {
-        if now.saturating_duration_since(t) > WINDOW_10M {
+        if now.saturating_duration_since(t) > TELEMETRY_SLIDING_WINDOW {
             q.pop_front();
         } else {
             break;
@@ -308,20 +342,20 @@ impl TelemetryInner {
             && migrating_sessions == 0
             && handshaking_sessions == 0
         {
-            ("idle", 1u8)
+            ("idle", HEALTH_CODE_IDLE)
         } else if migrating_sessions > 0
-            || blackholes_last_10m >= 2
-            || stun_loss_pct >= 15.0
+            || blackholes_last_10m >= TELEMETRY_HEALTH_CRITICAL_BLACKHOLES
+            || stun_loss_pct >= TELEMETRY_HEALTH_CRITICAL_LOSS_PCT
         {
-            ("critical", 0u8)
+            ("critical", HEALTH_CODE_CRITICAL)
         } else if blackholes_last_10m == 1
-            || stun_loss_pct >= 2.0
-            || self.stun_jitter_ms >= 30.0
+            || stun_loss_pct >= TELEMETRY_HEALTH_DEGRADED_LOSS_PCT
+            || self.stun_jitter_ms >= TELEMETRY_HEALTH_DEGRADED_JITTER_MS
             || (active_sessions == 0 && handshaking_sessions > 0)
         {
-            ("degraded", 2u8)
+            ("degraded", HEALTH_CODE_DEGRADED)
         } else {
-            ("good", 3u8)
+            ("good", HEALTH_CODE_GOOD)
         };
 
         AggregatedView {
@@ -378,7 +412,7 @@ impl TelemetryHub {
             stun_rtt_ewma_ms: None,
             stun_jitter_ms: 0.0,
             stun_rtt_samples: 0,
-            stun_outcomes: VecDeque::with_capacity(STUN_LOSS_WINDOW),
+            stun_outcomes: VecDeque::with_capacity(TELEMETRY_STUN_LOSS_WINDOW),
             stun_probes_ok_total: 0,
             stun_probes_lost_total: 0,
             mapped_nat: None,
@@ -392,7 +426,7 @@ impl TelemetryHub {
             unauth_deltas_10m: VecDeque::new(),
             last_event: "started",
             last_event_unix: unix_now_secs(),
-            recent_events: VecDeque::with_capacity(RECENT_EVENT_CAP),
+            recent_events: VecDeque::with_capacity(TELEMETRY_RECENT_EVENT_CAP),
             last_file_flush: None,
         };
         let hub = Arc::new(Self {
@@ -448,7 +482,7 @@ impl TelemetryHub {
                             {
                                 break;
                             }
-                            match server.recv_timeout(Duration::from_millis(100)) {
+                            match server.recv_timeout(TELEMETRY_HTTP_RECV_TIMEOUT) {
                                 Ok(Some(req)) => handle_http_request(req, &hub_c),
                                 Ok(None) => {}
                                 Err(_) => break,
@@ -526,7 +560,7 @@ impl TelemetryHub {
             };
             if !force {
                 if let Some(last) = g.last_file_flush {
-                    if now.saturating_duration_since(last) < MIN_FILE_FLUSH_GAP {
+                    if now.saturating_duration_since(last) < TELEMETRY_MIN_FILE_FLUSH_GAP {
                         return;
                     }
                 }
@@ -557,7 +591,7 @@ impl TelemetryHub {
                 .iter()
                 .fold(0u64, |acc, w| acc.saturating_add(w.rx_bytes_total));
             let dt_s = now.saturating_duration_since(g.rate_prev_at).as_secs_f64();
-            if dt_s >= 0.5 {
+            if dt_s >= TELEMETRY_MIN_RATE_DT_SECS {
                 let dtx = total_tx.saturating_sub(g.rate_prev_tx_bytes);
                 let drx = total_rx.saturating_sub(g.rate_prev_rx_bytes);
                 g.tx_mbps = (dtx as f64 * 8.0) / dt_s / 1_000_000.0;
@@ -573,7 +607,7 @@ impl TelemetryHub {
     /// Record a completed STUN handshake or consent keepalive RTT sample + any retries lost before success.
     pub fn record_stun_ok(&self, rtt_ms: f64, retries_before_ok: u8, mapped: Option<SocketAddr>) {
         if let Ok(mut g) = self.inner.lock() {
-            if rtt_ms.is_finite() && rtt_ms >= 0.0 && rtt_ms < 60_000.0 {
+            if rtt_ms.is_finite() && rtt_ms >= 0.0 && rtt_ms < TELEMETRY_MAX_VALID_RTT_MS {
                 if let Some(prev) = g.stun_rtt_ms {
                     let d = (rtt_ms - prev).abs();
                     let div = if g.stun_rtt_samples < 4 { 4.0 } else { 16.0 };
@@ -581,7 +615,10 @@ impl TelemetryHub {
                 }
                 g.stun_rtt_ms = Some(rtt_ms);
                 g.stun_rtt_ewma_ms = Some(match g.stun_rtt_ewma_ms {
-                    Some(prev) => prev * 0.75 + rtt_ms * 0.25,
+                    Some(prev) => {
+                        prev * (1.0 - TELEMETRY_RTT_EWMA_ALPHA)
+                            + rtt_ms * TELEMETRY_RTT_EWMA_ALPHA
+                    }
                     None => rtt_ms,
                 });
                 g.stun_rtt_samples += 1;
@@ -590,13 +627,13 @@ impl TelemetryHub {
                 g.mapped_nat = Some(addr.to_string());
             }
             for _ in 0..retries_before_ok {
-                if g.stun_outcomes.len() >= STUN_LOSS_WINDOW {
+                if g.stun_outcomes.len() >= TELEMETRY_STUN_LOSS_WINDOW {
                     g.stun_outcomes.pop_front();
                 }
                 g.stun_outcomes.push_back(false);
                 g.stun_probes_lost_total += 1;
             }
-            if g.stun_outcomes.len() >= STUN_LOSS_WINDOW {
+            if g.stun_outcomes.len() >= TELEMETRY_STUN_LOSS_WINDOW {
                 g.stun_outcomes.pop_front();
             }
             g.stun_outcomes.push_back(true);
@@ -609,7 +646,7 @@ impl TelemetryHub {
         let now = Instant::now();
         if let Ok(mut g) = self.inner.lock() {
             for _ in 0..attempts.max(1) {
-                if g.stun_outcomes.len() >= STUN_LOSS_WINDOW {
+                if g.stun_outcomes.len() >= TELEMETRY_STUN_LOSS_WINDOW {
                     g.stun_outcomes.pop_front();
                 }
                 g.stun_outcomes.push_back(false);
@@ -654,7 +691,7 @@ impl TelemetryHub {
         let ts = unix_now_secs();
         g.last_event = event;
         g.last_event_unix = ts;
-        if g.recent_events.len() >= RECENT_EVENT_CAP {
+        if g.recent_events.len() >= TELEMETRY_RECENT_EVENT_CAP {
             g.recent_events.pop_front();
         }
         g.recent_events.push_back(TelemetryEvent {

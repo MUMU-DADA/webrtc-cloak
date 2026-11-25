@@ -4,13 +4,19 @@ use super::registry::{SharedV4Registry, WorkerCmd};
 use super::{
     deregister_backend, ensure_owned_backend, log, record_server_media_bytes, BackendPipe,
     PendingPathMigration, ServerConfig, ServerSession, ServerState, WireAudit,
-    MAX_CHALLENGES_PER_SEC, MAX_FORWARD_HOPS, MAX_PENDING_MIGRATIONS_PER_SESSION,
-    MIGRATION_CHALLENGE_TTL, OLD_PEER_DRAIN_TTL,
+    MAX_CHALLENGES_PER_SEC, MAX_FORWARD_HOPS, MIGRATION_CHALLENGE_TTL, OLD_PEER_DRAIN_TTL,
+    SERVER_SRTCP_INIT_MAX_MS, SERVER_SRTCP_INIT_MIN_MS,
+};
+use crate::constants::{
+    CTRL_FRAME_BUF_LEN, HANDOVER_MIN_REQ_LEN, HANDOVER_OP_ACK, HANDOVER_OP_REQ, HANDOVER_PROOF_LEN,
+    PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
+    PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, PROBE_IO_BUF_LEN, SRTP_HANDOVER_MAGIC,
+    SRTP_PATH_CHALLENGE_MAGIC, STUN_MAX_USERNAME_LEN, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     combine_session_key, compute_handover_proof, derive_ice_migration_key,
     extract_dtls_server_hello_suite, fill_random, rand_duration_range_ms, resolve_srtp_suite,
-    RollingByteWindow, SrtpCloakCipher, SrtpFrame, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC,
+    RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
 use crate::telemetry::TelemetryHub;
 use dimpl::{Output as DtlsOutput, ProtocolVersion};
@@ -21,6 +27,9 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use subtle::ConstantTimeEq;
+
+/// 单会话最多同时保留的未验证迁移候选地址槽位数，隔离伪造源地址竞争攻击。
+const MAX_PENDING_MIGRATIONS_PER_SESSION: usize = 4;
 
 /// P0-2 & P0-4: Rate-limited, idempotent 4-slot candidate challenge allocator.
 /// Reuses exact `(nonce, epoch)` if `cand_addr` already has an unexpired slot so reordered STUN
@@ -78,11 +87,11 @@ pub(super) fn send_encrypted_path_challenge(
     audit: &mut WireAudit,
 )
 {
-    let mut payload = [0u8; 17];
-    payload[0] = 0x01; // Server -> Client challenge
+    let mut payload = [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
+    payload[0] = PATH_CHALLENGE_OP_REQ; // Server -> Client challenge
     payload[1..9].copy_from_slice(&nonce);
     payload[9..17].copy_from_slice(&epoch.to_be_bytes());
-    let mut pbuf = [0u8; 256];
+    let mut pbuf = [0u8; CTRL_FRAME_BUF_LEN];
     if let Some(ref mut cipher) = sess.cipher {
         if let Some(wn) =
             cipher.wrap_control_unpadded_into(SRTP_PATH_CHALLENGE_MAGIC, &payload, &mut pbuf)
@@ -103,10 +112,10 @@ pub(super) fn send_encrypted_path_confirm(
     audit: &mut WireAudit,
 )
 {
-    let mut payload = [0u8; 9];
-    payload[0] = 0x03; // Server -> Client confirm
+    let mut payload = [0u8; PATH_CONFIRM_PAYLOAD_LEN];
+    payload[0] = PATH_CHALLENGE_OP_CONFIRM; // Server -> Client confirm
     payload[1..9].copy_from_slice(&nonce);
-    let mut pbuf = [0u8; 256];
+    let mut pbuf = [0u8; CTRL_FRAME_BUF_LEN];
     if let Some(ref mut cipher) = sess.cipher {
         if let Some(wn) = cipher.wrap_control_into(SRTP_PATH_CHALLENGE_MAGIC, &payload, &mut pbuf) {
             audit.record(1, &pbuf[..wn]);
@@ -124,8 +133,8 @@ pub(super) fn send_encrypted_handover_ack(
     audit: &mut WireAudit,
 )
 {
-    let payload = [0x02u8, if ok { 0x01 } else { 0x00 }];
-    let mut pbuf = [0u8; 256];
+    let payload = [HANDOVER_OP_ACK, if ok { 0x01 } else { 0x00 }];
+    let mut pbuf = [0u8; CTRL_FRAME_BUF_LEN];
     if let Some(ref mut cipher) = sess.cipher {
         if let Some(wn) = cipher.wrap_control_into(SRTP_HANDOVER_MAGIC, &payload, &mut pbuf) {
             audit.record(1, &pbuf[..wn]);
@@ -303,9 +312,10 @@ pub(super) fn drain_server_dtls(
         sess.last_data_active = now;
         sess.last_peer_rx = now;
         sess.last_active_burst = now;
-        sess.rate_15s = RollingByteWindow::new(now, Duration::from_secs(15));
+        sess.rate_15s = RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_15S_SECS));
         sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
-        sess.next_srtcp_at = now + rand_duration_range_ms(300, 750);
+        sess.next_srtcp_at =
+            now + rand_duration_range_ms(SERVER_SRTCP_INIT_MIN_MS, SERVER_SRTCP_INIT_MAX_MS);
         registry.register_session(&sess.username, worker_id, mi_key_mig, sess.tie_breaker);
         became_ready = true;
         log(
@@ -431,7 +441,7 @@ pub(super) fn process_ready_srtp(
                 } else {
                     sess.peer_addr
                 };
-                let mut pbuf = [0u8; 2048];
+                let mut pbuf = [0u8; PROBE_IO_BUF_LEN];
                 if let Some(ref mut cipher) = sess.cipher {
                     if let Some(wn) = cipher.wrap_probe_into(&wbuf[..pn], &mut pbuf) {
                         audit.record(1, &pbuf[..wn]);
@@ -446,7 +456,7 @@ pub(super) fn process_ready_srtp(
         }
         SrtpFrame::PathChallenge(pn) => {
             // V4 1-RTT ICE path reachability response: [0x02 || nonce(8B) || epoch_be(8B)]
-            if pn == 17 && wbuf[0] == 0x02 {
+            if pn == PATH_CHALLENGE_PAYLOAD_LEN && wbuf[0] == PATH_CHALLENGE_OP_RESP {
                 let got_nonce: [u8; 8] = wbuf[1..9].try_into().unwrap();
                 let got_epoch = u64::from_be_bytes(wbuf[9..17].try_into().unwrap());
                 if let Some(sess) = sessions_by_token.get_mut(&tok) {
@@ -522,18 +532,19 @@ pub(super) fn process_ready_srtp(
         }
         SrtpFrame::Handover(pn) => {
             // V4 MBB encrypted backend_sock handover: [0x01 || old_ufrag_len(1B) || old_ufrag || proof(32B)]
-            if pn < 34 || wbuf[0] != 0x01 {
+            if pn < HANDOVER_MIN_REQ_LEN || wbuf[0] != HANDOVER_OP_REQ {
                 return;
             }
             let ulen = wbuf[1] as usize;
-            if ulen == 0 || ulen > 64 || pn != 2 + ulen + 32 {
+            if ulen == 0 || ulen > STUN_MAX_USERNAME_LEN || pn != 2 + ulen + HANDOVER_PROOF_LEN {
                 return;
             }
             let Ok(old_ufrag) = std::str::from_utf8(&wbuf[2..2 + ulen]) else {
                 return;
             };
             let old_ufrag = old_ufrag.to_string();
-            let proof: [u8; 32] = wbuf[2 + ulen..2 + ulen + 32].try_into().unwrap();
+            let proof: [u8; HANDOVER_PROOF_LEN] =
+                wbuf[2 + ulen..2 + ulen + HANDOVER_PROOF_LEN].try_into().unwrap();
 
             let Some((new_ufrag, new_key)) = sessions_by_token.get_mut(&tok).and_then(|s| {
                 s.rx_pkts += 1;

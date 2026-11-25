@@ -4,8 +4,16 @@ use super::handlers::{drain_server_dtls, graceful_teardown_server, process_ready
 use super::registry::{SeenTxidCache, SharedV4Registry, WorkerCmd};
 use super::{
     cleanup_session_routes, log, make_udp_socket, ServerConfig, ServerSession, ServerState,
-    WireAudit, CLOSING_DRAIN_MS, LISTEN_TOKEN, PEER_CONSENT_TIMEOUT, TRICKLE_RATE_15S_BYTES,
-    WAKE_TOKEN,
+    WireAudit, SERVER_SRTCP_ACTIVE_MAX_MS, SERVER_SRTCP_ACTIVE_MIN_MS,
+};
+use crate::constants::{
+    CLOSING_DRAIN_MS, DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU,
+    MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT, PROBE_IO_BUF_LEN, SOCK_BUF_8MIB,
+    SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS, SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS,
+    SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS, TRICKLE_RATE_15S_BYTES,
+    TRICKLE_WINDOW_15S_SECS, UDP_RECV_BUF_LEN, UDP_WRITE_BUF_LEN, WAKE_TOKEN,
+    WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS,
+    WORKER_MIN_NORMAL_WAIT_MS, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
     detect_cpu_accel, rand_duration_range_ms, register_shutdown_waker, stun_hmac_key, CertCache,
@@ -21,6 +29,13 @@ use std::net::SocketAddr;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+
+/// 服务端 DTLS 握手阶段无进展时的超时清理阈值（秒）。
+const SERVER_DTLS_HS_TIMEOUT_SECS: u64 = 15;
+/// 服务端连续细流超过该时长（秒）后暂停主动下行 SRTCP 心跳。
+const SERVER_LONG_TRICKLE_SECS: u64 = 60;
+/// 服务端处于长细流静默期时的 SRTCP 状态复检间隔（秒）。
+const SERVER_LONG_TRICKLE_RECHECK_SECS: u64 = 10;
 
 pub(super) struct ServerWorker {
     pub(super) worker_id: usize,
@@ -78,15 +93,17 @@ pub(super) fn run_server_worker(
         }
     }
 
-    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, 8 * 1024 * 1024)?;
+    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
 
     let stun_mi_key = stun_hmac_key(&cfg.psk);
     let max_early_srtp_len = if cfg.wan_mtu > 0 {
-        cfg.wan_mtu.saturating_sub(28).clamp(576, 2048)
+        cfg.wan_mtu
+            .saturating_sub(IPV4_UDP_HDR_LEN)
+            .clamp(MIN_WIRE_UDP_MTU, PROBE_IO_BUF_LEN)
     } else {
-        2048
+        PROBE_IO_BUF_LEN
     };
     let audit = WireAudit::new(cfg.wire_audit_file.as_ref())?;
     let cpu = detect_cpu_accel();
@@ -103,7 +120,7 @@ pub(super) fn run_server_worker(
     let telemetry_dur = telemetry
         .as_ref()
         .map(|th| th.interval())
-        .unwrap_or(Duration::from_secs(5));
+        .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
 
     let mut worker = ServerWorker {
@@ -132,9 +149,9 @@ pub(super) fn run_server_worker(
         closed_tx_pkts: 0,
         closed_rx_pkts: 0,
         closed_auth_drops: 0,
-        rbuf: vec![0u8; 65536],
-        wbuf: vec![0u8; 65536 + 128],
-        dtls_buf: vec![0u8; 4096],
+        rbuf: vec![0u8; UDP_RECV_BUF_LEN],
+        wbuf: vec![0u8; UDP_WRITE_BUF_LEN],
+        dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
         cpu,
         idle_dur,
         stats_dur,
@@ -147,7 +164,7 @@ pub(super) fn run_server_worker(
 
 impl ServerWorker {
     fn run(&mut self) -> std::io::Result<()> {
-        let mut events = Events::with_capacity(256);
+        let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
             if self
                 .cfg
@@ -166,8 +183,9 @@ impl ServerWorker {
             if self.telemetry.is_some() && wait > self.telemetry_dur {
                 wait = self.telemetry_dur;
             }
-            if self.cfg.stop.is_some() && self.cfg.quiet && wait > Duration::from_millis(20) {
-                wait = Duration::from_millis(20);
+            let quiet_cap = Duration::from_millis(WORKER_QUIET_STOP_POLL_MS);
+            if self.cfg.stop.is_some() && self.cfg.quiet && wait > quiet_cap {
+                wait = quiet_cap;
             }
             if let Err(e) = self.poll.poll(&mut events, Some(wait)) {
                 if e.kind() == ErrorKind::Interrupted {
@@ -227,9 +245,9 @@ impl ServerWorker {
     }
 
     let mut wait = if self.sessions_by_token.is_empty() {
-        Duration::from_secs(5)
+        Duration::from_secs(WORKER_IDLE_POLL_SECS)
     } else {
-        Duration::from_secs(1)
+        Duration::from_secs(WORKER_ACTIVE_POLL_SECS)
     };
     let mut to_close: Vec<(Token, &'static str)> = Vec::new();
     let mut newly_ready_early: Vec<Token> = Vec::new();
@@ -250,7 +268,9 @@ impl ServerWorker {
 
         match sess.state {
             ServerState::DtlsHandshake => {
-                if now.duration_since(sess.last_data_active) > Duration::from_secs(15) {
+                if now.duration_since(sess.last_data_active)
+                    > Duration::from_secs(SERVER_DTLS_HS_TIMEOUT_SECS)
+                {
                     to_close.push((tok, "dtls_handshake_timeout"));
                     continue;
                 }
@@ -288,7 +308,7 @@ impl ServerWorker {
                     } else {
                         let rem = t.saturating_duration_since(now);
                         if rem < wait {
-                            wait = rem.max(Duration::from_millis(5));
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
                         }
                     }
                 }
@@ -312,18 +332,21 @@ impl ServerWorker {
                     continue;
                 }
                 if now >= sess.next_srtcp_at {
-                    let age_ge_15s = sess
-                        .ready_at
-                        .map_or(false, |r| now.duration_since(r) >= Duration::from_secs(15));
+                    let age_ge_15s = sess.ready_at.map_or(false, |r| {
+                        now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS)
+                    });
                     let in_trickle = age_ge_15s
                         && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES;
                     let long_trickle = in_trickle
-                        && now.duration_since(sess.last_active_burst) >= Duration::from_secs(60);
+                        && now.duration_since(sess.last_active_burst)
+                            >= Duration::from_secs(SERVER_LONG_TRICKLE_SECS);
                     if long_trickle {
-                        sess.next_srtcp_at = now + Duration::from_secs(10);
+                        sess.next_srtcp_at =
+                            now + Duration::from_secs(SERVER_LONG_TRICKLE_RECHECK_SECS);
                     } else {
                         let is_active_media = !in_trickle
-                            && now.duration_since(sess.last_data_active) <= Duration::from_secs(3);
+                            && now.duration_since(sess.last_data_active)
+                                <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
                         let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
                         let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
                         sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
@@ -337,17 +360,20 @@ impl ServerWorker {
                         }
                         sess.next_srtcp_at = now
                             + if is_active_media {
-                                rand_duration_range_ms(950, 1950)
+                                rand_duration_range_ms(
+                                    SERVER_SRTCP_ACTIVE_MIN_MS,
+                                    SERVER_SRTCP_ACTIVE_MAX_MS,
+                                )
                             } else if !in_trickle {
-                                rand_duration_range_ms(3500, 6500)
+                                rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
                             } else {
-                                rand_duration_range_ms(20_000, 40_000)
+                                rand_duration_range_ms(SRTCP_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS)
                             };
                     }
                 } else {
                     let rem = sess.next_srtcp_at.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(10));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                     }
                 }
             }
@@ -357,7 +383,7 @@ impl ServerWorker {
                 } else {
                     let rem = deadline.saturating_duration_since(now);
                     if rem < wait {
-                        wait = rem.max(Duration::from_millis(10));
+                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
                     }
                 }
             }

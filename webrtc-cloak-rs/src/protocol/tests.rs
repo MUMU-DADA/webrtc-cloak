@@ -2,8 +2,12 @@
 
 use super::dtls::build_dimpl_config;
 use super::srtp::derive_audio_ssrc;
-use super::stun::{push_stun_attr, ATTR_FINGERPRINT, ATTR_USERNAME, STUN_FINGERPRINT_XOR};
+use super::stun::{
+    push_stun_attr, STUN_ATTR_FINGERPRINT as ATTR_FINGERPRINT, STUN_ATTR_USERNAME as ATTR_USERNAME,
+    STUN_FINGERPRINT_XOR,
+};
 use super::*;
+use crate::constants::*;
 use dimpl::{Dtls, Output};
 
 #[test]

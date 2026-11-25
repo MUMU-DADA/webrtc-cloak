@@ -8,6 +8,7 @@ mod worker_io;
 
 use self::registry::{SeenTxidCache, SharedV4Registry};
 use self::worker::run_server_worker;
+use crate::constants::TRICKLE_RATE_15S_BYTES;
 use crate::protocol::{
     build_dimpl_config_pool, detect_cpu_accel, rand_duration_range_ms, CipherPref, CipherSuite,
     DtlsMinVersion, RollingByteWindow, SrtpCloakCipher,
@@ -30,29 +31,26 @@ thread_local! {
     pub(super) static SERVER_QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) const LISTEN_TOKEN: Token = Token(0);
-pub(super) const WAKE_TOKEN: Token = Token(usize::MAX);
-pub(super) const EARLY_SRTP_CAP: usize = 32;
-pub(super) const MAX_DTLS_RESETS: u8 = 3;
-pub(super) const CLOSING_DRAIN_MS: u64 = 250;
-/// RFC 7675 §5.1 consent lifetime: stop transmitting and silently release session after 45s
-/// with zero authenticated packets (STUN/SRTP/SRTCP/DTLS) received from peer.
-pub(super) const PEER_CONSENT_TIMEOUT: Duration = Duration::from_secs(45);
-/// Rolling 15-second media byte threshold below which a session enters quiet trickle backoff (~270 B/s).
-pub(super) const TRICKLE_RATE_15S_BYTES: u64 = 4 * 1024;
-/// Lifetime of an unverified 1-RTT ICE path migration reachability challenge.
+/// 未验证的 1-RTT ICE 迁移路径挑战条目存活时间（秒）。
 pub(super) const MIGRATION_CHALLENGE_TTL: Duration = Duration::from_secs(5);
-/// Window after verified 1-RTT migration during which ECMP-reordered uplink packets from the
-/// old peer address are still accepted and delivered without rolling back `sess.peer_addr`.
+/// 1-RTT 迁移完成后继续容忍旧路径 ECMP 乱序尾包的只收引流窗口（秒）。
 pub(super) const OLD_PEER_DRAIN_TTL: Duration = Duration::from_secs(5);
-/// P0-2: Fixed per-session pending candidate slots (isolates legitimate retries from spoofed racers).
-pub(super) const MAX_PENDING_MIGRATIONS_PER_SESSION: usize = 4;
-/// P0-4: Strict per-session 0xFFFD challenge rate ceiling (prevents same-PSK reflection flooding).
+/// 单会话每秒最多发出的 `0xFFFD` 路径挑战次数，防止同 PSK 反射放大洪水。
 pub(super) const MAX_CHALLENGES_PER_SEC: u8 = 4;
-/// P0-4: Hard upper bound on unverified candidate maps (prevents OOM).
-pub(super) const MAX_MIG_PENDING_MAP: usize = 4096;
-/// P1-1: Maximum chained MBB handover forwarding hops during overlapping drains.
+/// MBB 重叠引流期间允许链式转发上行数据包的最大跳数。
 pub(super) const MAX_FORWARD_HOPS: u8 = 4;
+/// 服务端进入 Ready 后首条 SRTCP 心跳的最小延迟（毫秒）。
+pub(super) const SERVER_SRTCP_INIT_MIN_MS: u64 = 300;
+/// 服务端进入 Ready 后首条 SRTCP 心跳的最大延迟（毫秒）。
+pub(super) const SERVER_SRTCP_INIT_MAX_MS: u64 = 750;
+/// 服务端活跃媒体传输期 SRTCP 最小发送间隔（毫秒）。
+pub(super) const SERVER_SRTCP_ACTIVE_MIN_MS: u64 = 950;
+/// 服务端活跃媒体传输期 SRTCP 最大发送间隔（毫秒）。
+pub(super) const SERVER_SRTCP_ACTIVE_MAX_MS: u64 = 1950;
+/// 服务端单会话后端 UDP 套接字收发内核缓冲大小（512 KiB）。
+const SOCK_BUF_512KIB: usize = 512 * 1024;
+/// `--wire-audit-file` 单次运行最多落盘的外层抓包记录条数。
+const WIRE_AUDIT_MAX_PACKETS: usize = 128;
 
 pub(super) struct WireAudit {
     fp: Option<File>,
@@ -68,7 +66,7 @@ impl WireAudit {
     #[inline]
     pub(super) fn record(&mut self, d_code: u8, payload: &[u8]) {
         if let Some(ref mut f) = self.fp {
-            if self.count < 128 {
+            if self.count < WIRE_AUDIT_MAX_PACKETS {
                 let _ = f.write_all(&[d_code]);
                 let _ = f.write_all(&(payload.len() as u32).to_be_bytes());
                 let _ = f.write_all(payload);
@@ -198,8 +196,9 @@ pub(super) fn record_server_media_bytes(sess: &mut ServerSession, now: Instant, 
     sess.rate_15s.record(now, bytes);
     if sess.rate_15s.bytes_in_window(now) >= TRICKLE_RATE_15S_BYTES {
         sess.last_active_burst = now;
-        if sess.next_srtcp_at > now + Duration::from_millis(1950) {
-            sess.next_srtcp_at = now + rand_duration_range_ms(950, 1950);
+        if sess.next_srtcp_at > now + Duration::from_millis(SERVER_SRTCP_ACTIVE_MAX_MS) {
+            sess.next_srtcp_at =
+                now + rand_duration_range_ms(SERVER_SRTCP_ACTIVE_MIN_MS, SERVER_SRTCP_ACTIVE_MAX_MS);
         }
     }
 }
@@ -244,7 +243,7 @@ pub(super) fn ensure_owned_backend(
 ) -> bool {
     if matches!(sess.backend, BackendPipe::Unbound) {
         let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-        let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, 512 * 1024) {
+        let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, SOCK_BUF_512KIB) {
             Ok(s) => s,
             Err(e) => {
                 log(worker_id, &format!("backend socket error: {}", e));

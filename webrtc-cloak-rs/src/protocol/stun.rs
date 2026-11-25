@@ -1,8 +1,8 @@
 //! RFC 5389/8445 ICE STUN 报文编解码、新鲜度校验与 HKDF 密钥派生。
 
-use super::{
-    fill_random, rand_u32, rand_ufrag_chrome, unix_secs, STUN_BINDING_REQUEST,
-    STUN_BINDING_SUCCESS, STUN_MAGIC_COOKIE, STUN_MAX_SKEW_SECS,
+use super::{fill_random, rand_u32, rand_ufrag_chrome, unix_secs};
+use crate::constants::{
+    STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS, STUN_HDR_LEN, STUN_MAX_USERNAME_LEN,
 };
 use hmac::{Hmac, Mac as _};
 use sha1::Sha1;
@@ -12,15 +12,36 @@ use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
 
-pub(super) const ATTR_USERNAME: u16 = 0x0006;
-const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
-const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
-const ATTR_PRIORITY: u16 = 0x0024;
-const ATTR_USE_CANDIDATE: u16 = 0x0025;
-pub(super) const ATTR_FINGERPRINT: u16 = 0x8028;
-const ATTR_ICE_CONTROLLING: u16 = 0x802A;
-
+/// RFC 5389 STUN Magic Cookie 固定值。
+const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
+/// STUN 请求事务 ID 嵌入时间戳允许的最大时钟偏差（秒），用于防重放。
+const STUN_MAX_SKEW_SECS: i64 = 30;
+/// STUN 属性类型：`USERNAME` (0x0006)。
+pub(super) const STUN_ATTR_USERNAME: u16 = 0x0006;
+/// STUN 属性类型：`MESSAGE-INTEGRITY` (0x0008)。
+const STUN_ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+/// STUN 属性类型：`XOR-MAPPED-ADDRESS` (0x0020)。
+const STUN_ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+/// STUN 属性类型：`PRIORITY` (0x0024)。
+const STUN_ATTR_PRIORITY: u16 = 0x0024;
+/// STUN 属性类型：`USE-CANDIDATE` (0x0025)。
+const STUN_ATTR_USE_CANDIDATE: u16 = 0x0025;
+/// STUN 属性类型：`FINGERPRINT` (0x8028)。
+pub(super) const STUN_ATTR_FINGERPRINT: u16 = 0x8028;
+/// STUN 属性类型：`ICE-CONTROLLING` (0x802A)。
+const STUN_ATTR_ICE_CONTROLLING: u16 = 0x802A;
+/// RFC 5389 `FINGERPRINT` CRC32 异或掩码（ASCII `"STUN"`）。
 pub(super) const STUN_FINGERPRINT_XOR: u32 = 0x5354_554E;
+/// STUN `MESSAGE-INTEGRITY` HMAC-SHA1 值长度（字节）。
+const STUN_MI_ATTR_LEN: usize = 20;
+/// STUN `MESSAGE-INTEGRITY` 完整 TLV 长度（4B 头 + 20B 摘要）。
+const STUN_MI_TLV_LEN: usize = 24;
+/// STUN `FINGERPRINT` 完整 TLV 长度（4B 头 + 4B CRC32）。
+const STUN_FP_TLV_LEN: usize = 8;
+/// RFC 8445 ICE host 候选地址类型优先级常量。
+const ICE_HOST_TYPE_PREF: u32 = 126;
+/// RFC 8445 RTP 组件（component_id=1）对应的优先级低位值（256 - 1）。
+const ICE_COMPONENT_RTP_REV: u32 = 255;
 
 /// Session-constant ICE attributes per RFC 8445 §5.1.2.1 & §5.2.
 #[derive(Debug, Clone)]
@@ -36,7 +57,7 @@ impl SessionIceParams {
         let mut tie_breaker = [0u8; 8];
         fill_random(&mut tie_breaker);
         let local_pref = (rand_u32() & 0xFFFF) | 0x8000;
-        let priority = (126u32 << 24) | (local_pref << 8) | 255u32;
+        let priority = (ICE_HOST_TYPE_PREF << 24) | (local_pref << 8) | ICE_COMPONENT_RTP_REV;
         Self {
             ufrag_local: rand_ufrag_chrome(),
             ufrag_remote: rand_ufrag_chrome(),
@@ -134,7 +155,7 @@ fn finalize_stun_with_key(
     mi_key: &[u8; 32],
 ) -> Vec<u8> {
     let mut body = body_in.to_vec();
-    let len_for_mi = (body.len() + 24) as u16;
+    let len_for_mi = (body.len() + STUN_MI_TLV_LEN) as u16;
     let mut mac = HmacSha1::new_from_slice(mi_key).expect("HMAC key");
     mac.update(&msg_type.to_be_bytes());
     mac.update(&len_for_mi.to_be_bytes());
@@ -142,10 +163,10 @@ fn finalize_stun_with_key(
     mac.update(txid);
     mac.update(&body);
     let digest = mac.finalize().into_bytes();
-    push_stun_attr(&mut body, ATTR_MESSAGE_INTEGRITY, &digest);
+    push_stun_attr(&mut body, STUN_ATTR_MESSAGE_INTEGRITY, &digest);
 
-    let len_final = (body.len() + 8) as u16;
-    let mut out = Vec::with_capacity(20 + body.len() + 8);
+    let len_final = (body.len() + STUN_FP_TLV_LEN) as u16;
+    let mut out = Vec::with_capacity(STUN_HDR_LEN + body.len() + STUN_FP_TLV_LEN);
     out.extend_from_slice(&msg_type.to_be_bytes());
     out.extend_from_slice(&len_final.to_be_bytes());
     out.extend_from_slice(&STUN_MAGIC_COOKIE.to_be_bytes());
@@ -153,7 +174,7 @@ fn finalize_stun_with_key(
     out.extend_from_slice(&body);
 
     let crc = crc32fast::hash(&out) ^ STUN_FINGERPRINT_XOR;
-    push_stun_attr(&mut out, ATTR_FINGERPRINT, &crc.to_be_bytes());
+    push_stun_attr(&mut out, STUN_ATTR_FINGERPRINT, &crc.to_be_bytes());
     out
 }
 
@@ -209,12 +230,12 @@ pub fn build_ice_stun_request_with_key(
     let txid = txid_opt.unwrap_or_else(|| make_fresh_stun_txid(psk));
     let uname = ice.username();
     let mut body = Vec::with_capacity(64);
-    push_stun_attr(&mut body, ATTR_USERNAME, uname.as_bytes());
-    push_stun_attr(&mut body, ATTR_ICE_CONTROLLING, &ice.tie_breaker);
+    push_stun_attr(&mut body, STUN_ATTR_USERNAME, uname.as_bytes());
+    push_stun_attr(&mut body, STUN_ATTR_ICE_CONTROLLING, &ice.tie_breaker);
     if include_use_candidate {
-        push_stun_attr(&mut body, ATTR_USE_CANDIDATE, &[]);
+        push_stun_attr(&mut body, STUN_ATTR_USE_CANDIDATE, &[]);
     }
-    push_stun_attr(&mut body, ATTR_PRIORITY, &ice.priority.to_be_bytes());
+    push_stun_attr(&mut body, STUN_ATTR_PRIORITY, &ice.priority.to_be_bytes());
 
     let pkt = finalize_stun_with_key(STUN_BINDING_REQUEST, &txid, &body, mi_key);
     (pkt, txid)
@@ -224,7 +245,7 @@ pub fn build_ice_stun_request_with_key(
 pub fn build_stun_success_response(txid: &[u8; 12], peer: SocketAddrV4, psk: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(48);
     let xma = encode_xor_mapped_v4(peer);
-    push_stun_attr(&mut body, ATTR_XOR_MAPPED_ADDRESS, &xma);
+    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma);
     finalize_stun(STUN_BINDING_SUCCESS, txid, &body, psk)
 }
 
@@ -236,14 +257,14 @@ pub fn build_stun_success_response_with_key(
 ) -> Vec<u8> {
     let mut body = Vec::with_capacity(48);
     let xma = encode_xor_mapped_v4(peer);
-    push_stun_attr(&mut body, ATTR_XOR_MAPPED_ADDRESS, &xma);
+    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma);
     finalize_stun_with_key(STUN_BINDING_SUCCESS, txid, &body, mi_key)
 }
 
 /// Zero-allocation pre-auth peek of `USERNAME` on a framed `STUN_BINDING_REQUEST` so the server
 /// can select a session's V4 per-session `mi_key_mig` before running constant-time HMAC verification.
 pub fn peek_stun_request_username(data: &[u8]) -> Option<&str> {
-    if data.len() < 20 {
+    if data.len() < STUN_HDR_LEN {
         return None;
     }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
@@ -252,12 +273,12 @@ pub fn peek_stun_request_username(data: &[u8]) -> Option<&str> {
     if msg_type != STUN_BINDING_REQUEST
         || magic != STUN_MAGIC_COOKIE
         || msg_len % 4 != 0
-        || 20 + msg_len != data.len()
+        || STUN_HDR_LEN + msg_len != data.len()
     {
         return None;
     }
-    let mut pos = 20usize;
-    let end = 20 + msg_len;
+    let mut pos = STUN_HDR_LEN;
+    let end = STUN_HDR_LEN + msg_len;
     while pos + 4 <= end {
         let attr_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
         let attr_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
@@ -266,14 +287,14 @@ pub fn peek_stun_request_username(data: &[u8]) -> Option<&str> {
         if val_end > end {
             return None;
         }
-        if attr_type == ATTR_USERNAME {
-            if attr_len == 0 || attr_len > 64 {
+        if attr_type == STUN_ATTR_USERNAME {
+            if attr_len == 0 || attr_len > STUN_MAX_USERNAME_LEN {
                 return None;
             }
             let s = std::str::from_utf8(&data[val_start..val_end]).ok()?;
             return if s.contains(':') { Some(s) } else { None };
         }
-        if attr_type == ATTR_MESSAGE_INTEGRITY {
+        if attr_type == STUN_ATTR_MESSAGE_INTEGRITY {
             return None;
         }
         let pad = (4 - (attr_len % 4)) % 4;
@@ -305,20 +326,20 @@ pub fn parse_stun(data: &[u8], psk: &[u8]) -> Option<ParsedStun> {
 }
 
 pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option<ParsedStun> {
-    if data.len() < 20 {
+    if data.len() < STUN_HDR_LEN {
         return None;
     }
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    if magic != STUN_MAGIC_COOKIE || msg_len % 4 != 0 || 20 + msg_len != data.len() {
+    if magic != STUN_MAGIC_COOKIE || msg_len % 4 != 0 || STUN_HDR_LEN + msg_len != data.len() {
         return None;
     }
     let mut txid = [0u8; 12];
-    txid.copy_from_slice(&data[8..20]);
+    txid.copy_from_slice(&data[8..STUN_HDR_LEN]);
 
-    let mut pos = 20usize;
-    let end = 20 + msg_len;
+    let mut pos = STUN_HDR_LEN;
+    let end = STUN_HDR_LEN + msg_len;
     let mut username_range: Option<(usize, usize)> = None;
     let mut tie_breaker: Option<[u8; 8]> = None;
     let mut use_candidate = false;
@@ -341,7 +362,7 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
 
         if seen_mi {
             // RFC 5389 §15.4: ONLY a single trailing 8-byte FINGERPRINT may follow MESSAGE-INTEGRITY!
-            if attr_type == ATTR_FINGERPRINT && attr_len == 4 && next_pos == end {
+            if attr_type == STUN_ATTR_FINGERPRINT && attr_len == 4 && next_pos == end {
                 let expected_crc = crc32fast::hash(&data[..pos]) ^ STUN_FINGERPRINT_XOR;
                 let got_crc = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
                 fp_ok = got_crc == expected_crc;
@@ -354,37 +375,37 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
         }
 
         match attr_type {
-            ATTR_USERNAME => {
+            STUN_ATTR_USERNAME => {
                 username_range = Some((val_start, val_end));
             }
-            ATTR_ICE_CONTROLLING if attr_len == 8 => {
+            STUN_ATTR_ICE_CONTROLLING if attr_len == 8 => {
                 let mut tb = [0u8; 8];
                 tb.copy_from_slice(val);
                 tie_breaker = Some(tb);
             }
-            ATTR_XOR_MAPPED_ADDRESS => {
+            STUN_ATTR_XOR_MAPPED_ADDRESS => {
                 xor_mapped = decode_xor_mapped_v4(val);
             }
-            ATTR_USE_CANDIDATE if attr_len == 0 => {
+            STUN_ATTR_USE_CANDIDATE if attr_len == 0 => {
                 use_candidate = true;
             }
-            ATTR_MESSAGE_INTEGRITY if attr_len == 20 => {
+            STUN_ATTR_MESSAGE_INTEGRITY if attr_len == STUN_MI_ATTR_LEN => {
                 seen_mi = true;
                 // Must be followed by exact 8-byte FINGERPRINT (next_pos + 8 == end)
-                if next_pos + 8 != end {
+                if next_pos + STUN_FP_TLV_LEN != end {
                     return None;
                 }
-                let mi_hdr_len = ((pos - 20) + 24) as u16;
+                let mi_hdr_len = ((pos - STUN_HDR_LEN) + STUN_MI_TLV_LEN) as u16;
                 let mut mac = HmacSha1::new_from_slice(mi_key).expect("HMAC key");
                 mac.update(&msg_type.to_be_bytes());
                 mac.update(&mi_hdr_len.to_be_bytes());
                 mac.update(&STUN_MAGIC_COOKIE.to_be_bytes());
                 mac.update(&txid);
-                mac.update(&data[20..pos]);
+                mac.update(&data[STUN_HDR_LEN..pos]);
                 let expected = mac.finalize().into_bytes();
                 mi_ok = bool::from(val.ct_eq(&expected[..]));
             }
-            ATTR_FINGERPRINT => {
+            STUN_ATTR_FINGERPRINT => {
                 // FINGERPRINT without preceding MESSAGE-INTEGRITY -> unauthenticated
                 return None;
             }
@@ -398,7 +419,8 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
         if let Some((s, e)) = username_range {
             let raw = &data[s..e];
             if msg_type == STUN_BINDING_REQUEST {
-                let valid_uname = !raw.is_empty() && raw.len() <= 64 && raw.contains(&b':');
+                let valid_uname =
+                    !raw.is_empty() && raw.len() <= STUN_MAX_USERNAME_LEN && raw.contains(&b':');
                 if !valid_uname || !verify_stun_txid_fresh(psk, &txid) {
                     auth_ok = false;
                     None

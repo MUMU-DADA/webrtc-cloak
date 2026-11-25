@@ -19,10 +19,18 @@ use self::local_resilience::{
 };
 use self::remote::run_remote_selftest;
 use self::report::{pad_right, print_json_report, print_pretty_report, Palette};
-use crate::protocol::{detect_cpu_accel, CipherPref, DtlsMinVersion, DEFAULT_WAN_MTU};
+use crate::constants::DEFAULT_WAN_MTU;
+use crate::protocol::{detect_cpu_accel, CipherPref, DtlsMinVersion};
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
 use std::time::Instant;
+
+/// `selftest` 远端 STUN 探测默认发包数。
+const DEFAULT_SELFTEST_PROBE_COUNT: usize = 20;
+/// 自测辅助套接字收发内核缓冲大小（4 MiB）。
+const SOCK_BUF_4MIB: usize = 4 * 1024 * 1024;
+/// XorShift64 传入零种子时的非零兜底初始态。
+const XORSHIFT64_FALLBACK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 
 pub struct SelftestOptions {
     pub server_addr: Option<SocketAddr>,
@@ -47,7 +55,7 @@ impl Default for SelftestOptions {
             cipher_pref: CipherPref::Auto,
             dtls_min_version: DtlsMinVersion::Auto,
             wan_mtu: DEFAULT_WAN_MTU,
-            probe_count: 20,
+            probe_count: DEFAULT_SELFTEST_PROBE_COUNT,
             active_probes: true,
             color: !no_color,
             json: false,
@@ -62,7 +70,11 @@ pub(super) struct XorShift64 {
 impl XorShift64 {
     pub(super) fn new(seed: u64) -> Self {
         Self {
-            state: if seed == 0 { 0x9E37_79B9_7F4A_7C15 } else { seed },
+            state: if seed == 0 {
+                XORSHIFT64_FALLBACK_SEED
+            } else {
+                seed
+            },
         }
     }
 
@@ -100,8 +112,8 @@ pub(super) fn reserve_free_port() -> u16 {
 
 pub(super) fn tune_socket(sock: &UdpSocket) {
     let s2 = socket2::SockRef::from(sock);
-    let _ = s2.set_recv_buffer_size(4 * 1024 * 1024);
-    let _ = s2.set_send_buffer_size(4 * 1024 * 1024);
+    let _ = s2.set_recv_buffer_size(SOCK_BUF_4MIB);
+    let _ = s2.set_send_buffer_size(SOCK_BUF_4MIB);
 }
 
 pub(super) fn percentile(sorted: &[f64], p: usize) -> f64 {

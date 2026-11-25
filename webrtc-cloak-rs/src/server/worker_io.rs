@@ -8,21 +8,29 @@ use super::registry::{TxidCheck, WorkerCmd};
 use super::worker::ServerWorker;
 use super::{
     alloc_token, cleanup_session_routes, log, record_server_media_bytes, BackendPipe,
-    ServerSession, ServerState, CLOSING_DRAIN_MS, EARLY_SRTP_CAP, MAX_DTLS_RESETS,
-    MAX_MIG_PENDING_MAP, MIGRATION_CHALLENGE_TTL,
+    ServerSession, ServerState, MIGRATION_CHALLENGE_TTL, SERVER_SRTCP_INIT_MAX_MS,
+    SERVER_SRTCP_INIT_MIN_MS,
+};
+use crate::constants::{
+    CLOSING_DRAIN_MS, DTLS_READY_ALERT_ONLY_GRACE_SECS, MAX_DTLS_RESETS, MAX_INNER_UDP_LEN,
+    SRTP_DATA_MIN_WIRE_LEN, STUN_BINDING_REQUEST, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     build_stun_success_response, build_stun_success_response_with_key, combine_session_key,
     demux_rfc7983, derive_ice_migration_key, derive_stun_material, new_dtls_instance,
     parse_stun_with_key, peek_stun_request_username, rand_duration_range_ms, resolve_srtp_suite,
-    validate_dtls_datagram, PacketKind, RollingByteWindow, SrtpCloakCipher, MAX_INNER_UDP_LEN,
-    STUN_BINDING_REQUEST,
+    validate_dtls_datagram, PacketKind, RollingByteWindow, SrtpCloakCipher,
 };
 use mio::Token;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
+
+/// 服务端在 DTLS Flight 5 完成前每会话最多缓存的 0-RTT 早到 SRTP 包数。
+const EARLY_SRTP_CAP: usize = 32;
+/// 服务端未验证迁移候选映射表硬容量上限，防止 OOM。
+const MAX_MIG_PENDING_MAP: usize = 4096;
 
 impl ServerWorker {
     pub(super) fn handle_listen_readable(&mut self, now: Instant) {
@@ -457,8 +465,15 @@ impl ServerWorker {
                         last_data_active: now,
                         last_peer_rx: now,
                         last_active_burst: now,
-                        next_srtcp_at: now + rand_duration_range_ms(300, 750),
-                        rate_15s: RollingByteWindow::new(now, Duration::from_secs(15)),
+                        next_srtcp_at: now
+                            + rand_duration_range_ms(
+                                SERVER_SRTCP_INIT_MIN_MS,
+                                SERVER_SRTCP_INIT_MAX_MS,
+                            ),
+                        rate_15s: RollingByteWindow::new(
+                            now,
+                            Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
+                        ),
                         rx_pkts: 0,
                         rx_pkts_at_last_rtcp: 0,
                         rx_bytes: 0,
@@ -491,7 +506,12 @@ impl ServerWorker {
                                 && (sess.rx_pkts > 0
                                     || sess
                                         .ready_at
-                                        .map(|r| now.duration_since(r) > Duration::from_secs(5))
+                                        .map(|r| {
+                                            now.duration_since(r)
+                                                > Duration::from_secs(
+                                                    DTLS_READY_ALERT_ONLY_GRACE_SECS,
+                                                )
+                                        })
                                         .unwrap_or(false));
                             if !validate_dtls_datagram(pkt, ready_only_alert) {
                                 sess.auth_drops += 1;
@@ -639,7 +659,7 @@ impl ServerWorker {
                             Some(ServerState::DtlsHandshake) => {
                                 if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
                                     if sess.early_srtp.len() < EARLY_SRTP_CAP
-                                        && pkt.len() >= 38
+                                        && pkt.len() >= SRTP_DATA_MIN_WIRE_LEN
                                         && pkt.len() <= self.max_early_srtp_len
                                     {
                                         sess.early_srtp.push_back(pkt.to_vec());

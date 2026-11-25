@@ -45,6 +45,7 @@
     ├── .cargo/config.toml
     └── src/
         ├── main.rs                        # CLI 参数解析与子命令分发入口
+        ├── constants.rs                   # 跨模块共享的协议契约、网络缓冲与双端耦合时序常量
         ├── bench_tools.rs                 # cpu / bench / sink / loadgen 压测与算力工具
         ├── protocol/                      # STUN / dimpl DTLS 1.3+1.2 / X.509 / 双 SSRC SRTP / SRTCP
         ├── client/                        # 客户端 mio 事件循环、黑洞 1-RTT 迁移、MBB 状态机与集成测试

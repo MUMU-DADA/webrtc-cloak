@@ -16,6 +16,7 @@ getrandom = "0.2"
 hmac = "0.12"
 mio = { version = "1.0", features = ["os-poll", "net"] }
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+pico-args = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha1 = "0.10"

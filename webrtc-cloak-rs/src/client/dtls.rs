@@ -2,7 +2,11 @@
 
 use super::{
     log, make_udp_socket, record_client_media_bytes, schedule_mbb_timers, ClientConfig,
-    ClientSession, HandshakeState, MAX_DRAINING_SESSIONS,
+    ClientSession, HandshakeState, CLIENT_SRTCP_INIT_MAX_MS, CLIENT_SRTCP_INIT_MIN_MS,
+    MAX_DRAINING_SESSIONS, SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
+};
+use crate::constants::{
+    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_PLAINTEXT_HDR_LEN, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     build_ice_stun_request, combine_session_key, derive_ice_migration_key, jitter_duration_ms,
@@ -39,7 +43,10 @@ pub(super) fn drain_client_dtls(
         loop {
             match dtls.poll_output(dtls_buf) {
                 DtlsOutput::Packet(p) => {
-                    if p.len() >= 14 && p[0] == 22 && p[13] == 1 {
+                    if p.len() > DTLS_PLAINTEXT_HDR_LEN
+                        && p[0] == DTLS_CT_HANDSHAKE
+                        && p[DTLS_PLAINTEXT_HDR_LEN] == DTLS_HS_CLIENT_HELLO
+                    {
                         emitted_client_hello = true;
                     } else {
                         emitted_flight5_or_later = true;
@@ -113,15 +120,18 @@ pub(super) fn drain_client_dtls(
             sess.ready_at = Some(now);
             sess.last_data_active = now;
             sess.last_active_burst = now;
-            sess.rate_15s = RollingByteWindow::new(now, Duration::from_secs(15));
-            sess.rate_5min = RollingByteWindow::new(now, Duration::from_secs(300));
+            sess.rate_15s =
+                RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_15S_SECS));
+            sess.rate_5min =
+                RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS));
             sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
             sess.ka_txid = None;
             sess.ka_pkt.clear();
             sess.ka_retries = 0;
             sess.ka_rto_at = None;
             sess.next_keepalive_at = now + jitter_duration_ms(cfg.keepalive_secs * 1000);
-            sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
+            sess.next_srtcp_at =
+                now + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS);
             schedule_mbb_timers(sess, cfg, now);
 
             let mut flushed = 0usize;
@@ -280,7 +290,7 @@ pub(super) fn spawn_client_session(
     }
 
     let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
-    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, 2 * 1024 * 1024) {
+    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, SOCK_BUF_2MIB) {
         Ok(s) => s,
         Err(e) => {
             log(worker_id, &format!("upstream socket error: {}", e));
@@ -327,7 +337,8 @@ pub(super) fn spawn_client_session(
         last_active_burst: now,
         next_retry_at: now + retry_dur,
         next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
-        next_srtcp_at: now + rand_duration_range_ms(250, 600),
+        next_srtcp_at: now
+            + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS),
         dtls_next_timeout: None,
         is_standby,
         standby_for_primary,
@@ -335,8 +346,8 @@ pub(super) fn spawn_client_session(
         rotate_at: None,
         hard_rotate_at: None,
         rotate_byte_budget: None,
-        rate_15s: RollingByteWindow::new(now, Duration::from_secs(15)),
-        rate_5min: RollingByteWindow::new(now, Duration::from_secs(300)),
+        rate_15s: RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_15S_SECS)),
+        rate_5min: RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS)),
         retries: 0,
         ka_txid: None,
         ka_pkt: Vec::new(),

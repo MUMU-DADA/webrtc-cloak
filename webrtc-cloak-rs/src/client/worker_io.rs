@@ -5,21 +5,51 @@ use super::worker::ClientWorker;
 use super::{
     cancel_standby_for_client, is_client_in_trickle, log, record_client_media_bytes,
     schedule_mbb_timers, HandshakeState, PendingReconnect, ACTIVE_ROTATE_WINDOW_SECS,
-    CLOSING_DRAIN_MS, KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DTLS_RESETS, MAX_PENDING_BYTES,
-    POST_BYE_CLOSING_DRAIN_MS,
+    CLIENT_HANDOVER_MIN_RETRY_MS, CLIENT_MIG_ECHO_INTERVAL_MS, CLIENT_SRTCP_INIT_MAX_MS,
+    CLIENT_SRTCP_INIT_MIN_MS, KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, RECENT_ROTATION_DAMP_SECS,
+    TRICKLE_WINDOW_5MIN_SECS,
+};
+use crate::constants::{
+    CLOSING_DRAIN_MS, CTRL_FRAME_BUF_LEN, DTLS_READY_ALERT_ONLY_GRACE_SECS, HANDOVER_OP_ACK,
+    HANDOVER_OP_REQ, HANDOVER_PROOF_LEN, MAX_DTLS_RESETS, MAX_INNER_UDP_LEN,
+    PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
+    PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, POST_BYE_CLOSING_DRAIN_MS,
+    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     combine_session_key, compute_handover_proof, demux_rfc7983, derive_ice_migration_key,
     derive_stun_material, extract_dtls_server_hello_suite, jitter_duration_ms, new_dtls_instance,
     parse_stun_with_key, rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram,
-    PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame, MAX_INNER_UDP_LEN,
-    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS,
+    PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
 use mio::Token;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+/// 细流模式下 STUN 保活退避最小间隔（毫秒，低于典型 CGNAT 超时与 45s 服务端同意超时）。
+const TRICKLE_KA_MIN_MS: u64 = 10_000;
+/// 细流模式下 STUN 保活退避最大间隔（毫秒）。
+const TRICKLE_KA_MAX_MS: u64 = 14_000;
+/// 启用细流 STUN 保活退避的 `--keepalive` 下界（秒，含）。
+const TRICKLE_KA_ENABLE_MIN_SECS: u64 = 3;
+/// 启用细流 STUN 保活退避的 `--keepalive` 上界（秒，不含）。
+const TRICKLE_KA_ENABLE_MAX_SECS: u64 = 10;
+/// 握手或重连缓冲队列允许暂存的最大应用数据包个数。
+const MAX_PENDING_PKTS: usize = 256;
+/// 握手或重连缓冲队列允许暂存的最大总字节数（256 KiB）。
+const MAX_PENDING_BYTES: usize = 256 * 1024;
+/// 收到 `0xFFFD` 路径挑战后重复回显确认的最大补发次数，防止弱网丢失响应。
+const CLIENT_MIG_ECHO_COUNT: u8 = 3;
+/// MBB 切换完成后旧会话延迟发送 BYE 的最小重叠引流时长（毫秒，打破切换时间关联指纹）。
+const CLIENT_MBB_DELAYED_BYE_MIN_MS: u64 = 2_000;
+/// MBB 切换完成后旧会话延迟发送 BYE 的最大重叠引流时长（毫秒）。
+const CLIENT_MBB_DELAYED_BYE_MAX_MS: u64 = 10_000;
+/// 收到服务端优雅关闭 BYE 后客户端快连的最小抖动退避（毫秒，避开 systemd 重启窗口）。
+const CLIENT_GRACEFUL_RECONNECT_MIN_MS: u64 = 80;
+/// 收到服务端优雅关闭 BYE 后客户端快连的最大抖动退避（毫秒）。
+const CLIENT_GRACEFUL_RECONNECT_MAX_MS: u64 = 350;
 
 impl ClientWorker {
     pub(super) fn handle_listen_readable(&mut self, now: Instant) {
@@ -37,7 +67,7 @@ impl ClientWorker {
             // buffer arriving app packets so we never bypass the backoff and trigger ICMP bounce!
             if let Some(pr) = self.pending_reconnects.get_mut(&client_addr) {
                 if n <= self.max_inner_pending
-                    && pr.pending.len() < 256
+                    && pr.pending.len() < MAX_PENDING_PKTS
                     && pr.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
                 {
                     pr.pending.push_back(self.rbuf[..n].to_vec());
@@ -62,7 +92,9 @@ impl ClientWorker {
             } else {
                 let recently_rotated = self.last_rotation_by_client
                     .get(&client_addr)
-                    .map(|&t| now.duration_since(t) < Duration::from_secs(60))
+                    .map(|&t| {
+                        now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS)
+                    })
                     .unwrap_or(false);
                 let ka_retries = if recently_rotated {
                     KA_MAX_RETRIES_DAMPED
@@ -95,7 +127,7 @@ impl ClientWorker {
                 sess.last_data_active = now;
                 if sess.state != HandshakeState::Ready {
                     if n <= self.max_inner_pending
-                        && sess.pending.len() < 256
+                        && sess.pending.len() < MAX_PENDING_PKTS
                         && sess.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
                     {
                         sess.pending.push_back(self.rbuf[..n].to_vec());
@@ -316,15 +348,25 @@ impl ClientWorker {
                                     sess.ready_at = Some(now);
                                     sess.last_data_active = now;
                                     sess.last_active_burst = now;
-                                    sess.rate_15s = RollingByteWindow::new(now, Duration::from_secs(15));
-                                    sess.rate_5min = RollingByteWindow::new(now, Duration::from_secs(300));
+                                    sess.rate_15s = RollingByteWindow::new(
+                                        now,
+                                        Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
+                                    );
+                                    sess.rate_5min = RollingByteWindow::new(
+                                        now,
+                                        Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS),
+                                    );
                                     sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
                                     sess.ka_txid = None;
                                     sess.ka_pkt.clear();
                                     sess.ka_retries = 0;
                                     sess.ka_rto_at = None;
                                     sess.next_keepalive_at = now + jitter_duration_ms(self.ka_base_ms);
-                                    sess.next_srtcp_at = now + rand_duration_range_ms(250, 600);
+                                    sess.next_srtcp_at = now
+                                        + rand_duration_range_ms(
+                                            CLIENT_SRTCP_INIT_MIN_MS,
+                                            CLIENT_SRTCP_INIT_MAX_MS,
+                                        );
                                     schedule_mbb_timers(sess, &self.cfg, now);
                                     if sess.is_standby {
                                         standby_ready.push((tok, sess.client_addr));
@@ -380,11 +422,11 @@ impl ClientWorker {
                                 let in_trickle = is_client_in_trickle(sess, now);
                                 sess.next_keepalive_at = now
                                     + if in_trickle
-                                        && self.cfg.keepalive_secs >= 3
-                                        && self.cfg.keepalive_secs < 10
+                                        && self.cfg.keepalive_secs >= TRICKLE_KA_ENABLE_MIN_SECS
+                                        && self.cfg.keepalive_secs < TRICKLE_KA_ENABLE_MAX_SECS
                                     {
                                         // Conservative trickle STUN backoff (10-14s, safely below 20-30s CGNAT & 45s server consent)
-                                        rand_duration_range_ms(10_000, 14_000)
+                                        rand_duration_range_ms(TRICKLE_KA_MIN_MS, TRICKLE_KA_MAX_MS)
                                     } else {
                                         jitter_duration_ms(self.ka_base_ms)
                                     };
@@ -403,7 +445,10 @@ impl ClientWorker {
                         HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::Migrating
                     ) && sess
                         .ready_at
-                        .map(|r| now.duration_since(r) > Duration::from_secs(5))
+                        .map(|r| {
+                            now.duration_since(r)
+                                > Duration::from_secs(DTLS_READY_ALERT_ONLY_GRACE_SECS)
+                        })
                         .unwrap_or(false);
                     if !validate_dtls_datagram(pkt, ready_only_alert) {
                         sess.auth_drops += 1;
@@ -553,13 +598,15 @@ impl ClientWorker {
                             }
                             Some(SrtpFrame::PathChallenge(pn)) => {
                                 sess.rx_pkts += 1;
-                                if pn == 17 && self.wbuf[0] == 0x01 {
+                                if pn == PATH_CHALLENGE_PAYLOAD_LEN
+                                    && self.wbuf[0] == PATH_CHALLENGE_OP_REQ
+                                {
                                     // P0-2 fix: Accept 0xFFFD(0x01) both in `Migrating` AND while
                                     // in `Ready` with unconfirmed `mig_echo_left > 0` (epoch >= current)!
                                     let cur_epoch = sess
                                         .mig_echo_payload
                                         .as_deref()
-                                        .filter(|p| p.len() == 17)
+                                        .filter(|p| p.len() == PATH_CHALLENGE_PAYLOAD_LEN)
                                         .map(|p| {
                                             u64::from_be_bytes(p[9..17].try_into().unwrap())
                                         })
@@ -572,9 +619,10 @@ impl ClientWorker {
                                             && sess.mig_echo_left > 0
                                             && got_epoch >= cur_epoch);
                                     if accept_challenge {
-                                        let mut resp_payload = [0u8; 17];
-                                        resp_payload[0] = 0x02;
-                                        resp_payload[1..17].copy_from_slice(&self.wbuf[1..17]);
+                                        let mut resp_payload = [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
+                                        resp_payload[0] = PATH_CHALLENGE_OP_RESP;
+                                        resp_payload[1..PATH_CHALLENGE_PAYLOAD_LEN]
+                                            .copy_from_slice(&self.wbuf[1..PATH_CHALLENGE_PAYLOAD_LEN]);
                                         let was_migrating =
                                             sess.state == HandshakeState::Migrating;
                                         let mut flushed = 0usize;
@@ -583,7 +631,7 @@ impl ClientWorker {
                                             sess.pending_bytes = 0;
                                         }
                                         if let Some(ref mut cipher) = sess.cipher {
-                                            let mut cbuf = [0u8; 256];
+                                            let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
                                             if let Some(wn) = cipher.wrap_control_into(
                                                 SRTP_PATH_CHALLENGE_MAGIC,
                                                 &resp_payload,
@@ -622,9 +670,10 @@ impl ClientWorker {
                                         sess.mig_txid = None;
                                         sess.mig_retry_at = None;
                                         sess.mig_echo_payload = Some(resp_payload.to_vec());
-                                        sess.mig_echo_next_at =
-                                            Some(now + Duration::from_millis(250));
-                                        sess.mig_echo_left = 3;
+                                        sess.mig_echo_next_at = Some(
+                                            now + Duration::from_millis(CLIENT_MIG_ECHO_INTERVAL_MS),
+                                        );
+                                        sess.mig_echo_left = CLIENT_MIG_ECHO_COUNT;
                                         if was_migrating {
                                             sess.next_keepalive_at =
                                                 now + jitter_duration_ms(self.ka_base_ms);
@@ -652,13 +701,15 @@ impl ClientWorker {
                                             }
                                         }
                                     }
-                                } else if pn >= 9 && self.wbuf[0] == 0x03 {
+                                } else if pn >= PATH_CONFIRM_PAYLOAD_LEN
+                                    && self.wbuf[0] == PATH_CHALLENGE_OP_CONFIRM
+                                {
                                     // P2-1: Verify confirm nonce matches active in-flight echo
                                     let nonce_ok = sess
                                         .mig_echo_payload
                                         .as_deref()
-                                        .filter(|p| p.len() >= 9)
-                                        .map(|p| &p[1..9] == &self.wbuf[1..9])
+                                        .filter(|p| p.len() >= PATH_CONFIRM_PAYLOAD_LEN)
+                                        .map(|p| p[1..9] == self.wbuf[1..9])
                                         .unwrap_or(true);
                                     if nonce_ok {
                                         sess.mig_echo_left = 0;
@@ -671,7 +722,7 @@ impl ClientWorker {
                                 sess.rx_pkts += 1;
                                 if sess.state == HandshakeState::HandoverWait
                                     && pn >= 2
-                                    && self.wbuf[0] == 0x02
+                                    && self.wbuf[0] == HANDOVER_OP_ACK
                                 {
                                     sess.handover_payload = None;
                                     sess.handover_retry_at = None;
@@ -747,8 +798,8 @@ impl ClientWorker {
             if let Some(new_key) = new_sess.session_key {
                 let proof = compute_handover_proof(&old_key, &new_key);
                 let ub = old_ufrag.as_bytes();
-                let mut payload = Vec::with_capacity(2 + ub.len() + 32);
-                payload.push(0x01);
+                let mut payload = Vec::with_capacity(2 + ub.len() + HANDOVER_PROOF_LEN);
+                payload.push(HANDOVER_OP_REQ);
                 payload.push(ub.len() as u8);
                 payload.extend_from_slice(ub);
                 payload.extend_from_slice(&proof);
@@ -764,8 +815,11 @@ impl ClientWorker {
                 new_sess.state = HandshakeState::HandoverWait;
                 new_sess.handover_payload = Some(payload);
                 new_sess.handover_retries = 0;
-                new_sess.handover_retry_at =
-                    Some(now + self.retry_dur.max(Duration::from_millis(380)));
+                new_sess.handover_retry_at = Some(
+                    now + self
+                        .retry_dur
+                        .max(Duration::from_millis(CLIENT_HANDOVER_MIN_RETRY_MS)),
+                );
             } else {
                 standby_promoted.push((new_tok, client_addr));
             }
@@ -814,7 +868,10 @@ impl ClientWorker {
             if old_tok != new_tok {
                 if let Some(old_sess) = self.sessions_by_token.get_mut(&old_tok) {
                     if old_sess.state == HandshakeState::Ready {
-                        let bye_delay = rand_duration_range_ms(2_000, 10_000);
+                        let bye_delay = rand_duration_range_ms(
+                            CLIENT_MBB_DELAYED_BYE_MIN_MS,
+                            CLIENT_MBB_DELAYED_BYE_MAX_MS,
+                        );
                         log(
                             self.worker_id,
                             &format!(
@@ -854,7 +911,10 @@ impl ClientWorker {
                 &mut self.dtls_buf,
                 now,
             );
-            let jitter = rand_duration_range_ms(80, 350);
+            let jitter = rand_duration_range_ms(
+                CLIENT_GRACEFUL_RECONNECT_MIN_MS,
+                CLIENT_GRACEFUL_RECONNECT_MAX_MS,
+            );
             log(
                 self.worker_id,
                 &format!(

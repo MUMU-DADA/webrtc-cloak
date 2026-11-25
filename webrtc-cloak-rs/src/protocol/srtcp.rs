@@ -1,10 +1,34 @@
 //! RFC 3550/7714 复合 SRTCP 报文构造、校验与防重放。
 
-use super::{CipherSuite, SrtpCloakCipher, SRTP_TAG_LEN};
+use super::{CipherSuite, SrtpCloakCipher, RTCP_CNAME_LEN, RTCP_HDR_LEN, RTP_V2_BITS, RTP_V2_MASK};
+use crate::constants::SRTP_TAG_LEN;
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Nonce as GcmNonce, Tag as GcmTag};
 use chacha20poly1305::{Nonce as ChaNonce, Tag as ChaTag};
 use subtle::ConstantTimeEq;
+
+/// SRTCP 控制面正交 AEAD Nonce 域掩码位。
+const NONCE_DOMAIN_SRTCP_BIT: u8 = 0x80;
+/// SRTCP 64 位滑动防重放窗口宽度（包）。
+const SRTCP_REPLAY_WINDOW: u32 = 64;
+/// SRTCP 尾部 `E || SRTCP_index` 字段长度（字节）。
+const SRTCP_INDEX_LEN: usize = 4;
+/// SRTCP 尾部加密标志位（最高位 `E=1`）。
+const SRTCP_E_FLAG: u32 = 0x8000_0000;
+/// SRTCP 31 位序列索引掩码。
+const SRTCP_IDX_MASK: u32 = 0x7FFF_FFFF;
+/// RTCP 类型：Sender Report (200)。
+const RTCP_PT_SR: u8 = 200;
+/// RTCP 类型：Receiver Report (201)。
+const RTCP_PT_RR: u8 = 201;
+/// RTCP 类型：Source Description / SDES (202)。
+const RTCP_PT_SDES: u8 = 202;
+/// RTCP 类型：Goodbye / BYE (203)。
+const RTCP_PT_BYE: u8 = 203;
+/// RTCP 类型：Transport-Layer Feedback / TWCC (205)。
+const RTCP_PT_RTPFB: u8 = 205;
+/// RTCP 类型：Payload-Specific Feedback (206)。
+const RTCP_PT_PSFB: u8 = 206;
 
 impl SrtpCloakCipher {
     #[inline]
@@ -16,7 +40,7 @@ impl SrtpCloakCipher {
             return false;
         }
         let delta = self.rx_srtcp_highest - idx;
-        if delta >= 64 {
+        if delta >= SRTCP_REPLAY_WINDOW {
             return true;
         }
         ((self.rx_srtcp_bitmap >> delta) & 1) != 0
@@ -32,7 +56,7 @@ impl SrtpCloakCipher {
         }
         if idx > self.rx_srtcp_highest {
             let shift = idx - self.rx_srtcp_highest;
-            self.rx_srtcp_bitmap = if shift >= 64 {
+            self.rx_srtcp_bitmap = if shift >= SRTCP_REPLAY_WINDOW {
                 1
             } else {
                 (self.rx_srtcp_bitmap << shift) | 1
@@ -40,7 +64,7 @@ impl SrtpCloakCipher {
             self.rx_srtcp_highest = idx;
         } else {
             let delta = self.rx_srtcp_highest - idx;
-            if delta < 64 {
+            if delta < SRTCP_REPLAY_WINDOW {
                 self.rx_srtcp_bitmap |= 1u64 << delta;
             }
         }
@@ -78,7 +102,11 @@ impl SrtpCloakCipher {
             (self.ssrc_tx, is_sender && video_sent)
         };
 
-        let pt: u8 = if effective_sender { 200 } else { 201 };
+        let pt: u8 = if effective_sender {
+            RTCP_PT_SR
+        } else {
+            RTCP_PT_RR
+        };
         let rc: u8 = if has_rx_media { 1 } else { 0 };
         let primary_words: u16 = match (effective_sender, has_rx_media) {
             (true, true) => 12,   // SR + 1 Report Block (52B)
@@ -88,12 +116,12 @@ impl SrtpCloakCipher {
         };
         let primary_rem_len = ((primary_words as usize) - 1) * 4;
 
-        let idx = self.tx_srtcp_idx & 0x7FFF_FFFF;
-        self.tx_srtcp_idx = self.tx_srtcp_idx.saturating_add(1).min(0x7FFF_FFFF);
-        let e_idx = 0x8000_0000u32 | idx;
+        let idx = self.tx_srtcp_idx & SRTCP_IDX_MASK;
+        self.tx_srtcp_idx = self.tx_srtcp_idx.saturating_add(1).min(SRTCP_IDX_MASK);
+        let e_idx = SRTCP_E_FLAG | idx;
 
-        let mut hdr = [0u8; 8];
-        hdr[0] = 0x80 | rc;
+        let mut hdr = [0u8; RTCP_HDR_LEN];
+        hdr[0] = RTP_V2_BITS | rc;
         hdr[1] = pt;
         hdr[2..4].copy_from_slice(&primary_words.to_be_bytes());
         hdr[4..8].copy_from_slice(&report_ssrc.to_be_bytes());
@@ -109,11 +137,11 @@ impl SrtpCloakCipher {
         // Subpacket 2: strictly RFC 3550 §6.5 compliant SDES (PT=202) with session-constant CNAME + 0x00 END
         // Layout: [4B hdr] [4B SSRC] [1B type=1] [1B len=13] [13B ASCII CNAME] [1B END=0x00] = 24B (6 words -> len=5)
         let sdes_len_words: u16 = 5;
-        body.extend_from_slice(&[0x81, 202]);
+        body.extend_from_slice(&[RTP_V2_BITS | 1, RTCP_PT_SDES]);
         body.extend_from_slice(&sdes_len_words.to_be_bytes());
         body.extend_from_slice(&report_ssrc.to_be_bytes());
         body.push(1); // CNAME item type
-        body.push(13);
+        body.push(RTCP_CNAME_LEN as u8);
         body.extend_from_slice(&self.cname);
         body.push(0); // RFC 3550 §6.5 END item (32-bit aligned at 24B)
 
@@ -121,7 +149,11 @@ impl SrtpCloakCipher {
         // ONLY when media was actually received since the last RTCP (`has_rx_media`) and not BYE!
         // Prevents RFC 3550 semantic violation of emitting TWCC/PSFB feedback on zero-media RR intervals.
         if !include_bye && has_rx_media && (self.next_rng() & 7) != 0 {
-            let fb_pt: u8 = if (self.next_rng() & 1) == 0 { 205 } else { 206 };
+            let fb_pt: u8 = if (self.next_rng() & 1) == 0 {
+                RTCP_PT_RTPFB
+            } else {
+                RTCP_PT_PSFB
+            };
             let fb_words: u16 = 2 + ((self.next_rng() as u16) % 11); // 12..52B
             body.extend_from_slice(&[0x8F, fb_pt]);
             body.extend_from_slice(&fb_words.to_be_bytes());
@@ -133,17 +165,18 @@ impl SrtpCloakCipher {
 
         // Final Subpacket (if tearing down): RFC 3550 §6.1 BYE (PT=203) MUST be last & encrypted!
         if include_bye {
-            body.extend_from_slice(&[0x81, 203, 0x00, 0x01]);
+            body.extend_from_slice(&[RTP_V2_BITS | 1, RTCP_PT_BYE, 0x00, 0x01]);
             body.extend_from_slice(&report_ssrc.to_be_bytes());
         }
 
-        let mut aad = [0u8; 12];
-        aad[..8].copy_from_slice(&hdr);
-        aad[8..12].copy_from_slice(&e_idx.to_be_bytes());
+        let mut aad = [0u8; RTCP_HDR_LEN + SRTCP_INDEX_LEN];
+        aad[..RTCP_HDR_LEN].copy_from_slice(&hdr);
+        aad[RTCP_HDR_LEN..RTCP_HDR_LEN + SRTCP_INDEX_LEN].copy_from_slice(&e_idx.to_be_bytes());
 
-        let tag_bytes: [u8; 16] = match self.suite {
+        let srtcp_tx_dir = self.tx_dir | NONCE_DOMAIN_SRTCP_BIT;
+        let tag_bytes: [u8; SRTP_TAG_LEN] = match self.suite {
             CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(self.tx_dir | 0x80, report_ssrc, idx as u64);
+                let iv = self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64);
                 let tag = self
                     .aes_gcm
                     .encrypt_in_place_detached(GcmNonce::from_slice(&iv), &aad, &mut body)
@@ -151,7 +184,7 @@ impl SrtpCloakCipher {
                 tag.into()
             }
             CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(self.tx_dir | 0x80, report_ssrc, idx as u64);
+                let iv = self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64);
                 let tag = self
                     .chacha
                     .encrypt_in_place_detached(ChaNonce::from_slice(&iv), &aad, &mut body)
@@ -159,12 +192,12 @@ impl SrtpCloakCipher {
                 tag.into()
             }
             CipherSuite::Blake2b => {
-                self.xor_keystream(self.tx_dir | 0x80, report_ssrc, idx as u64, &mut body);
-                self.auth_tag(self.tx_dir | 0x80, &aad, &body, idx)
+                self.xor_keystream(srtcp_tx_dir, report_ssrc, idx as u64, &mut body);
+                self.auth_tag(srtcp_tx_dir, &aad, &body, idx)
             }
         };
 
-        let mut pkt = Vec::with_capacity(8 + body.len() + SRTP_TAG_LEN + 4);
+        let mut pkt = Vec::with_capacity(RTCP_HDR_LEN + body.len() + SRTP_TAG_LEN + SRTCP_INDEX_LEN);
         pkt.extend_from_slice(&hdr);
         pkt.extend_from_slice(&body);
         pkt.extend_from_slice(&tag_bytes);
@@ -176,11 +209,13 @@ impl SrtpCloakCipher {
     /// Accepts Video SSRC (`ssrc_rx`) and, in dual-SSRC mode, Audio SSRC (`audio_ssrc_rx`).
     /// Returns `Some(has_encrypted_bye)` on success, `None` on failure.
     pub fn verify_srtcp(&mut self, packet: &[u8]) -> Option<bool> {
-        if packet.len() < 8 + SRTP_TAG_LEN + 4 {
+        if packet.len() < RTCP_HDR_LEN + SRTP_TAG_LEN + SRTCP_INDEX_LEN {
             return None;
         }
         // RFC 3550 §6.1: plaintext first subpacket MUST be SR (200) or RR (201)
-        if (packet[0] & 0xC0) != 0x80 || (packet[1] != 200 && packet[1] != 201) {
+        if (packet[0] & RTP_V2_MASK) != RTP_V2_BITS
+            || (packet[1] != RTCP_PT_SR && packet[1] != RTCP_PT_RR)
+        {
             return None;
         }
         let primary_words = u16::from_be_bytes([packet[2], packet[3]]) as usize;
@@ -192,7 +227,7 @@ impl SrtpCloakCipher {
             return None;
         }
 
-        let idx_pos = packet.len() - 4;
+        let idx_pos = packet.len() - SRTCP_INDEX_LEN;
         let tag_pos = idx_pos - SRTP_TAG_LEN;
         let e_idx = u32::from_be_bytes([
             packet[idx_pos],
@@ -200,22 +235,23 @@ impl SrtpCloakCipher {
             packet[idx_pos + 2],
             packet[idx_pos + 3],
         ]);
-        if (e_idx & 0x8000_0000) == 0 {
+        if (e_idx & SRTCP_E_FLAG) == 0 {
             return None;
         }
-        let idx = e_idx & 0x7FFF_FFFF;
+        let idx = e_idx & SRTCP_IDX_MASK;
         if self.is_srtcp_replay(idx) {
             return None;
         }
 
-        let mut aad = [0u8; 12];
-        aad[..8].copy_from_slice(&packet[..8]);
-        aad[8..12].copy_from_slice(&packet[idx_pos..]);
-        let mut plain = packet[8..tag_pos].to_vec();
+        let mut aad = [0u8; RTCP_HDR_LEN + SRTCP_INDEX_LEN];
+        aad[..RTCP_HDR_LEN].copy_from_slice(&packet[..RTCP_HDR_LEN]);
+        aad[RTCP_HDR_LEN..RTCP_HDR_LEN + SRTCP_INDEX_LEN].copy_from_slice(&packet[idx_pos..]);
+        let mut plain = packet[RTCP_HDR_LEN..tag_pos].to_vec();
 
+        let srtcp_rx_dir = self.rx_dir | NONCE_DOMAIN_SRTCP_BIT;
         let ok = match self.suite {
             CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(self.rx_dir | 0x80, ssrc, idx as u64);
+                let iv = self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64);
                 self.aes_gcm
                     .decrypt_in_place_detached(
                         GcmNonce::from_slice(&iv),
@@ -226,7 +262,7 @@ impl SrtpCloakCipher {
                     .is_ok()
             }
             CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(self.rx_dir | 0x80, ssrc, idx as u64);
+                let iv = self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64);
                 self.chacha
                     .decrypt_in_place_detached(
                         ChaNonce::from_slice(&iv),
@@ -237,9 +273,9 @@ impl SrtpCloakCipher {
                     .is_ok()
             }
             CipherSuite::Blake2b => {
-                let expected = self.auth_tag(self.rx_dir | 0x80, &aad, &plain, idx);
+                let expected = self.auth_tag(srtcp_rx_dir, &aad, &plain, idx);
                 if bool::from(packet[tag_pos..idx_pos].ct_eq(&expected[..])) {
-                    self.xor_keystream(self.rx_dir | 0x80, ssrc, idx as u64, &mut plain);
+                    self.xor_keystream(srtcp_rx_dir, ssrc, idx as u64, &mut plain);
                     true
                 } else {
                     false
@@ -256,7 +292,7 @@ impl SrtpCloakCipher {
         let mut pos = (primary_words - 1) * 4;
         let mut has_bye = false;
         while pos + 4 <= plain.len() {
-            if (plain[pos] & 0xC0) != 0x80 {
+            if (plain[pos] & RTP_V2_MASK) != RTP_V2_BITS {
                 break;
             }
             let sub_pt = plain[pos + 1];
@@ -265,7 +301,7 @@ impl SrtpCloakCipher {
             if pos + sub_len > plain.len() {
                 break;
             }
-            if sub_pt == 203 {
+            if sub_pt == RTCP_PT_BYE {
                 has_bye = true;
             }
             pos += sub_len;

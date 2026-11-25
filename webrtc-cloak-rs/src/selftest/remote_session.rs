@@ -1,12 +1,16 @@
 //! 远端现网测试会话建立（STUN/DTLS 握手）与带内加密探测引擎。
 
 use super::tune_socket;
+use crate::constants::{
+    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS, DTLS_IO_BUF_LEN,
+    DTLS_PLAINTEXT_HDR_LEN, PROBE_IO_BUF_LEN, STUN_BINDING_SUCCESS,
+};
 use crate::protocol::{
     build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite,
     generate_ephemeral_webrtc_cert, make_fresh_stun_txid, new_dtls_instance, parse_stun,
     resolve_srtp_suite, validate_dtls_datagram, CipherPref, CipherSuite, DtlsMinVersion,
-    PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame, STUN_BINDING_SUCCESS,
+    PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame,
 };
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use std::io::ErrorKind;
@@ -46,7 +50,7 @@ pub(super) fn remote_stun_handshake(server_addr: SocketAddr, psk: &[u8]) -> Resu
     let ice = SessionIceParams::generate();
     let txid = make_fresh_stun_txid(psk);
     let (req, _) = build_ice_stun_request(psk, &ice, Some(txid), true);
-    let mut rbuf = [0u8; 2048];
+    let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
 
     for _ in 0..4 {
         let ts = Instant::now();
@@ -103,8 +107,8 @@ pub(super) fn remote_dtls_handshake(
     sock.set_read_timeout(Some(Duration::from_millis(25)))
         .map_err(|e| format!("set timeout: {}", e))?;
 
-    let mut dtls_buf = vec![0u8; 4096];
-    let mut rbuf = vec![0u8; 4096];
+    let mut dtls_buf = vec![0u8; DTLS_IO_BUF_LEN];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
     let mut pending_sh_suite: Option<u16> = None;
     let mut dtls_suite_id: Option<u16> = None;
     let mut dtls_km: Option<Vec<u8>> = None;
@@ -121,7 +125,10 @@ pub(super) fn remote_dtls_handshake(
         loop {
             match dtls.poll_output(&mut dtls_buf) {
                 DtlsOutput::Packet(p) => {
-                    if p.len() >= 14 && p[0] == 22 && p[13] == 1 {
+                    if p.len() > DTLS_PLAINTEXT_HDR_LEN
+                        && p[0] == DTLS_CT_HANDSHAKE
+                        && p[DTLS_PLAINTEXT_HDR_LEN] == DTLS_HS_CLIENT_HELLO
+                    {
                         emitted_ch = true;
                     } else {
                         emitted_f5 = true;
@@ -212,7 +219,7 @@ impl LiveReadySession {
         }
         if let Some(t) = self.dtls_next_timeout {
             let rem = t.saturating_duration_since(now);
-            if rem > Duration::from_secs(60) {
+            if rem > Duration::from_secs(DTLS_IDLE_TIMEOUT_THRESHOLD_SECS) {
                 self.dtls_next_timeout = None;
             } else if now >= t {
                 if self.dtls.handle_timeout(now).is_err() {
@@ -225,7 +232,7 @@ impl LiveReadySession {
         } else if incoming.is_none() {
             return;
         }
-        let mut dtls_buf = vec![0u8; 4096];
+        let mut dtls_buf = vec![0u8; DTLS_IO_BUF_LEN];
         loop {
             match self.dtls.poll_output(&mut dtls_buf) {
                 DtlsOutput::Packet(p) => {
@@ -233,7 +240,9 @@ impl LiveReadySession {
                 }
                 DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
                 DtlsOutput::Timeout(t) => {
-                    if t.saturating_duration_since(now) > Duration::from_secs(60) {
+                    if t.saturating_duration_since(now)
+                        > Duration::from_secs(DTLS_IDLE_TIMEOUT_THRESHOLD_SECS)
+                    {
                         self.dtls_next_timeout = None;
                     } else {
                         self.dtls_next_timeout = Some(t);
@@ -255,7 +264,7 @@ impl LiveReadySession {
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
         let ts = Instant::now();
         let _ = self.sock.send(&req);
-        let mut rbuf = [0u8; 2048];
+        let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
         let deadline = Duration::from_millis(timeout_ms);
         while ts.elapsed() < deadline {
             match self.sock.recv(&mut rbuf) {
@@ -308,7 +317,7 @@ impl LiveReadySession {
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
         let ts = Instant::now();
         let _ = self.sock.send(raw_req);
-        let mut rbuf = [0u8; 2048];
+        let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
         let deadline = Duration::from_millis(timeout_ms);
         while ts.elapsed() < deadline {
             match self.sock.recv(&mut rbuf) {
@@ -347,15 +356,15 @@ impl LiveReadySession {
 
     pub(super) fn probe_srtp_one(&mut self, payload: &[u8], timeout_ms: u64) -> Option<(f64, usize)> {
         self.pump_dtls(None);
-        let mut wbuf = [0u8; 2048];
+        let mut wbuf = [0u8; PROBE_IO_BUF_LEN];
         let wn = self.cipher.wrap_probe_into(payload, &mut wbuf)?;
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(30)));
         let ts = Instant::now();
         if self.sock.send(&wbuf[..wn]).is_ok() {
             self.tx_srtp_pkts += 1;
         }
-        let mut rbuf = [0u8; 2048];
-        let mut pbuf = [0u8; 2048];
+        let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
+        let mut pbuf = [0u8; PROBE_IO_BUF_LEN];
         let deadline = Duration::from_millis(timeout_ms);
         while ts.elapsed() < deadline {
             match self.sock.recv(&mut rbuf) {
@@ -397,7 +406,7 @@ impl LiveReadySession {
             .cipher
             .build_srtcp(self.rx_srtp_pkts > 0, self.tx_srtp_pkts > 0, true);
         let _ = self.sock.send(&bye);
-        let mut dtls_buf = vec![0u8; 2048];
+        let mut dtls_buf = vec![0u8; PROBE_IO_BUF_LEN];
         if self.dtls.close().is_ok() {
             loop {
                 match self.dtls.poll_output(&mut dtls_buf) {
@@ -423,7 +432,7 @@ pub(super) fn send_probe_expect_silence_ms(server_addr: SocketAddr, payload: &[u
         return 0;
     }
     let _ = atk.send(payload);
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; PROBE_IO_BUF_LEN];
     match atk.recv(&mut buf) {
         Ok(n) => n,
         Err(_) => 0,

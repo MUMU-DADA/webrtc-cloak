@@ -4,6 +4,10 @@ use super::remote_session::{
     remote_dtls_handshake, remote_stun_handshake, send_probe_expect_silence_ms, LiveReadySession,
 };
 use super::{percentile, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
+use crate::constants::{
+    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_VER_MAJOR, DTLS_VER_MINOR_12, IPV4_UDP_HDR_LEN,
+    PROBE_IO_BUF_LEN, SRTP_DATA_MIN_WIRE_LEN, STUN_HDR_LEN,
+};
 use crate::protocol::{
     build_ice_stun_request, demux_rfc7983, fill_random, PacketKind, SessionIceParams, SrtpFrame,
 };
@@ -56,9 +60,9 @@ pub(super) fn run_remote_steps_06_to_09(
             let probe_len = 1198usize;
             let mut payload = vec![0u8; probe_len];
             payload[..4].copy_from_slice(b"SEQ:");
-            let mut wbuf = [0u8; 2048];
-            let mut rbuf = [0u8; 2048];
-            let mut pbuf = [0u8; 2048];
+            let mut wbuf = [0u8; PROBE_IO_BUF_LEN];
+            let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
+            let mut pbuf = [0u8; PROBE_IO_BUF_LEN];
             let mut sent_at: HashMap<u64, Instant> = HashMap::new();
             let mut rtts_ms: Vec<f64> = Vec::with_capacity(total as usize);
             let mut rx_set: HashSet<u64> = HashSet::new();
@@ -239,8 +243,8 @@ pub(super) fn run_remote_steps_06_to_09(
             report_step(7, r.name, &r);
             results.push(r);
         } else {
-            let max_wire_allowed = opts.wan_mtu.saturating_sub(28);
-            let exact_edge = max_wire_allowed.saturating_sub(38); // 1422B for WAN MTU 1488
+            let max_wire_allowed = opts.wan_mtu.saturating_sub(IPV4_UDP_HDR_LEN);
+            let exact_edge = max_wire_allowed.saturating_sub(SRTP_DATA_MIN_WIRE_LEN); // 1422B for WAN MTU 1488
             let candidates = [1000usize, 1200, 1350, 1400, exact_edge];
             let mut max_udp_pass = 0usize;
             let mut max_wire_seen = 0usize;
@@ -273,14 +277,14 @@ pub(super) fn run_remote_steps_06_to_09(
             // Local anti-frag guard MUST block oversize (e.g. 1452B)
             let oversize_udp = exact_edge + 30;
             let oversize_payload = vec![0x77u8; oversize_udp.saturating_sub(2)];
-            let mut tmp_buf = [0u8; 2048];
+            let mut tmp_buf = [0u8; PROBE_IO_BUF_LEN];
             let guard_dropped = sess
                 .cipher
                 .wrap_probe_into(&oversize_payload, &mut tmp_buf)
                 .is_none();
 
             let ipv4_mtu_verified = if max_udp_pass > 0 {
-                max_udp_pass + 38 + 28
+                max_udp_pass + SRTP_DATA_MIN_WIRE_LEN + IPV4_UDP_HDR_LEN
             } else {
                 0
             };
@@ -428,11 +432,11 @@ pub(super) fn run_remote_steps_06_to_09(
         fill_random(&mut rand_junk);
 
         let mut forged_dtls = vec![0u8; 64];
-        forged_dtls[0] = 22;
-        forged_dtls[1] = 0xFE;
-        forged_dtls[2] = 0xFD;
+        forged_dtls[0] = DTLS_CT_HANDSHAKE;
+        forged_dtls[1] = DTLS_VER_MAJOR;
+        forged_dtls[2] = DTLS_VER_MINOR_12;
         forged_dtls[12] = 51;
-        forged_dtls[13] = 1;
+        forged_dtls[13] = DTLS_HS_CLIENT_HELLO;
 
         let (wrong_psk_stun, _) = build_ice_stun_request(b"wrong-attacker-psk", &ice, None, true);
 
@@ -442,7 +446,7 @@ pub(super) fn run_remote_steps_06_to_09(
 
         let (mut smuggled_stun, _) = build_ice_stun_request(psk, &ice, None, true);
         smuggled_stun.extend_from_slice(&[0x80, 0x22, 0x00, 0x04, b'E', b'V', b'I', b'L']);
-        let new_len = (smuggled_stun.len() - 20) as u16;
+        let new_len = (smuggled_stun.len() - STUN_HDR_LEN) as u16;
         smuggled_stun[2..4].copy_from_slice(&new_len.to_be_bytes());
 
         let replay_stun = if captured_stun.is_empty() {

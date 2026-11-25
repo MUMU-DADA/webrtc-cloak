@@ -3,11 +3,16 @@
 use super::dtls::graceful_teardown_client;
 use super::{
     log, make_udp_socket, ClientConfig, ClientSession, HandshakeState, OldPathDrain,
-    PendingReconnect, LISTEN_TOKEN, WAKE_TOKEN,
+    PendingReconnect,
+};
+use crate::constants::{
+    DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP,
+    SOCK_BUF_8MIB, SRTP_DATA_MIN_WIRE_LEN, TELEMETRY_DEFAULT_INTERVAL_SECS, UDP_RECV_BUF_LEN,
+    UDP_WRITE_BUF_LEN, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
     detect_cpu_accel, register_shutdown_waker, stun_hmac_key, CertCache, CpuAccelInfo,
-    DtlsConfigPool, MAX_INNER_UDP_LEN,
+    DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use dimpl::ProtocolVersion;
@@ -70,13 +75,15 @@ pub(super) fn run_client_worker(
         }
     }
 
-    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, 8 * 1024 * 1024)?;
+    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
 
     let stun_mi_key = stun_hmac_key(&cfg.psk);
     let max_inner_pending = if cfg.wan_mtu > 0 {
-        cfg.wan_mtu.saturating_sub(28 + 38).min(MAX_INNER_UDP_LEN)
+        cfg.wan_mtu
+            .saturating_sub(IPV4_UDP_HDR_LEN + SRTP_DATA_MIN_WIRE_LEN)
+            .min(MAX_INNER_UDP_LEN)
     } else {
         MAX_INNER_UDP_LEN
     };
@@ -96,7 +103,7 @@ pub(super) fn run_client_worker(
     let telemetry_dur = telemetry
         .as_ref()
         .map(|th| th.interval())
-        .unwrap_or(Duration::from_secs(5));
+        .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
 
     let mut worker = ClientWorker {
@@ -116,9 +123,9 @@ pub(super) fn run_client_worker(
         stun_mi_key,
         max_inner_pending,
         telemetry,
-        rbuf: vec![0u8; 65536],
-        wbuf: vec![0u8; 65536 + 128],
-        dtls_buf: vec![0u8; 4096],
+        rbuf: vec![0u8; UDP_RECV_BUF_LEN],
+        wbuf: vec![0u8; UDP_WRITE_BUF_LEN],
+        dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
         cpu,
         retry_dur,
         ka_base_ms,
@@ -138,7 +145,7 @@ pub(super) fn run_client_worker(
 
 impl ClientWorker {
     fn run(&mut self) -> std::io::Result<()> {
-        let mut events = Events::with_capacity(256);
+        let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
             if self
                 .cfg
@@ -156,8 +163,9 @@ impl ClientWorker {
             if self.telemetry.is_some() && wait > self.telemetry_dur {
                 wait = self.telemetry_dur;
             }
-            if self.cfg.stop.is_some() && self.cfg.quiet && wait > Duration::from_millis(20) {
-                wait = Duration::from_millis(20);
+            let quiet_cap = Duration::from_millis(WORKER_QUIET_STOP_POLL_MS);
+            if self.cfg.stop.is_some() && self.cfg.quiet && wait > quiet_cap {
+                wait = quiet_cap;
             }
             if let Err(e) = self.poll.poll(&mut events, Some(wait)) {
                 if e.kind() == ErrorKind::Interrupted {

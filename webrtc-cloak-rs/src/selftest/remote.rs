@@ -5,6 +5,7 @@ use super::remote_probes::run_remote_steps_06_to_09;
 use super::remote_session::{remote_dtls_handshake, remote_stun_handshake, LiveReadySession};
 use super::report::{pad_right, print_json_report, print_pretty_report, Palette};
 use super::{percentile, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
+use crate::constants::PROBE_IO_BUF_LEN;
 use crate::protocol::{demux_rfc7983, detect_cpu_accel, PacketKind};
 use std::net::SocketAddr;
 use std::thread;
@@ -309,7 +310,7 @@ pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAdd
         let _ = sess.sock.send(&cli_rtcp);
         if sess.dl_srtcp_verified == 0 {
             let _ = sess.sock.set_read_timeout(Some(Duration::from_millis(50)));
-            let mut rbuf = [0u8; 2048];
+            let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
             let wait_t0 = Instant::now();
             while wait_t0.elapsed() < Duration::from_secs(3) && sess.dl_srtcp_verified == 0 {
                 if let Ok(n) = sess.sock.recv(&mut rbuf) {

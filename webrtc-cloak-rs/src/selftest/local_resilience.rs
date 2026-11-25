@@ -5,6 +5,10 @@ use super::harness::{
     NetProfile,
 };
 use super::{reserve_free_port, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
+use crate::constants::{
+    CTRL_FRAME_BUF_LEN, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_VER_MAJOR, DTLS_VER_MINOR_12,
+    PROBE_IO_BUF_LEN, RTP_V2_EXT_BYTE, RTP_VIDEO_PT, STUN_HDR_LEN,
+};
 use crate::protocol::{
     build_ice_stun_request, combine_session_key, derive_stun_material, detect_cpu_accel,
     fill_random, generate_ephemeral_webrtc_cert, CipherPref, CipherSuite, SessionIceParams,
@@ -43,7 +47,7 @@ pub(super) fn test_07_asymmetric_blackhole(opts: &SelftestOptions, hi: &mut High
     // Cut 100% uplink on port1 while downlink SRTCP continues flowing!
     proxy.blackhole_port.store(port1, Ordering::SeqCst);
     let bh_t0 = Instant::now();
-    let mut rbuf = [0u8; 256];
+    let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
     let mut recovered_s: Option<f64> = None;
 
     while bh_t0.elapsed() < Duration::from_secs(10) {
@@ -119,7 +123,7 @@ pub(super) fn test_08_server_restart(opts: &SelftestOptions, hi: &mut Highlights
     let _server2 = ManagedServer::start(server_port, backend.port, psk, opts.cipher_pref, opts.wan_mtu);
     let rs_t0 = Instant::now();
 
-    let mut rbuf = [0u8; 256];
+    let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
     let mut recovered_s: Option<f64> = None;
     while rs_t0.elapsed() < Duration::from_secs(10) {
         let _ = app.send(b"PROBE_AFTER_RESTART");
@@ -161,7 +165,7 @@ fn send_probe_expect_silence(server_addr: SocketAddr, payload: &[u8]) -> usize {
     atk.set_read_timeout(Some(Duration::from_millis(110))).unwrap();
     atk.connect(server_addr).unwrap();
     let _ = atk.send(payload);
-    let mut buf = [0u8; 2048];
+    let mut buf = [0u8; PROBE_IO_BUF_LEN];
     match atk.recv(&mut buf) {
         Ok(n) => n,
         Err(_) => 0,
@@ -203,12 +207,12 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
 
     // 2. Forged DTLS 1.2 ClientHello without prior STUN authentication
     let mut forged_dtls = vec![0u8; 64];
-    forged_dtls[0] = 22; // Handshake
-    forged_dtls[1] = 0xFE;
-    forged_dtls[2] = 0xFD; // DTLS 1.2
+    forged_dtls[0] = DTLS_CT_HANDSHAKE; // Handshake
+    forged_dtls[1] = DTLS_VER_MAJOR;
+    forged_dtls[2] = DTLS_VER_MINOR_12; // DTLS 1.2
     forged_dtls[11] = 0;
     forged_dtls[12] = 51;
-    forged_dtls[13] = 1; // ClientHello
+    forged_dtls[13] = DTLS_HS_CLIENT_HELLO; // ClientHello
 
     // 3. Valid-format STUN signed with WRONG PSK
     let (wrong_psk_stun, _) = build_ice_stun_request(b"wrong-attacker-psk", &ice, None, true);
@@ -221,7 +225,7 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
     // 5. Real STUN with injected trailing attribute after FINGERPRINT (smuggling)
     let (mut smuggled_stun, _) = build_ice_stun_request(&psk, &ice, None, true);
     smuggled_stun.extend_from_slice(&[0x80, 0x22, 0x00, 0x04, b'E', b'V', b'I', b'L']);
-    let new_body_len = (smuggled_stun.len() - 20) as u16;
+    let new_body_len = (smuggled_stun.len() - STUN_HDR_LEN) as u16;
     smuggled_stun[2..4].copy_from_slice(&new_body_len.to_be_bytes());
 
     // 6. Cross-port replay of real captured authenticated client STUN packet
@@ -233,8 +237,8 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
     // 8. Forged/tampered SRTP packet (0x90 RTP header + random payload/tag)
     let mut forged_srtp = vec![0u8; 96];
     fill_random(&mut forged_srtp);
-    forged_srtp[0] = 0x90;
-    forged_srtp[1] = 96;
+    forged_srtp[0] = RTP_V2_EXT_BYTE;
+    forged_srtp[1] = RTP_VIDEO_PT;
 
     let probes: [(&str, &[u8]); 8] = [
         ("junk", &rand_junk),
@@ -261,7 +265,7 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
     }
 
     // Verify legitimate tunnel is completely undisturbed after active attack wave
-    let mut rbuf = [0u8; 256];
+    let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
     let _ = app.send(b"LEGIT_POST_ATTACK_OK");
     let legit_ok = app
         .recv(&mut rbuf)
@@ -314,7 +318,7 @@ pub(super) fn test_10_multistream_throughput(opts: &SelftestOptions, hi: &mut Hi
             let sock = connect_app(cport, 300);
             bar.wait();
             let msg = format!("STREAM_ISOLATION_TOKEN_{:02}", sid);
-            let mut rb = [0u8; 256];
+            let mut rb = [0u8; CTRL_FRAME_BUF_LEN];
             let deadline = Instant::now() + Duration::from_secs(3);
             let mut ok = false;
             while Instant::now() < deadline {

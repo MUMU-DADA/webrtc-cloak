@@ -1,9 +1,12 @@
 //! 会话密钥派生与双 SSRC SRTP 加解密及防重放状态机。
 
 use super::{
-    fill_random, CipherSuite, SrtpFrame, DEFAULT_WAN_MTU, DIR_C2S, DIR_S2C, MAX_INNER_UDP_LEN,
-    RTP_AUDIO_PT, RTP_FIXED_HDR_LEN, RTP_FULL_HDR_LEN, RTP_VIDEO_PT, SRTP_HANDOVER_MAGIC,
-    SRTP_PATH_CHALLENGE_MAGIC, SRTP_PROBE_MAGIC_LEN, SRTP_TAG_LEN,
+    fill_random, CipherSuite, SrtpFrame, BASE64_ALPHABET, RTCP_CNAME_LEN, RTP_V2_BITS, RTP_V2_MASK,
+};
+use crate::constants::{
+    DEFAULT_WAN_MTU, IPV4_UDP_HDR_LEN, MAX_INNER_UDP_LEN, MIN_WIRE_UDP_MTU, RTP_AUDIO_PT,
+    RTP_FIXED_HDR_LEN, RTP_FULL_HDR_LEN, RTP_V2_EXT_BYTE, RTP_VIDEO_PT, SRTP_DATA_PREFIX_LEN,
+    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, SRTP_PROBE_MAGIC_LEN, SRTP_TAG_LEN,
 };
 use aes_gcm::aead::AeadInPlace;
 use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag as GcmTag};
@@ -15,10 +18,82 @@ use sha2::Sha256;
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
-/// Hard SRTP 48-bit extended sequence exhaustion ceiling (never wrap Nonce!).
+/// IPv4 单个 UDP 报文理论最大负载长度（65535 - 28 字节）。
+const MAX_IPV4_UDP_PAYLOAD: usize = 65_507;
+/// 加密 Nonce 方向域标识：客户端 -> 服务端。
+const DIR_C2S: u8 = 0;
+/// 加密 Nonce 方向域标识：服务端 -> 客户端。
+const DIR_S2C: u8 = 1;
+/// 双 SSRC 音频流正交 AEAD Nonce 域掩码位。
+const NONCE_DOMAIN_AUDIO_BIT: u8 = 0x40;
+/// 解封 SRTP 时允许的最大 RTP 头部长度（字节），防止越界构造。
+const RTP_MAX_HDR_LEN: usize = 64;
+/// RTP 次字节 Marker 位（`M=1` 表示视频帧尾或音频 talkspurt 起始）。
+const RTP_MARKER_BIT: u8 = 0x80;
+/// RFC 8285 One-Byte Header 魔数高字节（0xBE）。
+const RTP_ONE_BYTE_EXT_MAGIC_HI: u8 = 0xBE;
+/// RFC 8285 One-Byte Header 魔数低字节（0xDE）。
+const RTP_ONE_BYTE_EXT_MAGIC_LO: u8 = 0xDE;
+/// RFC 8285 transport-wide-cc 扩展元素头字节（ID=3, L=1 即 2 字节值）。
+const RTP_TWCC_EXT_ID_LEN: u8 = 0x31;
+/// 带内控制帧加密区前缀长度（2B 控制魔数 + 2B 控制负载长度）。
+const SRTP_CTRL_PREFIX_LEN: usize = 4;
+/// 带内控制帧允许携带的最大负载字节数。
+const SRTP_MAX_CTRL_PAYLOAD_LEN: usize = 1460;
+/// 触发小范围随机填充的大包有效负载阈值（字节），避免接近 MTU 时浪费空间。
+const SRTP_PAD_LARGE_PKT_THRESHOLD: usize = 1340;
+/// 大包允许的最大随机填充字节数（0..=7B）。
+const SRTP_PAD_LARGE_MAX: usize = 7;
+/// 常规包允许的最大随机填充字节数（0..=31B）。
+const SRTP_PAD_NORMAL_MAX: usize = 31;
+/// SRTP 48 位扩展序列号硬上限（触及前强制轮换密钥，杜绝 Nonce 回绕）。
 const MAX_SRTP_EXT_SEQ: u64 = 0xFFFF_FFFF_FF00;
-/// Hard SRTCP 31-bit index exhaustion ceiling (never wrap Nonce!).
+/// SRTCP 31 位索引硬上限（触及前强制轮换密钥，杜绝 Nonce 回绕）。
 const MAX_SRTCP_IDX: u32 = 0x7FFF_FF00;
+/// SRTP 防重放环形位图 64 位字数（64 * 64 = 4096 位环，支持 O(1) 2048 包窗口）。
+const SRTP_REPLAY_RING_WORDS: usize = 64;
+/// SRTP RFC 6479 防重放滑动窗口宽度（2048 包，容忍跨洋 ECMP 乱序）。
+const SRTP_REPLAY_WINDOW: u64 = 2048;
+/// 16 位 RTP 序列号 ROC 回绕判定低阈值（< 0x4000）。
+const SRTP_ROC_WRAP_LOW: u16 = 0x4000;
+/// 16 位 RTP 序列号 ROC 回绕判定高阈值（> 0xC000）。
+const SRTP_ROC_WRAP_HIGH: u16 = 0xC000;
+/// Opus 音频帧步长（20ms，严格遵守 RFC 7587 <= 50 pps 上限）。
+const AUDIO_FRAME_MS: u64 = 20;
+/// Opus 48 kHz 时钟每 20ms 帧对应的 RTP 时间戳增量（960 ticks）。
+const AUDIO_TICKS_PER_FRAME: u64 = 960;
+/// 音频静默间隔达到该阈值（毫秒）后，下一帧置 `M=1` 标记 talkspurt 起点。
+const AUDIO_TALKSPURT_GAP_MS: u64 = 200;
+/// 双 SSRC 小包路由到音频流的基准长度下界（字节，加 `0..=127` 抖动得 `180..=307B`）。
+const AUDIO_SPLIT_BASE_LEN: usize = 180;
+/// 双 SSRC 音频分流长度随机抖动掩码（0..=127 字节）。
+const AUDIO_SPLIT_JITTER_MASK: usize = 0x7F;
+/// 视频流标准 RTP 时钟频率（90 kHz）。
+const VIDEO_CLOCK_KHZ: u128 = 90;
+/// 视频单包成帧或提前收尾的小包负载阈值（字节）。
+const VIDEO_SMALL_PKT_THRESHOLD: usize = 1100;
+/// 稀疏小包独立成帧（立即置 `M=1`）的最小时间间隔（90 kHz ticks，约 28ms）。
+const VIDEO_SPARSE_GAP_90K: u64 = 2500;
+/// 打开中的视频帧最大空闲年龄（90 kHz ticks，约 66ms），超时后放弃旧帧另起新帧。
+const VIDEO_MAX_FRAME_AGE_90K: u64 = 6000;
+/// 打开中的视频帧强制封帧（置 `M=1`）年龄阈值（90 kHz ticks，约 32ms，约 30 fps）。
+const VIDEO_FORCE_CLOSE_90K: u64 = 2900;
+/// 打开中的视频帧软封帧年龄阈值（90 kHz ticks，约 16.7ms，配合小包或包数预算提前封帧）。
+const VIDEO_SOFT_CLOSE_90K: u64 = 1500;
+/// 单个视频帧随机包数预算下限（8..=18 包）。
+const VIDEO_FRAME_PKT_BUDGET_MIN: u16 = 8;
+/// 单个视频帧随机包数预算跨度（模 11 得到 0..=10 增量）。
+const VIDEO_FRAME_PKT_BUDGET_SPAN: u16 = 11;
+/// SplitMix64 伪随机数增量常量（黄金比例 64 位常数）。
+const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
+/// SplitMix64 第一阶段混合乘数。
+const SPLITMIX64_MUL1: u64 = 0xBF58_476D_1CE4_E5B9;
+/// SplitMix64 第二阶段混合乘数。
+const SPLITMIX64_MUL2: u64 = 0x94D0_49BB_1331_11EB;
+/// SRTP 随机填充 LCG 初始种子异或常量。
+const PAD_LCG_SEED_XOR: u64 = 0xA076_1D64_78BD_642F;
+/// SRTP 随机填充 LCG 乘数（Knuth MMIX 64 位同余常数）。
+const PAD_LCG_MUL: u64 = 6_364_136_223_846_793_005;
 
 pub fn derive_stun_material(psk: &[u8], stun_txid: &[u8; 12], username: &str) -> ([u8; 32], u32, u32) {
     let mut seed = Vec::with_capacity(64 + psk.len() + username.len());
@@ -55,9 +130,6 @@ pub fn combine_session_key(stun_key: &[u8; 32], dtls_km: Option<&[u8]>) -> [u8; 
     h.finalize().into()
 }
 
-const SRTP_REPLAY_RING_WORDS: usize = 64; // 4096-bit ring buffer -> exact O(1) 2048-packet RFC 6479 window
-const SRTP_REPLAY_WINDOW: u64 = 2048;     // WireGuard-grade trans-Pacific ECMP reorder tolerance
-
 pub(super) fn derive_audio_ssrc(session_key: &[u8; 32], video_ssrc: u32) -> u32 {
     let mut h = Sha256::new();
     h.update(b"webrtc-cloak-v3-audio-ssrc|");
@@ -85,7 +157,7 @@ pub struct SrtpCloakCipher {
     pub(super) aes_gcm: Aes128Gcm,
     pub(super) chacha: ChaCha20Poly1305,
     pub(super) gcm_salt: [u8; 4],
-    pub(super) cname: [u8; 13],
+    pub(super) cname: [u8; RTCP_CNAME_LEN],
     pub ssrc_tx: u32,
     pub ssrc_rx: u32,
     pub audio_ssrc_tx: u32,
@@ -158,16 +230,16 @@ impl SrtpCloakCipher {
         let pad_rng = u64::from_ne_bytes(r[8..16].try_into().unwrap()) | 1;
         let audio_init_seq = (u16::from_be_bytes([r[16], r[17]]) & 0x7FFF) as u64;
         let audio_ts_base = u32::from_be_bytes([r[18], r[19], r[20], r[21]]);
-        let init_budget = 8 + ((r[22] as u16) % 11);
-        const B64: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut cname = [0u8; 13];
-        for i in 0..13 {
-            cname[i] = B64[(r[24 + i] as usize) & 63];
+        let init_budget =
+            VIDEO_FRAME_PKT_BUDGET_MIN + ((r[22] as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
+        let mut cname = [0u8; RTCP_CNAME_LEN];
+        for i in 0..RTCP_CNAME_LEN {
+            cname[i] = BASE64_ALPHABET[(r[24 + i] as usize) & 63];
         }
 
         Self {
             suite,
-            max_wire_udp: DEFAULT_WAN_MTU - 28,
+            max_wire_udp: DEFAULT_WAN_MTU - IPV4_UDP_HDR_LEN,
             dual_ssrc: false,
             enc_key,
             mac_key,
@@ -231,16 +303,18 @@ impl SrtpCloakCipher {
         self.max_wire_udp = if wan_mtu == 0 {
             0
         } else {
-            wan_mtu.saturating_sub(28).max(576)
+            wan_mtu
+                .saturating_sub(IPV4_UDP_HDR_LEN)
+                .max(MIN_WIRE_UDP_MTU)
         };
     }
 
     #[inline]
     pub(super) fn next_rng(&mut self) -> u64 {
-        self.pad_rng = self.pad_rng.wrapping_add(0x9E37_79B9_7F4A_7C15);
+        self.pad_rng = self.pad_rng.wrapping_add(SPLITMIX64_GAMMA);
         let mut z = self.pad_rng;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+        z = (z ^ (z >> 30)).wrapping_mul(SPLITMIX64_MUL1);
+        z = (z ^ (z >> 27)).wrapping_mul(SPLITMIX64_MUL2);
         z ^ (z >> 31)
     }
 
@@ -396,7 +470,7 @@ impl SrtpCloakCipher {
         payload: &[u8],
         out: &mut [u8],
     ) -> Option<usize> {
-        if payload.len() > 1460
+        if payload.len() > SRTP_MAX_CTRL_PAYLOAD_LEN
             || !matches!(
                 magic,
                 SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
@@ -416,12 +490,16 @@ impl SrtpCloakCipher {
         out: &mut [u8],
     ) -> Option<usize> {
         let is_control = control_magic.is_some();
-        let prefix_len = if is_control { 4 } else { 2 };
+        let prefix_len = if is_control {
+            SRTP_CTRL_PREFIX_LEN
+        } else {
+            SRTP_DATA_PREFIX_LEN
+        };
         let fixed_overhead = RTP_FULL_HDR_LEN + prefix_len + SRTP_TAG_LEN;
         let base_total = fixed_overhead.saturating_add(plaintext.len());
         if plaintext.len() > MAX_INNER_UDP_LEN
             || base_total > out.len()
-            || base_total > 65_507
+            || base_total > MAX_IPV4_UDP_PAYLOAD
             || (self.max_wire_udp > 0 && base_total > self.max_wire_udp)
         {
             return None; // Prevents IPv4 fragmentation & guides inner QUIC DPLPMTUD cleanly
@@ -429,15 +507,15 @@ impl SrtpCloakCipher {
         let headroom = if self.max_wire_udp > 0 {
             self.max_wire_udp - base_total
         } else {
-            31
+            SRTP_PAD_NORMAL_MAX
         };
-        let eff_len = plaintext.len() + if is_control { 2 } else { 0 };
+        let eff_len = plaintext.len() + if is_control { SRTP_DATA_PREFIX_LEN } else { 0 };
         let max_pad = if no_pad {
             0
-        } else if eff_len >= 1340 {
-            headroom.min(7)
+        } else if eff_len >= SRTP_PAD_LARGE_PKT_THRESHOLD {
+            headroom.min(SRTP_PAD_LARGE_MAX)
         } else {
-            headroom.min(31)
+            headroom.min(SRTP_PAD_NORMAL_MAX)
         };
         let rnd = self.next_rng();
         let pad_len: usize = if max_pad == 0 {
@@ -447,7 +525,7 @@ impl SrtpCloakCipher {
         };
         let ct_len = prefix_len + plaintext.len() + pad_len;
         let total = RTP_FULL_HDR_LEN + ct_len + SRTP_TAG_LEN;
-        if total > out.len() || total > 65_507 {
+        if total > out.len() || total > MAX_IPV4_UDP_PAYLOAD {
             return None;
         }
 
@@ -457,11 +535,12 @@ impl SrtpCloakCipher {
 
         let elapsed = self.t0.elapsed();
         let wall_ms = elapsed.as_millis() as u64;
-        let audio_frame = wall_ms / 20;
+        let audio_frame = wall_ms / AUDIO_FRAME_MS;
         // Jittered audio/video split threshold (180..=307B) + strict RFC 7587 <=50pps Opus cap
         // (max 1 PT=111 packet per 20ms frame; bursty QUIC ACKs cleanly spill onto PT=96 Video).
         // Applies uniformly to Data and 0xFFFE Probe frames for zero selftest fingerprint delta.
-        let audio_thresh = 180 + (((rnd >> 24) as usize) & 0x7F);
+        let audio_thresh =
+            AUDIO_SPLIT_BASE_LEN + (((rnd >> 24) as usize) & AUDIO_SPLIT_JITTER_MASK);
         let use_audio = self.dual_ssrc
             && plaintext.len() < audio_thresh
             && audio_frame != self.last_audio_frame;
@@ -471,24 +550,33 @@ impl SrtpCloakCipher {
             self.audio_tx_since_rtcp += 1;
             self.last_audio_frame = audio_frame;
             // RFC 7587 Opus 48,000 Hz clock quantized to 20ms frames (960 ticks/frame); M=1 on talkspurt start
-            let a_ts = self.audio_ts_base.wrapping_add((audio_frame.wrapping_mul(960)) as u32);
+            let a_ts = self
+                .audio_ts_base
+                .wrapping_add((audio_frame.wrapping_mul(AUDIO_TICKS_PER_FRAME)) as u32);
             let m: u8 = if self.last_audio_wall_ms == u64::MAX
-                || wall_ms.saturating_sub(self.last_audio_wall_ms) >= 200
+                || wall_ms.saturating_sub(self.last_audio_wall_ms) >= AUDIO_TALKSPURT_GAP_MS
             {
-                0x80
+                RTP_MARKER_BIT
             } else {
                 0x00
             };
             self.last_audio_wall_ms = wall_ms;
             // Orthogonal AEAD Nonce domain (`dir | 0x40`) + high-16-bit disjoint Audio SSRC
-            (es, self.audio_ssrc_tx, RTP_AUDIO_PT, a_ts, m, self.tx_dir | 0x40)
+            (
+                es,
+                self.audio_ssrc_tx,
+                RTP_AUDIO_PT,
+                a_ts,
+                m,
+                self.tx_dir | NONCE_DOMAIN_AUDIO_BIT,
+            )
         } else {
             let es = self.tx_ext_seq;
             self.tx_ext_seq += 1;
             self.video_tx_since_rtcp += 1;
             // Exact 90,000 Hz wall-clock video framing with STRICT RFC 3550 M=1 causality:
             // once a packet emits M=1 for timestamp T, NO subsequent packet EVER reuses T!
-            let wall_90k: u64 = ((elapsed.as_nanos() * 90) / 1_000_000) as u64;
+            let wall_90k: u64 = ((elapsed.as_nanos() * VIDEO_CLOCK_KHZ) / 1_000_000) as u64;
             let (frame_ts, m): (u64, u8) = if !self.video_frame_open {
                 let start_ts = if self.last_closed_video_ts == u64::MAX {
                     wall_90k
@@ -497,37 +585,39 @@ impl SrtpCloakCipher {
                 };
                 // Sparse small packet after >=28ms gap -> clean single-packet frame (M=1 & close)
                 let sparse_gap = self.last_closed_video_ts == u64::MAX
-                    || start_ts.saturating_sub(self.last_closed_video_ts) >= 2500;
-                if plaintext.len() < 1100 && sparse_gap {
+                    || start_ts.saturating_sub(self.last_closed_video_ts) >= VIDEO_SPARSE_GAP_90K;
+                if plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD && sparse_gap {
                     self.last_closed_video_ts = start_ts;
                     self.frame_pkt_count = 0;
-                    (start_ts, 0x80)
+                    (start_ts, RTP_MARKER_BIT)
                 } else {
                     self.video_frame_open = true;
                     self.cur_video_ts = start_ts;
                     self.frame_pkt_count = 1;
-                    self.frame_pkt_budget = 8 + (((rnd >> 8) as u16) % 11); // 8..=18 pkts
+                    self.frame_pkt_budget = VIDEO_FRAME_PKT_BUDGET_MIN
+                        + (((rnd >> 8) as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
                     (start_ts, 0x00)
                 }
             } else {
                 let age_90k = wall_90k.saturating_sub(self.cur_video_ts);
-                if age_90k >= 6000 {
+                if age_90k >= VIDEO_MAX_FRAME_AGE_90K {
                     // Long idle gap (>66ms): abandon old open frame cleanly & start fresh at wall_90k
                     let start_ts = wall_90k.max(self.cur_video_ts.wrapping_add(1));
-                    if plaintext.len() < 1100 {
+                    if plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD {
                         self.video_frame_open = false;
                         self.last_closed_video_ts = start_ts;
                         self.frame_pkt_count = 0;
-                        (start_ts, 0x80)
+                        (start_ts, RTP_MARKER_BIT)
                     } else {
                         self.cur_video_ts = start_ts;
                         self.frame_pkt_count = 1;
-                        self.frame_pkt_budget = 8 + (((rnd >> 8) as u16) % 11);
+                        self.frame_pkt_budget = VIDEO_FRAME_PKT_BUDGET_MIN
+                            + (((rnd >> 8) as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
                         (start_ts, 0x00)
                     }
-                } else if age_90k >= 2900
-                    || (age_90k >= 1500
-                        && (plaintext.len() < 1100
+                } else if age_90k >= VIDEO_FORCE_CLOSE_90K
+                    || (age_90k >= VIDEO_SOFT_CLOSE_90K
+                        && (plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD
                             || self.frame_pkt_count >= self.frame_pkt_budget))
                 {
                     // Close current frame with M=1 as its FINAL packet; next packet MUST advance TS!
@@ -535,7 +625,7 @@ impl SrtpCloakCipher {
                     self.video_frame_open = false;
                     self.last_closed_video_ts = close_ts;
                     self.frame_pkt_count = 0;
-                    (close_ts, 0x80)
+                    (close_ts, RTP_MARKER_BIT)
                 } else {
                     self.frame_pkt_count = self.frame_pkt_count.saturating_add(1);
                     (self.cur_video_ts, 0x00)
@@ -551,18 +641,18 @@ impl SrtpCloakCipher {
         self.tx_twcc_seq = self.tx_twcc_seq.wrapping_add(1);
 
         // 12B standard Chrome RTP header: 0x90 (V=2, P=0, X=1, CC=0)
-        out[0] = 0x90;
+        out[0] = RTP_V2_EXT_BYTE;
         out[1] = marker | pt;
         out[2..4].copy_from_slice(&seq16.to_be_bytes());
         out[4..8].copy_from_slice(&ts.to_be_bytes());
         out[8..12].copy_from_slice(&active_ssrc.to_be_bytes());
 
         // 8B RFC 8285 One-Byte Extension Header (0xBEDE, len=1 word, ID=3 L=1 transport-wide-cc)
-        out[12] = 0xBE;
-        out[13] = 0xDE;
+        out[12] = RTP_ONE_BYTE_EXT_MAGIC_HI;
+        out[13] = RTP_ONE_BYTE_EXT_MAGIC_LO;
         out[14] = 0x00;
         out[15] = 0x01;
-        out[16] = 0x31;
+        out[16] = RTP_TWCC_EXT_ID_LEN;
         out[17..19].copy_from_slice(&twcc.to_be_bytes());
         out[19] = 0x00;
 
@@ -583,9 +673,9 @@ impl SrtpCloakCipher {
             .copy_from_slice(plaintext);
         if pad_len > 0 {
             let p_start = RTP_FULL_HDR_LEN + prefix_len + plaintext.len();
-            let mut st = rnd ^ 0xA076_1D64_78BD_642F;
+            let mut st = rnd ^ PAD_LCG_SEED_XOR;
             for b in &mut out[p_start..ct_end] {
-                st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                st = st.wrapping_mul(PAD_LCG_MUL).wrapping_add(1);
                 *b = (st >> 56) as u8;
             }
         }
@@ -645,11 +735,11 @@ impl SrtpCloakCipher {
     /// Zero-allocation unwrap distinguishing normal UDP `Data(len)` from in-band encrypted `Probe(len)`.
     #[inline]
     pub fn unwrap_into_ex(&mut self, packet: &[u8], out: &mut [u8]) -> Option<SrtpFrame> {
-        if packet.len() < RTP_FIXED_HDR_LEN + 2 + SRTP_TAG_LEN {
+        if packet.len() < RTP_FIXED_HDR_LEN + SRTP_DATA_PREFIX_LEN + SRTP_TAG_LEN {
             return None;
         }
         let b0 = packet[0];
-        if (b0 & 0xC0) != 0x80 {
+        if (b0 & RTP_V2_MASK) != RTP_V2_BITS {
             return None;
         }
         let has_ext = (b0 & 0x10) != 0;
@@ -662,7 +752,9 @@ impl SrtpCloakCipher {
             let ext_words = u16::from_be_bytes([packet[hdr_len + 2], packet[hdr_len + 3]]) as usize;
             hdr_len += 4 + ext_words * 4;
         }
-        if packet.len() < hdr_len + 2 + SRTP_TAG_LEN || hdr_len > 64 {
+        if packet.len() < hdr_len + SRTP_DATA_PREFIX_LEN + SRTP_TAG_LEN
+            || hdr_len > RTP_MAX_HDR_LEN
+        {
             return None;
         }
 
@@ -692,12 +784,12 @@ impl SrtpCloakCipher {
         let mut candidates = [0u32; 3];
         let mut n_cand = 0usize;
         if rx_init {
-            if seq16 < 0x4000 && rx_highest > 0xC000 {
+            if seq16 < SRTP_ROC_WRAP_LOW && rx_highest > SRTP_ROC_WRAP_HIGH {
                 candidates[n_cand] = rx_roc.wrapping_add(1);
                 n_cand += 1;
                 candidates[n_cand] = rx_roc;
                 n_cand += 1;
-            } else if seq16 > 0xC000 && rx_highest < 0x4000 && rx_roc > 0 {
+            } else if seq16 > SRTP_ROC_WRAP_HIGH && rx_highest < SRTP_ROC_WRAP_LOW && rx_roc > 0 {
                 candidates[n_cand] = rx_roc - 1;
                 n_cand += 1;
                 candidates[n_cand] = rx_roc;
@@ -737,12 +829,16 @@ impl SrtpCloakCipher {
             }
         };
 
-        let rx_domain_dir = if is_audio { self.rx_dir | 0x40 } else { self.rx_dir };
+        let rx_domain_dir = if is_audio {
+            self.rx_dir | NONCE_DOMAIN_AUDIO_BIT
+        } else {
+            self.rx_dir
+        };
 
         let decrypted = match self.suite {
             CipherSuite::Aes128Gcm => {
                 let got_tag = GcmTag::from_slice(&packet[packet.len() - SRTP_TAG_LEN..]);
-                let mut aad = [0u8; 68];
+                let mut aad = [0u8; RTP_MAX_HDR_LEN + 4];
                 aad[..hdr_len].copy_from_slice(rtp_hdr);
                 let mut ok = false;
                 for &cand in &candidates[..n_cand] {
@@ -772,7 +868,7 @@ impl SrtpCloakCipher {
             }
             CipherSuite::ChaCha20Poly1305 => {
                 let got_tag = ChaTag::from_slice(&packet[packet.len() - SRTP_TAG_LEN..]);
-                let mut aad = [0u8; 68];
+                let mut aad = [0u8; RTP_MAX_HDR_LEN + 4];
                 aad[..hdr_len].copy_from_slice(rtp_hdr);
                 let mut ok = false;
                 for &cand in &candidates[..n_cand] {
@@ -834,14 +930,14 @@ impl SrtpCloakCipher {
             raw_len,
             SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
         ) {
-            if ct_len < 4 {
+            if ct_len < SRTP_CTRL_PREFIX_LEN {
                 return None;
             }
             let ctrl_len = u16::from_be_bytes([out[2], out[3]]) as usize;
-            if ctrl_len > 1460 || 4 + ctrl_len > ct_len {
+            if ctrl_len > SRTP_MAX_CTRL_PAYLOAD_LEN || SRTP_CTRL_PREFIX_LEN + ctrl_len > ct_len {
                 return None;
             }
-            out.copy_within(4..4 + ctrl_len, 0);
+            out.copy_within(SRTP_CTRL_PREFIX_LEN..SRTP_CTRL_PREFIX_LEN + ctrl_len, 0);
             return Some(match raw_len {
                 SRTP_PROBE_MAGIC_LEN => SrtpFrame::Probe(ctrl_len),
                 SRTP_PATH_CHALLENGE_MAGIC => SrtpFrame::PathChallenge(ctrl_len),
@@ -850,10 +946,10 @@ impl SrtpCloakCipher {
             });
         }
         let inner_len = raw_len as usize;
-        if inner_len > MAX_INNER_UDP_LEN || 2 + inner_len > ct_len {
+        if inner_len > MAX_INNER_UDP_LEN || SRTP_DATA_PREFIX_LEN + inner_len > ct_len {
             return None;
         }
-        out.copy_within(2..2 + inner_len, 0);
+        out.copy_within(SRTP_DATA_PREFIX_LEN..SRTP_DATA_PREFIX_LEN + inner_len, 0);
         Some(SrtpFrame::Data(inner_len))
     }
 

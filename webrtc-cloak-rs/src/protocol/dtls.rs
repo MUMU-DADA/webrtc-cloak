@@ -4,6 +4,9 @@ use super::{
     fill_random, rand_duration_range_ms, rand_u32, unix_secs, CipherPref, CipherSuite,
     CpuAccelInfo, DtlsMinVersion,
 };
+use crate::constants::{
+    DTLS_CT_HANDSHAKE, DTLS_PLAINTEXT_HDR_LEN, DTLS_VER_MAJOR, DTLS_VER_MINOR_12, IPV4_UDP_HDR_LEN,
+};
 use dimpl::crypto::{
     rust_crypto, CryptoProvider, Dtls12CipherSuite, Dtls13CipherSuite, SupportedDtls12CipherSuite,
     SupportedDtls13CipherSuite,
@@ -14,6 +17,76 @@ use p256::ecdsa::{Signature as P256Signature, SigningKey};
 use p256::pkcs8::EncodePrivateKey;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
+
+/// 加密 DTLS 记录最小密文长度（2B 最小内容 + 16B AEAD 标签）。
+const DTLS_MIN_ENCRYPTED_RECORD_LEN: usize = 18;
+/// 单个 UDP 数据报内允许拼接的最大 DTLS 记录条数，防止畸形包放大解析开销。
+const DTLS_MAX_RECORDS_PER_DATAGRAM: usize = 24;
+/// DTLS 记录类型：ChangeCipherSpec (20)。
+const DTLS_CT_CHANGE_CIPHER_SPEC: u8 = 20;
+/// DTLS 记录类型：Alert (21)。
+const DTLS_CT_ALERT: u8 = 21;
+/// DTLS 记录类型：ApplicationData (23)。
+const DTLS_CT_APP_DATA: u8 = 23;
+/// RFC 9147 DTLS 1.3 记录类型：ACK (26)。
+const DTLS_CT_ACK: u8 = 26;
+/// DTLS 握手消息类型：ServerHello (0x02)。
+const DTLS_HS_SERVER_HELLO: u8 = 0x02;
+/// DTLS 1.0 兼容记录次版本号低字节（0xFF）。
+const DTLS_VER_MINOR_10: u8 = 0xFF;
+/// RFC 9147 DTLS 1.3 统一密文头高 3 位掩码（`001C_SL_EE`）。
+const DTLS13_UNIFIED_HDR_MASK: u8 = 0xE0;
+/// RFC 9147 DTLS 1.3 统一密文头固定前缀位（`0x20`）。
+const DTLS13_UNIFIED_HDR_TAG: u8 = 0x20;
+/// RFC 9147 DTLS 1.3 统一密文头 Connection ID 标志位（本实现不支持 C=1）。
+const DTLS13_FLAG_CID: u8 = 0x10;
+/// RFC 9147 DTLS 1.3 统一密文头 16 位序列号标志位（S=1）。
+const DTLS13_FLAG_SEQ16: u8 = 0x08;
+/// RFC 9147 DTLS 1.3 统一密文头显式长度字段标志位（L=1）。
+const DTLS13_FLAG_LEN: u8 = 0x04;
+/// RFC 8446 §4.1.3 HelloRetryRequest 固定魔数 ServerRandom（不得误判为正式 ServerHello）。
+const TLS13_HRR_RANDOM: [u8; 32] = [
+    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
+    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
+];
+/// TLS 1.3 密码套件 ID：`TLS_AES_128_GCM_SHA256`。
+const TLS_AES_128_GCM_SHA256: u16 = 0x1301;
+/// TLS 1.3 密码套件 ID：`TLS_AES_256_GCM_SHA384`。
+const TLS_AES_256_GCM_SHA384: u16 = 0x1302;
+/// TLS 1.3 密码套件 ID：`TLS_CHACHA20_POLY1305_SHA256`。
+const TLS_CHACHA20_POLY1305_SHA256: u16 = 0x1303;
+/// TLS 1.2 密码套件 ID：`TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256`。
+const TLS_ECDHE_ECDSA_AES128_GCM_SHA256: u16 = 0xC02B;
+/// TLS 1.2 密码套件 ID：`TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384`。
+const TLS_ECDHE_ECDSA_AES256_GCM_SHA384: u16 = 0xC02C;
+/// TLS 1.2 密码套件 ID：`TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256`。
+const TLS_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256: u16 = 0xCCA9;
+/// 服务端及默认单实例 DTLS 分片目标 MTU（字节）。
+const DTLS_DEFAULT_MTU: usize = 1150;
+/// DTLS 配置允许的最大分片 MTU 上限（字节）。
+const DTLS_MAX_MTU: usize = 1360;
+/// DTLS 配置允许的最小分片 MTU 下限（字节）。
+const DTLS_MIN_MTU: usize = 256;
+/// 客户端随机选用的 DTLS MTU 候选池（字节），消除固定 1150B ClientHello 长度尖峰指纹。
+const DTLS_CLIENT_MTUS: [usize; 8] = [760, 840, 920, 1000, 1080, 1150, 1240, 1340];
+/// DTLS 握手首包重传超时 RTO（毫秒）。
+const DTLS_FLIGHT_START_RTO_MS: u64 = 350;
+/// DTLS 单个 flight 最大重传次数。
+const DTLS_FLIGHT_RETRIES: usize = 5;
+/// DTLS 整体握手超时时间（秒）。
+const DTLS_HANDSHAKE_TIMEOUT_SECS: u64 = 12;
+/// 工作线程本地临时证书缓存最小复用时长（20 小时，毫秒）。
+const DTLS_CERT_CACHE_TTL_MIN_MS: u64 = 20 * 3600 * 1000;
+/// 工作线程本地临时证书缓存最大复用时长（24 小时，毫秒）。
+const DTLS_CERT_CACHE_TTL_MAX_MS: u64 = 24 * 3600 * 1000;
+/// 自签临时证书 `notBefore` 最小回拨偏移（1 小时，秒）。
+const DTLS_CERT_BACKDATE_MIN_SECS: u64 = 3600;
+/// 自签临时证书 `notBefore` 随机回拨跨度（23 小时，即回拨 1..24 小时，秒）。
+const DTLS_CERT_BACKDATE_SPAN_SECS: u64 = 23 * 3600;
+/// 自签临时证书最短有效期（29 天，秒）。
+const DTLS_CERT_VALIDITY_MIN_SECS: u64 = 29 * 86400;
+/// 自签临时证书有效期随机跨度（2 天，即 29..31 天，秒）。
+const DTLS_CERT_VALIDITY_SPAN_SECS: u64 = 2 * 86400;
 
 pub fn new_dtls_instance(
     min_ver: DtlsMinVersion,
@@ -42,13 +115,13 @@ pub fn validate_dtls_datagram(pkt: &[u8], ready_only_alert: bool) -> bool {
     let mut rec_count = 0usize;
     while pos < pkt.len() {
         let b0 = pkt[pos];
-        if (b0 & 0xE0) == 0x20 {
+        if (b0 & DTLS13_UNIFIED_HDR_MASK) == DTLS13_UNIFIED_HDR_TAG {
             // RFC 9147 §4 DTLS 1.3 Unified Ciphertext Header: 001C_SL_EE (32..=63)
-            if (b0 & 0x10) != 0 {
+            if (b0 & DTLS13_FLAG_CID) != 0 {
                 return false; // Connection ID (C=1) not supported
             }
-            let seq_len = if (b0 & 0x08) != 0 { 2usize } else { 1usize };
-            let has_len = (b0 & 0x04) != 0;
+            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 { 2usize } else { 1usize };
+            let has_len = (b0 & DTLS13_FLAG_LEN) != 0;
             let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
             if pos + hdr_len > pkt.len() {
                 return false;
@@ -58,12 +131,12 @@ pub fn validate_dtls_datagram(pkt: &[u8], ready_only_alert: bool) -> bool {
             } else {
                 pkt.len() - (pos + hdr_len)
             };
-            if rec_len < 18 || pos + hdr_len + rec_len > pkt.len() {
+            if rec_len < DTLS_MIN_ENCRYPTED_RECORD_LEN || pos + hdr_len + rec_len > pkt.len() {
                 return false;
             }
             pos += hdr_len + rec_len;
         } else {
-            if pos + 13 > pkt.len() {
+            if pos + DTLS_PLAINTEXT_HDR_LEN > pkt.len() {
                 return false;
             }
             let ct = b0;
@@ -71,33 +144,38 @@ pub fn validate_dtls_datagram(pkt: &[u8], ready_only_alert: bool) -> bool {
             let ver_min = pkt[pos + 2];
             let epoch = u16::from_be_bytes([pkt[pos + 3], pkt[pos + 4]]);
             let rec_len = u16::from_be_bytes([pkt[pos + 11], pkt[pos + 12]]) as usize;
-            if !matches!(ct, 20..=23 | 26) {
+            if !matches!(
+                ct,
+                DTLS_CT_CHANGE_CIPHER_SPEC..=DTLS_CT_APP_DATA | DTLS_CT_ACK
+            ) {
                 return false;
             }
-            if ver_maj != 0xFE || (ver_min != 0xFD && ver_min != 0xFF) {
+            if ver_maj != DTLS_VER_MAJOR
+                || (ver_min != DTLS_VER_MINOR_12 && ver_min != DTLS_VER_MINOR_10)
+            {
                 return false;
             }
-            if rec_len == 0 || pos + 13 + rec_len > pkt.len() {
+            if rec_len == 0 || pos + DTLS_PLAINTEXT_HDR_LEN + rec_len > pkt.len() {
                 return false;
             }
             // Reject unauthenticated plaintext Epoch=0 Alerts during handshake,
             // and reject plaintext-framed Epoch>=1 ACK (RFC 9147 encrypted ACKs use 0x20..=0x3F).
-            if (ct == 21 && epoch == 0) || (ct == 26 && epoch >= 1) {
+            if (ct == DTLS_CT_ALERT && epoch == 0) || (ct == DTLS_CT_ACK && epoch >= 1) {
                 return false;
             }
             // AEAD encrypted DTLS 1.2 records (epoch >= 1) require >= 2B payload + 16B tag
-            if epoch >= 1 && rec_len < 18 {
+            if epoch >= 1 && rec_len < DTLS_MIN_ENCRYPTED_RECORD_LEN {
                 return false;
             }
             // In established Ready state, plaintext-framed records may ONLY be DTLS 1.2 encrypted Alerts
             // (DTLS 1.3 encrypted close_notify / ACK arrive inside 0x20..=0x3F Unified Ciphertext).
-            if ready_only_alert && !(ct == 21 && epoch >= 1) {
+            if ready_only_alert && !(ct == DTLS_CT_ALERT && epoch >= 1) {
                 return false;
             }
-            pos += 13 + rec_len;
+            pos += DTLS_PLAINTEXT_HDR_LEN + rec_len;
         }
         rec_count += 1;
-        if rec_count > 24 {
+        if rec_count > DTLS_MAX_RECORDS_PER_DATAGRAM {
             return false;
         }
     }
@@ -221,8 +299,10 @@ pub fn generate_ephemeral_webrtc_cert() -> DtlsCertificate {
     }
 
     let now = unix_secs() as u64;
-    let back_secs = 3600 + ((rand_u32() as u64) % (23 * 3600)); // 1..24h before now
-    let span_secs = (29 * 86400) + ((rand_u32() as u64) % (2 * 86400)); // 29..31 days
+    let back_secs =
+        DTLS_CERT_BACKDATE_MIN_SECS + ((rand_u32() as u64) % DTLS_CERT_BACKDATE_SPAN_SECS);
+    let span_secs =
+        DTLS_CERT_VALIDITY_MIN_SECS + ((rand_u32() as u64) % DTLS_CERT_VALIDITY_SPAN_SECS);
     let not_before = format_utctime(now.saturating_sub(back_secs));
     let not_after = format_utctime(now + span_secs);
     let mut val_inner = der_tlv(0x17, &not_before);
@@ -267,7 +347,8 @@ pub struct CertCache {
 
 impl CertCache {
     pub fn new() -> Self {
-        let ttl = rand_duration_range_ms(20 * 3600 * 1000, 24 * 3600 * 1000);
+        let ttl =
+            rand_duration_range_ms(DTLS_CERT_CACHE_TTL_MIN_MS, DTLS_CERT_CACHE_TTL_MAX_MS);
         Self {
             cert: generate_ephemeral_webrtc_cert(),
             expires_at: Instant::now() + ttl,
@@ -276,7 +357,8 @@ impl CertCache {
 
     pub fn get(&mut self, now: Instant) -> DtlsCertificate {
         if now >= self.expires_at {
-            let ttl = rand_duration_range_ms(20 * 3600 * 1000, 24 * 3600 * 1000);
+            let ttl =
+                rand_duration_range_ms(DTLS_CERT_CACHE_TTL_MIN_MS, DTLS_CERT_CACHE_TTL_MAX_MS);
             self.cert = generate_ephemeral_webrtc_cert();
             self.expires_at = now + ttl;
         }
@@ -371,9 +453,9 @@ fn build_single_dimpl_config(
         .mtu(dtls_mtu)
         .require_client_certificate(true)
         .use_server_cookie(true)
-        .flight_start_rto(Duration::from_millis(350))
-        .flight_retries(5)
-        .handshake_timeout(Duration::from_secs(12));
+        .flight_start_rto(Duration::from_millis(DTLS_FLIGHT_START_RTO_MS))
+        .flight_retries(DTLS_FLIGHT_RETRIES)
+        .handshake_timeout(Duration::from_secs(DTLS_HANDSHAKE_TIMEOUT_SECS));
 
     // Client ALWAYS advertises all real DTLS 1.3 + 1.2 AEAD suites (zero 1-suite JA4D leak!).
     // Server only restricts allow-list when forcing ChaCha20 or AES-GCM explicitly.
@@ -406,9 +488,12 @@ pub fn build_dimpl_config_pool(
     wan_mtu: usize,
 ) -> DtlsConfigPool {
     let max_dtls_mtu = if wan_mtu > 0 {
-        wan_mtu.saturating_sub(28).min(1360).max(256)
+        wan_mtu
+            .saturating_sub(IPV4_UDP_HDR_LEN)
+            .min(DTLS_MAX_MTU)
+            .max(DTLS_MIN_MTU)
     } else {
-        1360
+        DTLS_MAX_MTU
     };
     if !is_client {
         return DtlsConfigPool {
@@ -416,12 +501,11 @@ pub fn build_dimpl_config_pool(
                 pref,
                 cpu,
                 false,
-                1150.min(max_dtls_mtu),
+                DTLS_DEFAULT_MTU.min(max_dtls_mtu),
             )],
         };
     }
-    const CLIENT_MTUS: [usize; 8] = [760, 840, 920, 1000, 1080, 1150, 1240, 1340];
-    let mut mtus: Vec<usize> = CLIENT_MTUS
+    let mut mtus: Vec<usize> = DTLS_CLIENT_MTUS
         .iter()
         .map(|&m| m.min(max_dtls_mtu))
         .collect();
@@ -437,14 +521,8 @@ pub fn build_dimpl_config_pool(
 /// Build a single `dimpl` DTLS 1.3 / 1.2 Config (default WAN MTU).
 #[allow(dead_code)]
 pub fn build_dimpl_config(pref: CipherPref, cpu: &CpuAccelInfo, is_client: bool) -> Arc<DtlsConfig> {
-    build_single_dimpl_config(pref, cpu, is_client, 1150)
+    build_single_dimpl_config(pref, cpu, is_client, DTLS_DEFAULT_MTU)
 }
-
-/// RFC 8446 §4.1.3 HelloRetryRequest magic ServerRandom (MUST NOT be mistaken for ServerHello).
-const TLS13_HRR_RANDOM: [u8; 32] = [
-    0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8, 0x91,
-    0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8, 0x33, 0x9C,
-];
 
 /// Strictly extract negotiated 16-bit TLS cipher suite ID from an unfragmented Epoch=0 ServerHello
 /// (supports both DTLS 1.2 and RFC 9147 DTLS 1.3; rejects RFC 8446 HelloRetryRequest and
@@ -453,13 +531,13 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
     let mut pos = 0usize;
     while pos < datagram.len() {
         let b0 = datagram[pos];
-        if (b0 & 0xE0) == 0x20 {
+        if (b0 & DTLS13_UNIFIED_HDR_MASK) == DTLS13_UNIFIED_HDR_TAG {
             // Skip RFC 9147 DTLS 1.3 unified ciphertext records
-            if (b0 & 0x10) != 0 {
+            if (b0 & DTLS13_FLAG_CID) != 0 {
                 return None;
             }
-            let seq_len = if (b0 & 0x08) != 0 { 2usize } else { 1usize };
-            let has_len = (b0 & 0x04) != 0;
+            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 { 2usize } else { 1usize };
+            let has_len = (b0 & DTLS13_FLAG_LEN) != 0;
             let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
             if pos + hdr_len > datagram.len() {
                 return None;
@@ -474,21 +552,23 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
             }
             continue;
         }
-        if pos + 13 > datagram.len() {
+        if pos + DTLS_PLAINTEXT_HDR_LEN > datagram.len() {
             return None;
         }
         let ct = b0;
-        if datagram[pos + 1] != 0xFE || (datagram[pos + 2] != 0xFD && datagram[pos + 2] != 0xFF) {
+        if datagram[pos + 1] != DTLS_VER_MAJOR
+            || (datagram[pos + 2] != DTLS_VER_MINOR_12 && datagram[pos + 2] != DTLS_VER_MINOR_10)
+        {
             return None;
         }
         let epoch = u16::from_be_bytes([datagram[pos + 3], datagram[pos + 4]]);
         let rec_len = u16::from_be_bytes([datagram[pos + 11], datagram[pos + 12]]) as usize;
-        let rec_end = pos + 13 + rec_len;
+        let rec_end = pos + DTLS_PLAINTEXT_HDR_LEN + rec_len;
         if rec_end > datagram.len() {
             return None;
         }
-        if ct == 0x16 && epoch == 0 && rec_len >= 50 {
-            let hs = &datagram[pos + 13..rec_end];
+        if ct == DTLS_CT_HANDSHAKE && epoch == 0 && rec_len >= 50 {
+            let hs = &datagram[pos + DTLS_PLAINTEXT_HDR_LEN..rec_end];
             // HandshakeType=ServerHello(0x02), unfragmented (msg_len == frag_len, frag_off == 0),
             // legacy_version=0xFEFD, NOT HelloRetryRequest, valid compression=0 & exact extensions framing.
             let msg_len = u32::from_be_bytes([0, hs[1], hs[2], hs[3]]) as usize;
@@ -496,13 +576,13 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
             let frag_off = u32::from_be_bytes([0, hs[6], hs[7], hs[8]]) as usize;
             let frag_len = u32::from_be_bytes([0, hs[9], hs[10], hs[11]]) as usize;
             let sh_end = 12usize.saturating_add(frag_len);
-            if hs[0] == 0x02
+            if hs[0] == DTLS_HS_SERVER_HELLO
                 && msg_seq <= 1
                 && frag_off == 0
                 && msg_len == frag_len
                 && sh_end <= hs.len()
-                && hs[12] == 0xFE
-                && hs[13] == 0xFD
+                && hs[12] == DTLS_VER_MAJOR
+                && hs[13] == DTLS_VER_MINOR_12
                 && &hs[14..46] != &TLS13_HRR_RANDOM
             {
                 let sid_len = hs[46] as usize;
@@ -543,8 +623,15 @@ pub fn resolve_srtp_suite(
                 CipherSuite::ChaCha20Poly1305
             } else {
                 match dtls_suite_id {
-                    Some(0xCCA9 | 0x1303) => CipherSuite::ChaCha20Poly1305,
-                    Some(0xC02B | 0xC02C | 0x1301 | 0x1302) => CipherSuite::Aes128Gcm,
+                    Some(
+                        TLS_ECDHE_ECDSA_CHACHA20_POLY1305_SHA256 | TLS_CHACHA20_POLY1305_SHA256,
+                    ) => CipherSuite::ChaCha20Poly1305,
+                    Some(
+                        TLS_ECDHE_ECDSA_AES128_GCM_SHA256
+                        | TLS_ECDHE_ECDSA_AES256_GCM_SHA384
+                        | TLS_AES_128_GCM_SHA256
+                        | TLS_AES_256_GCM_SHA384,
+                    ) => CipherSuite::Aes128Gcm,
                     _ => cpu.recommended,
                 }
             }

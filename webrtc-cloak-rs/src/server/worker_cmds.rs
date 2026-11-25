@@ -10,6 +10,7 @@ use super::{
     alloc_token, deregister_backend, log, record_server_media_bytes, BackendPipe, ServerState,
     MAX_FORWARD_HOPS, OLD_PEER_DRAIN_TTL,
 };
+use crate::constants::{PATH_CHALLENGE_OP_RESP, PATH_CHALLENGE_PAYLOAD_LEN};
 use crate::protocol::{compute_handover_proof, SrtpFrame};
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::Interest;
@@ -90,7 +91,8 @@ impl ServerWorker {
                                 .and_then(|c| c.unwrap_into_ex(&pkt, &mut self.wbuf))
                             {
                                 Some(SrtpFrame::PathChallenge(pn))
-                                    if pn == 17 && self.wbuf[0] == 0x02 =>
+                                    if pn == PATH_CHALLENGE_PAYLOAD_LEN
+                                        && self.wbuf[0] == PATH_CHALLENGE_OP_RESP =>
                                 {
                                     sess.rx_pkts += 1;
                                     let got_nonce: [u8; 8] = self.wbuf[1..9].try_into().unwrap();

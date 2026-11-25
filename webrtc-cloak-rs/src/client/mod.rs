@@ -10,6 +10,9 @@ mod tests;
 
 use self::dtls::graceful_teardown_client;
 use self::worker::run_client_worker;
+use crate::constants::{
+    CLOSING_DRAIN_MS, POST_BYE_CLOSING_DRAIN_MS, TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS,
+};
 use crate::protocol::{
     build_dimpl_config_pool, detect_cpu_accel, jitter_duration_ms, lognormal_duration_ms,
     rand_byte_budget, rand_duration_range_ms, CipherPref, CipherSuite, DtlsMinVersion,
@@ -31,28 +34,36 @@ thread_local! {
     pub(super) static CLIENT_QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-pub(super) const LISTEN_TOKEN: Token = Token(0);
-pub(super) const WAKE_TOKEN: Token = Token(usize::MAX);
-pub(super) const CLOSING_DRAIN_MS: u64 = 250;
-/// Receive-only drain after sending client-initiated SRTCP BYE (strictly > server 250ms Closing
-/// flush + trans-Pacific RTT so trailing downlink SRTP never triggers ICMP Port Unreachable).
-pub(super) const POST_BYE_CLOSING_DRAIN_MS: u64 = 1000;
-/// Silent receive-only drain window after RFC 7675 consent loss (exceeds server's 45s consent
-/// expiry so trailing downlink SRTCP never triggers ICMP Port Unreachable and CGNAT never reuses
-/// the blackholed external port for the newly rotated 5-tuple).
-pub(super) const BLACKHOLE_DRAIN_SECS: u64 = 50;
+/// 客户端单会话上游 UDP 套接字收发内核缓冲大小（2 MiB）。
+pub(super) const SOCK_BUF_2MIB: usize = 2 * 1024 * 1024;
+/// 单个工作线程允许保留的静默引流套接字数量上限，防止持续黑洞泄露文件描述符。
 pub(super) const MAX_DRAINING_SESSIONS: usize = 16;
+/// 判定会话近期活跃并允许触发自动轮换/迁移/快连的时间窗口（秒）。
 pub(super) const ACTIVE_ROTATE_WINDOW_SECS: u64 = 30;
-/// Rolling 15s media byte threshold below which a session enters quiet control-plane backoff (~270 B/s).
-pub(super) const TRICKLE_RATE_15S_BYTES: u64 = 4 * 1024;
-/// Rolling 5-minute media byte threshold below which scheduled MBB rotation suspends (~218 B/s).
-pub(super) const TRICKLE_MBB_5MIN_BYTES: u64 = 64 * 1024;
-/// RFC 5389 §7.2.1 STUN consent retries (1 initial + 2 same-txid retransmits = 3 attempts, ~4.7s).
+/// 近期发生过轮换/迁移的阻尼判定窗口（秒），用于放宽保活重试防止高丢包抖动。
+pub(super) const RECENT_ROTATION_DAMP_SECS: u64 = 60;
+/// MBB 定时轮换挂起判定滑动窗口时长（5 分钟）。
+pub(super) const TRICKLE_WINDOW_5MIN_SECS: u64 = 300;
+/// RFC 7675 STUN 同意检查常规最大重传次数（1 次首包 + 2 次同 txid 重传 = 3 次，约 4.7s）。
 pub(super) const KA_MAX_RETRIES: u8 = 2;
-/// Elevated retry count after a recent rotation (<60s) to damp flapping on 20%+ random-loss links.
+/// 近期刚轮换后的阻尼 STUN 同意检查最大重传次数（共 5 次，防止高随机丢包反复切端口）。
 pub(super) const KA_MAX_RETRIES_DAMPED: u8 = 4;
-pub(super) const MAX_PENDING_BYTES: usize = 256 * 1024;
-pub(super) const MAX_DTLS_RESETS: u8 = 3;
+/// MBB `0xFFFC` 交接请求最小重传间隔下限（毫秒）。
+pub(super) const CLIENT_HANDOVER_MIN_RETRY_MS: u64 = 380;
+/// `0xFFFD` 路径挑战响应补发间隔（毫秒）。
+pub(super) const CLIENT_MIG_ECHO_INTERVAL_MS: u64 = 250;
+/// 客户端进入 Ready 后首条 SRTCP 心跳的最小延迟（毫秒）。
+pub(super) const CLIENT_SRTCP_INIT_MIN_MS: u64 = 250;
+/// 客户端进入 Ready 后首条 SRTCP 心跳的最大延迟（毫秒）。
+pub(super) const CLIENT_SRTCP_INIT_MAX_MS: u64 = 600;
+/// 客户端活跃媒体传输期 SRTCP 最小发送间隔（毫秒）。
+pub(super) const CLIENT_SRTCP_ACTIVE_MIN_MS: u64 = 900;
+/// 客户端活跃媒体传输期 SRTCP 最大发送间隔（毫秒）。
+pub(super) const CLIENT_SRTCP_ACTIVE_MAX_MS: u64 = 1900;
+/// 细流挂起场景下强制兜底 MBB 硬轮换的最短时长下限（5 小时，秒）。
+const CLIENT_MBB_HARD_ROTATE_MIN_SECS: u64 = 5 * 3600;
+/// 兜底硬轮换随机区间的最小跨度保底值（30 分钟，秒）。
+const CLIENT_MBB_HARD_ROTATE_MIN_GAP_SECS: u64 = 1800;
 
 #[derive(Clone)]
 pub struct ClientConfig {
@@ -191,8 +202,12 @@ pub(super) fn schedule_mbb_timers(sess: &mut ClientSession, cfg: &ClientConfig, 
     if cfg.rotate_interval_secs > 0 {
         sess.rotate_at = Some(now + lognormal_duration_ms(cfg.rotate_interval_secs * 1000));
         sess.hard_rotate_at = if cfg.rotate_interval_secs >= 60 {
-            let min_h = cfg.rotate_interval_secs.saturating_mul(4).max(5 * 3600);
-            let max_h = (min_h.saturating_mul(8) / 5).max(min_h + 1800);
+            let min_h = cfg
+                .rotate_interval_secs
+                .saturating_mul(4)
+                .max(CLIENT_MBB_HARD_ROTATE_MIN_SECS);
+            let max_h = (min_h.saturating_mul(8) / 5)
+                .max(min_h + CLIENT_MBB_HARD_ROTATE_MIN_GAP_SECS);
             Some(now + rand_duration_range_ms(min_h * 1000, max_h * 1000))
         } else {
             Some(now + Duration::from_secs(cfg.rotate_interval_secs.saturating_mul(6)))
@@ -210,9 +225,9 @@ pub(super) fn schedule_mbb_timers(sess: &mut ClientSession, cfg: &ClientConfig, 
 
 #[inline]
 pub(super) fn is_client_in_trickle(sess: &mut ClientSession, now: Instant) -> bool {
-    let age_ge_15s = sess
-        .ready_at
-        .map_or(false, |r| now.duration_since(r) >= Duration::from_secs(15));
+    let age_ge_15s = sess.ready_at.map_or(false, |r| {
+        now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS)
+    });
     age_ge_15s && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES
 }
 
@@ -234,8 +249,9 @@ pub(super) fn record_client_media_bytes(
                 sess.next_keepalive_at = now + jitter_duration_ms(ka_base_ms);
             }
         }
-        if sess.next_srtcp_at > now + Duration::from_millis(1900) {
-            sess.next_srtcp_at = now + rand_duration_range_ms(900, 1900);
+        if sess.next_srtcp_at > now + Duration::from_millis(CLIENT_SRTCP_ACTIVE_MAX_MS) {
+            sess.next_srtcp_at =
+                now + rand_duration_range_ms(CLIENT_SRTCP_ACTIVE_MIN_MS, CLIENT_SRTCP_ACTIVE_MAX_MS);
         }
     }
 }

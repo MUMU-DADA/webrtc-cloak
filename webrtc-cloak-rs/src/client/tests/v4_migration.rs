@@ -2,10 +2,11 @@
 
 use super::reserve_free_port;
 use crate::client::{run_client, ClientConfig};
+use crate::constants::SRTP_HANDOVER_MAGIC;
 use crate::protocol::{
     build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, new_dtls_instance, parse_stun, CipherPref, CipherSuite,
-    DtlsMinVersion, PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame, SRTP_HANDOVER_MAGIC,
+    DtlsMinVersion, PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame,
 };
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;

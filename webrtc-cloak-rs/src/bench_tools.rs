@@ -1,5 +1,6 @@
 //! CPU 加速探测、密码学基准测试与 UDP 压测辅助工具。
 
+use crate::constants::{CTRL_FRAME_BUF_LEN, DTLS_IO_BUF_LEN, SOCK_BUF_8MIB, UDP_RECV_BUF_LEN};
 use crate::protocol::{
     combine_session_key, derive_stun_material, detect_cpu_accel, fill_random, CipherSuite,
     SrtpCloakCipher,
@@ -91,11 +92,11 @@ pub(crate) fn run_sink(listen: &str, workers: usize) {
             }
             #[cfg(not(unix))]
             let _ = reuse;
-            let _ = s.set_recv_buffer_size(8 * 1024 * 1024);
-            let _ = s.set_send_buffer_size(8 * 1024 * 1024);
+            let _ = s.set_recv_buffer_size(SOCK_BUF_8MIB);
+            let _ = s.set_send_buffer_size(SOCK_BUF_8MIB);
             s.bind(&addr.into()).expect("bind sink");
             let sock: UdpSocket = s.into();
-            let mut buf = vec![0u8; 65536];
+            let mut buf = vec![0u8; UDP_RECV_BUF_LEN];
             loop {
                 let (n, peer) = match sock.recv_from(&mut buf) {
                     Ok(v) => v,
@@ -149,12 +150,12 @@ pub(crate) fn run_loadgen(target: &str, packets: u64, size: usize, rate_mbps: f6
     if streams == 1 {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind loadgen");
         let s2 = socket2::SockRef::from(&sock);
-        let _ = s2.set_recv_buffer_size(8 * 1024 * 1024);
-        let _ = s2.set_send_buffer_size(8 * 1024 * 1024);
+        let _ = s2.set_recv_buffer_size(SOCK_BUF_8MIB);
+        let _ = s2.set_send_buffer_size(SOCK_BUF_8MIB);
         sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         sock.connect(target).expect("connect target");
 
-        let mut rbuf = vec![0u8; 65536];
+        let mut rbuf = vec![0u8; UDP_RECV_BUF_LEN];
         let hello = b"HELLO_LOADGEN_WARMUP";
         let t0 = Instant::now();
         sock.send(hello).unwrap();
@@ -251,7 +252,7 @@ pub(crate) fn run_loadgen(target: &str, packets: u64, size: usize, rate_mbps: f6
     let ctrl = UdpSocket::bind("127.0.0.1:0").expect("ctrl bind");
     ctrl.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     ctrl.connect(target).expect("ctrl connect");
-    let mut rbuf = vec![0u8; 4096];
+    let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
     ctrl.send(b"RESET").unwrap();
     let rn = ctrl.recv(&mut rbuf).expect("ctrl reset");
     assert_eq!(&rbuf[..rn], b"RESET_OK");
@@ -265,12 +266,12 @@ pub(crate) fn run_loadgen(target: &str, packets: u64, size: usize, rate_mbps: f6
         handles.push(std::thread::spawn(move || {
             let sock = UdpSocket::bind("127.0.0.1:0").expect("stream bind");
             let s2 = socket2::SockRef::from(&sock);
-            let _ = s2.set_send_buffer_size(8 * 1024 * 1024);
+            let _ = s2.set_send_buffer_size(SOCK_BUF_8MIB);
             sock.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
             sock.connect(&tgt).expect("stream connect");
 
             // Complete independent STUN + DTLS handshake on this 5-tuple first (with retry)
-            let mut rb = [0u8; 256];
+            let mut rb = [0u8; CTRL_FRAME_BUF_LEN];
             let hi = format!("HI_STREAM_{}", sid);
             sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
             let mut ok = false;
