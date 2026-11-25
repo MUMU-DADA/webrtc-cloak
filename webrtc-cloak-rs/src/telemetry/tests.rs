@@ -46,7 +46,10 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
         hub.record_stun_ok(
             rtt,
             0,
-            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)), 4444)),
+            Some(SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(198, 51, 100, 10)),
+                4444,
+            )),
         );
     }
     hub.record_mbb_rotation("45678->45999".to_string());
@@ -71,7 +74,8 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
     assert!(r_status.contains("application/json"));
     assert!(r_status.contains("\"health\": \"good\""));
 
-    let r_metrics = http_get("GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
+    let r_metrics =
+        http_get("GET /metrics HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert!(r_metrics.starts_with("HTTP/1.1 200 OK"));
     assert!(r_metrics.contains("webrtc_cloak_health_code{role=\"client\",health=\"good\"} 3"));
     assert!(r_metrics.contains("webrtc_cloak_mbb_rotations_total{role=\"client\"} 1"));
@@ -111,10 +115,17 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
 
     // 4. Two blackholes in 10m -> critical -> /healthz returns 503!
     hub.record_blackhole(3, "bh#1".to_string());
-    assert!(hub.snapshot_json().contains("\"health\": \"critical\"") || hub.snapshot_json().contains("\"health\": \"degraded\""));
+    assert!(
+        hub.snapshot_json().contains("\"health\": \"critical\"")
+            || hub.snapshot_json().contains("\"health\": \"degraded\"")
+    );
     hub.record_blackhole(3, "bh#2".to_string());
     let r_hz = http_get("GET /healthz HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
-    assert!(r_hz.starts_with("HTTP/1.1 503 Service Unavailable"), "got: {}", r_hz);
+    assert!(
+        r_hz.starts_with("HTTP/1.1 503 Service Unavailable"),
+        "got: {}",
+        r_hz
+    );
 
     hub.shutdown();
     let _ = std::fs::remove_file(&tmp_path);

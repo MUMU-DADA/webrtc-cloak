@@ -85,8 +85,7 @@ pub(super) fn send_encrypted_path_challenge(
     epoch: u64,
     listen_sock: &MioUdpSocket,
     audit: &mut WireAudit,
-)
-{
+) {
     let mut payload = [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
     payload[0] = PATH_CHALLENGE_OP_REQ; // Server -> Client challenge
     payload[1..9].copy_from_slice(&nonce);
@@ -110,8 +109,7 @@ pub(super) fn send_encrypted_path_confirm(
     nonce: [u8; 8],
     listen_sock: &MioUdpSocket,
     audit: &mut WireAudit,
-)
-{
+) {
     let mut payload = [0u8; PATH_CONFIRM_PAYLOAD_LEN];
     payload[0] = PATH_CHALLENGE_OP_CONFIRM; // Server -> Client confirm
     payload[1..9].copy_from_slice(&nonce);
@@ -131,8 +129,7 @@ pub(super) fn send_encrypted_handover_ack(
     ok: bool,
     listen_sock: &MioUdpSocket,
     audit: &mut WireAudit,
-)
-{
+) {
     let payload = [HANDOVER_OP_ACK, if ok { 0x01 } else { 0x00 }];
     let mut pbuf = [0u8; CTRL_FRAME_BUF_LEN];
     if let Some(ref mut cipher) = sess.cipher {
@@ -238,8 +235,7 @@ pub(super) fn drain_server_dtls(
     registry: &SharedV4Registry,
     now: Instant,
     audit: &mut WireAudit,
-) -> (bool, bool)
-{
+) -> (bool, bool) {
     let mut connected_now = false;
     let mut peer_closed = false;
     let mut became_ready = false;
@@ -286,24 +282,15 @@ pub(super) fn drain_server_dtls(
             );
             return (true, false);
         };
-        let is_dtls13 = sess
-            .dtls
-            .as_ref()
-            .and_then(|d| d.protocol_version())
-            == Some(ProtocolVersion::DTLS1_3);
+        let is_dtls13 =
+            sess.dtls.as_ref().and_then(|d| d.protocol_version()) == Some(ProtocolVersion::DTLS1_3);
         let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
         let final_key = combine_session_key(&sess.stun_key, Some(km));
         let mi_key_mig = derive_ice_migration_key(&final_key);
         sess.session_key = Some(final_key);
         sess.mi_key_mig = Some(mi_key_mig);
         sess.negotiated_cipher = Some(chosen);
-        let mut c = SrtpCloakCipher::new(
-            &final_key,
-            sess.ssrc_s2c,
-            sess.ssrc_c2s,
-            false,
-            chosen,
-        );
+        let mut c = SrtpCloakCipher::new(&final_key, sess.ssrc_s2c, sess.ssrc_c2s, false, chosen);
         c.set_wan_mtu(cfg.wan_mtu);
         c.set_dual_ssrc(is_dtls13);
         sess.cipher = Some(c);
@@ -340,8 +327,7 @@ pub(super) fn graceful_teardown_server(
     listen_sock: &MioUdpSocket,
     dtls_buf: &mut Vec<u8>,
     audit: &mut WireAudit,
-)
-{
+) {
     if sess.state == ServerState::Ready {
         let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
         let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
@@ -388,8 +374,7 @@ pub(super) fn process_ready_srtp(
     wbuf: &mut [u8],
     now: Instant,
     audit: &mut WireAudit,
-)
-{
+) {
     let frame = {
         let Some(sess) = sessions_by_token.get_mut(&tok) else {
             return;
@@ -397,7 +382,11 @@ pub(super) fn process_ready_srtp(
         if sess.state != ServerState::Ready {
             return;
         }
-        match sess.cipher.as_mut().and_then(|c| c.unwrap_into_ex(pkt, wbuf)) {
+        match sess
+            .cipher
+            .as_mut()
+            .and_then(|c| c.unwrap_into_ex(pkt, wbuf))
+        {
             Some(f) => f,
             None => {
                 sess.auth_drops += 1;
@@ -495,13 +484,7 @@ pub(super) fn process_ready_srtp(
                         }
                         // P0-1: ONLY insert `from_peer` into `token_by_peer` AFTER 0xFFFD verification!
                         token_by_peer.insert(from_peer, tok);
-                        send_encrypted_path_confirm(
-                            sess,
-                            from_peer,
-                            got_nonce,
-                            listen_sock,
-                            audit,
-                        );
+                        send_encrypted_path_confirm(sess, from_peer, got_nonce, listen_sock, audit);
                         log(
                             worker_id,
                             &format!(
@@ -519,13 +502,7 @@ pub(super) fn process_ready_srtp(
                     }
                     // Duplicate response after migration already completed -> idempotently re-confirm
                     if from_peer == sess.peer_addr && got_epoch == sess.path_epoch {
-                        send_encrypted_path_confirm(
-                            sess,
-                            from_peer,
-                            got_nonce,
-                            listen_sock,
-                            audit,
-                        );
+                        send_encrypted_path_confirm(sess, from_peer, got_nonce, listen_sock, audit);
                     }
                 }
             }
@@ -543,8 +520,9 @@ pub(super) fn process_ready_srtp(
                 return;
             };
             let old_ufrag = old_ufrag.to_string();
-            let proof: [u8; HANDOVER_PROOF_LEN] =
-                wbuf[2 + ulen..2 + ulen + HANDOVER_PROOF_LEN].try_into().unwrap();
+            let proof: [u8; HANDOVER_PROOF_LEN] = wbuf[2 + ulen..2 + ulen + HANDOVER_PROOF_LEN]
+                .try_into()
+                .unwrap();
 
             let Some((new_ufrag, new_key)) = sessions_by_token.get_mut(&tok).and_then(|s| {
                 s.rx_pkts += 1;

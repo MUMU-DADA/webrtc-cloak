@@ -11,17 +11,23 @@ use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAddr, psk: &[u8]) -> bool {
+pub(super) fn run_remote_selftest(
+    opts: &SelftestOptions,
+    server_addr: SocketAddr,
+    psk: &[u8],
+) -> bool {
     let cpu = detect_cpu_accel();
     let p = Palette::new(opts.color);
     let suite_t0 = Instant::now();
-    let mut hi = Highlights::default();
-    hi.is_remote = true;
-    hi.target_label = Some(
-        opts.server_label
-            .clone()
-            .unwrap_or_else(|| server_addr.to_string()),
-    );
+    let mut hi = Highlights {
+        is_remote: true,
+        target_label: Some(
+            opts.server_label
+                .clone()
+                .unwrap_or_else(|| server_addr.to_string()),
+        ),
+        ..Default::default()
+    };
 
     if !opts.json {
         println!(
@@ -119,7 +125,11 @@ pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAdd
         ) {
             Ok((sess, hs_ms)) => {
                 hi.negotiated_cipher = Some(sess.suite.name().to_string());
-                let dtls_ver = if sess.is_dtls13 { "DTLS 1.3" } else { "DTLS 1.2" };
+                let dtls_ver = if sess.is_dtls13 {
+                    "DTLS 1.3"
+                } else {
+                    "DTLS 1.2"
+                };
                 let r = ScenarioResult {
                     id: 2,
                     code: "wan_dtls",
@@ -131,11 +141,18 @@ pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAdd
                         hs_ms,
                         dtls_ver,
                         sess.suite.name(),
-                        if sess.is_dtls13 { "dual-SSRC" } else { "1-SSRC" }
+                        if sess.is_dtls13 {
+                            "dual-SSRC"
+                        } else {
+                            "1-SSRC"
+                        }
                     ),
                     detail: format!(
                         "dtls={} negotiated={} dual_ssrc={} total_dtls_ms={:.2}",
-                        dtls_ver, sess.suite.name(), sess.is_dtls13, hs_ms
+                        dtls_ver,
+                        sess.suite.name(),
+                        sess.is_dtls13,
+                        hs_ms
                     ),
                     elapsed_s: t2.elapsed().as_secs_f64(),
                 };
@@ -216,7 +233,12 @@ pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAdd
                 "p50 {:.1}ms p95 {:.1}ms | jit {:.1}ms | {}/{} ({:.1}%)",
                 p50, p95, jitter_ms, rx, count, loss_pct
             ),
-            detail: format!("min={:.1}ms max={:.1}ms loss={:.2}%", rtts.first().copied().unwrap_or(0.0), rtts.last().copied().unwrap_or(0.0), loss_pct),
+            detail: format!(
+                "min={:.1}ms max={:.1}ms loss={:.2}%",
+                rtts.first().copied().unwrap_or(0.0),
+                rtts.last().copied().unwrap_or(0.0),
+                loss_pct
+            ),
             elapsed_s: t3.elapsed().as_secs_f64(),
         };
         report_step(3, r.name, &r);
@@ -259,7 +281,12 @@ pub(super) fn run_remote_selftest(opts: &SelftestOptions, server_addr: SocketAdd
                         if exact { "exact match" } else { "MISMATCH" },
                         rtt2
                     ),
-                    detail: format!("resp1={}B resp2={}B equal={}", resp1.len(), resp2.len(), exact),
+                    detail: format!(
+                        "resp1={}B resp2={}B equal={}",
+                        resp1.len(),
+                        resp2.len(),
+                        exact
+                    ),
                     elapsed_s: t4.elapsed().as_secs_f64(),
                 }
             } else {

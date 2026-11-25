@@ -271,7 +271,6 @@ pub(super) struct AggregatedView {
     pub(super) migrations_1rtt_last_10m: usize,
 }
 
-
 impl TelemetryInner {
     pub(super) fn compute_view(&mut self, now: Instant) -> AggregatedView {
         prune_times(&mut self.blackhole_times, now);
@@ -338,25 +337,23 @@ impl TelemetryInner {
         let blackholes_last_10m = self.blackhole_times.len();
         let migrations_1rtt_last_10m = self.migration_times.len();
 
-        let (health, health_code) = if active_sessions == 0
-            && migrating_sessions == 0
-            && handshaking_sessions == 0
-        {
-            ("idle", HEALTH_CODE_IDLE)
-        } else if migrating_sessions > 0
-            || blackholes_last_10m >= TELEMETRY_HEALTH_CRITICAL_BLACKHOLES
-            || stun_loss_pct >= TELEMETRY_HEALTH_CRITICAL_LOSS_PCT
-        {
-            ("critical", HEALTH_CODE_CRITICAL)
-        } else if blackholes_last_10m == 1
-            || stun_loss_pct >= TELEMETRY_HEALTH_DEGRADED_LOSS_PCT
-            || self.stun_jitter_ms >= TELEMETRY_HEALTH_DEGRADED_JITTER_MS
-            || (active_sessions == 0 && handshaking_sessions > 0)
-        {
-            ("degraded", HEALTH_CODE_DEGRADED)
-        } else {
-            ("good", HEALTH_CODE_GOOD)
-        };
+        let (health, health_code) =
+            if active_sessions == 0 && migrating_sessions == 0 && handshaking_sessions == 0 {
+                ("idle", HEALTH_CODE_IDLE)
+            } else if migrating_sessions > 0
+                || blackholes_last_10m >= TELEMETRY_HEALTH_CRITICAL_BLACKHOLES
+                || stun_loss_pct >= TELEMETRY_HEALTH_CRITICAL_LOSS_PCT
+            {
+                ("critical", HEALTH_CODE_CRITICAL)
+            } else if blackholes_last_10m == 1
+                || stun_loss_pct >= TELEMETRY_HEALTH_DEGRADED_LOSS_PCT
+                || self.stun_jitter_ms >= TELEMETRY_HEALTH_DEGRADED_JITTER_MS
+                || (active_sessions == 0 && handshaking_sessions > 0)
+            {
+                ("degraded", HEALTH_CODE_DEGRADED)
+            } else {
+                ("good", HEALTH_CODE_GOOD)
+            };
 
         AggregatedView {
             updated_at_unix: unix_now_secs(),
@@ -443,10 +440,17 @@ impl TelemetryHub {
             let body = hub.snapshot_json();
             if let Err(e) = write_atomic_file(path, &body) {
                 if !quiet {
-                    eprintln!("[telemetry] WARN: failed initial write to --status-file {}: {}", path, e);
+                    eprintln!(
+                        "[telemetry] WARN: failed initial write to --status-file {}: {}",
+                        path, e
+                    );
                 }
             } else if !quiet {
-                println!("[telemetry] status-file enabled -> {} (interval={}s)", path, hub.interval.as_secs());
+                println!(
+                    "[telemetry] status-file enabled -> {} (interval={}s)",
+                    path,
+                    hub.interval.as_secs()
+                );
             }
         }
 
@@ -476,9 +480,7 @@ impl TelemetryHub {
                         .name("wc-status-http".to_string())
                         .spawn(move || loop {
                             if h_stop.load(Ordering::Relaxed)
-                                || ext_stop
-                                    .as_ref()
-                                    .map_or(false, |s| s.load(Ordering::Relaxed))
+                                || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
                             {
                                 break;
                             }
@@ -496,7 +498,10 @@ impl TelemetryHub {
                 }
                 Err(e) => {
                     if !quiet {
-                        eprintln!("[telemetry] WARN: failed to bind --status-http {}: {}", addr, e);
+                        eprintln!(
+                            "[telemetry] WARN: failed to bind --status-http {}: {}",
+                            addr, e
+                        );
                     }
                 }
             }
@@ -578,7 +583,8 @@ impl TelemetryHub {
     pub fn update_worker(&self, worker_id: usize, snap: WorkerSnapshot) {
         if let Ok(mut g) = self.inner.lock() {
             if worker_id >= g.workers.len() {
-                g.workers.resize_with(worker_id + 1, WorkerSnapshot::default);
+                g.workers
+                    .resize_with(worker_id + 1, WorkerSnapshot::default);
             }
             g.workers[worker_id] = snap;
             let now = Instant::now();
@@ -607,7 +613,7 @@ impl TelemetryHub {
     /// Record a completed STUN handshake or consent keepalive RTT sample + any retries lost before success.
     pub fn record_stun_ok(&self, rtt_ms: f64, retries_before_ok: u8, mapped: Option<SocketAddr>) {
         if let Ok(mut g) = self.inner.lock() {
-            if rtt_ms.is_finite() && rtt_ms >= 0.0 && rtt_ms < TELEMETRY_MAX_VALID_RTT_MS {
+            if rtt_ms.is_finite() && (0.0..TELEMETRY_MAX_VALID_RTT_MS).contains(&rtt_ms) {
                 if let Some(prev) = g.stun_rtt_ms {
                     let d = (rtt_ms - prev).abs();
                     let div = if g.stun_rtt_samples < 4 { 4.0 } else { 16.0 };
@@ -616,8 +622,7 @@ impl TelemetryHub {
                 g.stun_rtt_ms = Some(rtt_ms);
                 g.stun_rtt_ewma_ms = Some(match g.stun_rtt_ewma_ms {
                     Some(prev) => {
-                        prev * (1.0 - TELEMETRY_RTT_EWMA_ALPHA)
-                            + rtt_ms * TELEMETRY_RTT_EWMA_ALPHA
+                        prev * (1.0 - TELEMETRY_RTT_EWMA_ALPHA) + rtt_ms * TELEMETRY_RTT_EWMA_ALPHA
                     }
                     None => rtt_ms,
                 });

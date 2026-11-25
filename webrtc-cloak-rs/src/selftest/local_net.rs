@@ -21,7 +21,13 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
     let psk = b"selftest-01-baseline-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
     let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
 
@@ -52,7 +58,8 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
     let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
     let mut rtts_ms = Vec::with_capacity(count);
     let mut ok = 0usize;
-    app.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
 
     for i in 0..count {
         pkt[..4].copy_from_slice(b"RTT:");
@@ -107,25 +114,39 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
         ),
         detail: format!(
             "STUN={} DTLS={} SRTP={} SRTCP={} max_wire={}B p95={:.2}ms",
-            after.stun_pkts, after.dtls_pkts, srtp_pkts_delta, after.srtcp_pkts, after.max_wire_udp, p95
+            after.stun_pkts,
+            after.dtls_pkts,
+            srtp_pkts_delta,
+            after.srtcp_pkts,
+            after.max_wire_udp,
+            p95
         ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
 
-pub(super) fn test_02_transpacific_latency(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_02_transpacific_latency(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-02-wan-rtt-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(
         server_port,
         psk.clone(),
         NetProfile {
             base_delay_ms: 80,
             jitter_ms: 12,
-            seed: 2026_02,
+            seed: 202_602,
             ..Default::default()
         },
         false,
@@ -167,7 +188,8 @@ pub(super) fn test_02_transpacific_latency(opts: &SelftestOptions, hi: &mut High
     let mut pkt = vec![0u8; 1000];
     let mut rtts_ms = Vec::with_capacity(count);
     let mut ok = 0usize;
-    app.set_read_timeout(Some(Duration::from_millis(800))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(800)))
+        .unwrap();
 
     for i in 0..count {
         pkt[..4].copy_from_slice(b"WAN:");
@@ -189,7 +211,7 @@ pub(super) fn test_02_transpacific_latency(opts: &SelftestOptions, hi: &mut High
     let p50 = percentile(&rtts_ms, 50);
     let p95 = percentile(&rtts_ms, 95);
 
-    let passed = ok == count && p50 >= 130.0 && p50 <= 210.0 && snap.ports_seen.len() == 1;
+    let passed = ok == count && (130.0..=210.0).contains(&p50) && snap.ports_seen.len() == 1;
     ScenarioResult {
         id: 2,
         code: "wan_latency",
@@ -200,7 +222,12 @@ pub(super) fn test_02_transpacific_latency(opts: &SelftestOptions, hi: &mut High
             "hs {:.0}ms | p50 {:.0}ms | p95 {:.0}ms | {}/{}",
             hs_val, p50, p95, ok, count
         ),
-        detail: format!("ports={} c2s={} s2c={}", snap.ports_seen.len(), snap.c2s_pkts, snap.s2c_pkts),
+        detail: format!(
+            "ports={} c2s={} s2c={}",
+            snap.ports_seen.len(),
+            snap.c2s_pkts,
+            snap.s2c_pkts
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
@@ -210,7 +237,13 @@ pub(super) fn test_03_random_loss(opts: &SelftestOptions, hi: &mut Highlights) -
     let psk = b"selftest-03-random-loss-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(
         server_port,
         psk.clone(),
@@ -219,7 +252,7 @@ pub(super) fn test_03_random_loss(opts: &SelftestOptions, hi: &mut Highlights) -
             jitter_ms: 3,
             loss_c2s_pct: 8,
             loss_s2c_pct: 8,
-            seed: 2026_03,
+            seed: 202_603,
             ..Default::default()
         },
         false,
@@ -297,17 +330,29 @@ pub(super) fn test_03_random_loss(opts: &SelftestOptions, hi: &mut Highlights) -
             snap.dropped_by_proxy,
             snap.ports_seen.len()
         ),
-        detail: format!("backend_unique={} backend_dup={}", bst.unique_seqs, bst.dup_seqs),
+        detail: format!(
+            "backend_unique={} backend_dup={}",
+            bst.unique_seqs, bst.dup_seqs
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
 
-pub(super) fn test_04_reorder_and_replay(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_04_reorder_and_replay(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-04-reorder-dup-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(
         server_port,
         psk.clone(),
@@ -316,7 +361,7 @@ pub(super) fn test_04_reorder_and_replay(opts: &SelftestOptions, hi: &mut Highli
             jitter_ms: 2,
             reorder_pct: 35,
             duplicate_pct: 30,
-            seed: 2026_04,
+            seed: 202_604,
             ..Default::default()
         },
         false,
@@ -350,37 +395,48 @@ pub(super) fn test_04_reorder_and_replay(opts: &SelftestOptions, hi: &mut Highli
     let mut rbuf = vec![0u8; DTLS_IO_BUF_LEN];
 
     let pkt_len = pkt.len();
-    let mut drain_app = |rx_u: &mut HashSet<u64>, dups: &mut u64, ooo: &mut u64, max_s: &mut Option<u64>| {
-        while let Ok(n) = app.recv(&mut rbuf) {
-            if n == pkt_len && &rbuf[..4] == b"SEQ:" {
-                let s = u64::from_be_bytes(rbuf[4..12].try_into().unwrap());
-                if !rx_u.insert(s) {
-                    *dups += 1;
-                }
-                if let Some(m) = *max_s {
-                    if s < m {
-                        *ooo += 1;
+    let mut drain_app =
+        |rx_u: &mut HashSet<u64>, dups: &mut u64, ooo: &mut u64, max_s: &mut Option<u64>| {
+            while let Ok(n) = app.recv(&mut rbuf) {
+                if n == pkt_len && &rbuf[..4] == b"SEQ:" {
+                    let s = u64::from_be_bytes(rbuf[4..12].try_into().unwrap());
+                    if !rx_u.insert(s) {
+                        *dups += 1;
+                    }
+                    if let Some(m) = *max_s {
+                        if s < m {
+                            *ooo += 1;
+                        } else {
+                            *max_s = Some(s);
+                        }
                     } else {
                         *max_s = Some(s);
                     }
-                } else {
-                    *max_s = Some(s);
                 }
             }
-        }
-    };
+        };
 
     for seq in 0..total {
         pkt[4..12].copy_from_slice(&seq.to_be_bytes());
         fill_random(&mut pkt[12..]);
         let _ = app.send(&pkt);
-        drain_app(&mut rx_unique, &mut rx_client_dups, &mut rx_out_of_order, &mut max_seq_seen);
+        drain_app(
+            &mut rx_unique,
+            &mut rx_client_dups,
+            &mut rx_out_of_order,
+            &mut max_seq_seen,
+        );
         thread::sleep(Duration::from_millis(5));
     }
 
     let drain_end = Instant::now() + Duration::from_millis(350);
     while Instant::now() < drain_end {
-        drain_app(&mut rx_unique, &mut rx_client_dups, &mut rx_out_of_order, &mut max_seq_seen);
+        drain_app(
+            &mut rx_unique,
+            &mut rx_client_dups,
+            &mut rx_out_of_order,
+            &mut max_seq_seen,
+        );
         thread::sleep(Duration::from_millis(5));
     }
 
@@ -421,7 +477,13 @@ pub(super) fn test_05_mtu_guard(opts: &SelftestOptions, hi: &mut Highlights) -> 
     let psk = b"selftest-05-mtu-guard-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
     let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
 
@@ -449,7 +511,8 @@ pub(super) fn test_05_mtu_guard(opts: &SelftestOptions, hi: &mut Highlights) -> 
         p[..4].copy_from_slice(b"MTU:");
         fill_random(&mut p[4..]);
         let mut rb = vec![0u8; DTLS_IO_BUF_LEN];
-        app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        app.set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
         let _ = app.send(&p);
         match app.recv(&mut rb) {
             Ok(n) => n == len && rb[..16] == p[..16],
@@ -491,12 +554,21 @@ pub(super) fn test_05_mtu_guard(opts: &SelftestOptions, hi: &mut Highlights) -> 
     }
 }
 
-pub(super) fn test_06_single_stun_drop(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_06_single_stun_drop(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-06-single-ka-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), true);
     let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 1, 200);
 
@@ -550,8 +622,10 @@ pub(super) fn test_06_single_stun_drop(opts: &SelftestOptions, hi: &mut Highligh
             snap.same_txid_ka_retransmits,
             snap.ports_seen.len()
         ),
-        detail: format!("port={} pings_ok={} dropped={}", port1, ping_ok, snap.dropped_by_proxy),
+        detail: format!(
+            "port={} pings_ok={} dropped={}",
+            port1, ping_ok, snap.dropped_by_proxy
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
-

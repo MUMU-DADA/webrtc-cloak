@@ -95,7 +95,11 @@ const PAD_LCG_SEED_XOR: u64 = 0xA076_1D64_78BD_642F;
 /// SRTP 随机填充 LCG 乘数（Knuth MMIX 64 位同余常数）。
 const PAD_LCG_MUL: u64 = 6_364_136_223_846_793_005;
 
-pub fn derive_stun_material(psk: &[u8], stun_txid: &[u8; 12], username: &str) -> ([u8; 32], u32, u32) {
+pub fn derive_stun_material(
+    psk: &[u8],
+    stun_txid: &[u8; 12],
+    username: &str,
+) -> ([u8; 32], u32, u32) {
     let mut seed = Vec::with_capacity(64 + psk.len() + username.len());
     seed.extend_from_slice(b"webrtc-cloak-v3|");
     seed.extend_from_slice(psk);
@@ -134,7 +138,7 @@ pub(super) fn derive_audio_ssrc(session_key: &[u8; 32], video_ssrc: u32) -> u32 
     let mut h = Sha256::new();
     h.update(b"webrtc-cloak-v3-audio-ssrc|");
     h.update(session_key);
-    h.update(&video_ssrc.to_be_bytes());
+    h.update(video_ssrc.to_be_bytes());
     let d: [u8; 32] = h.finalize().into();
     let mut s = u32::from_be_bytes([d[0], d[1], d[2], d[3]]);
     // Enforce strict high-16-bit disjointness (`iv[4..6]` in `gcm_nonce`), guaranteeing
@@ -341,7 +345,6 @@ impl SrtpCloakCipher {
         ((ring[word_idx] >> bit_idx) & 1) != 0
     }
 
-
     #[inline]
     pub(super) fn gcm_nonce(&self, direction: u8, ssrc: u32, ext_seq: u64) -> [u8; 12] {
         let mut iv = [0u8; 12];
@@ -399,7 +402,13 @@ impl SrtpCloakCipher {
     }
 
     #[inline]
-    pub(super) fn auth_tag(&self, direction: u8, aad_hdr: &[u8], ciphertext: &[u8], roc: u32) -> [u8; SRTP_TAG_LEN] {
+    pub(super) fn auth_tag(
+        &self,
+        direction: u8,
+        aad_hdr: &[u8],
+        ciphertext: &[u8],
+        roc: u32,
+    ) -> [u8; SRTP_TAG_LEN] {
         let mut h = Blake2bMac::<U16>::new_from_slice(&self.mac_key).expect("key");
         h.update(&[direction]);
         h.update(aad_hdr);
@@ -418,7 +427,6 @@ impl SrtpCloakCipher {
             i += take;
         }
     }
-
 
     /// Zero-allocation wrap into caller-provided `out` buffer; returns `Some(written_len)`.
     /// Wire format (RFC 3550 + RFC 8285 + RFC 7714 — fixes V3-H-03, V3-M-02, V3-L-03):
@@ -661,8 +669,7 @@ impl SrtpCloakCipher {
         //   Control: [magic: u16 BE (0xFFFE/0xFFFD/0xFFFC)] || [len: u16 BE] || [payload] || [random pad]
         let ct_end = RTP_FULL_HDR_LEN + ct_len;
         if let Some(magic) = control_magic {
-            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
-                .copy_from_slice(&magic.to_be_bytes());
+            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2].copy_from_slice(&magic.to_be_bytes());
             out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 4]
                 .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
         } else {
@@ -710,7 +717,12 @@ impl SrtpCloakCipher {
                 out[ct_end..total].copy_from_slice(&tag);
             }
             CipherSuite::Blake2b => {
-                self.xor_keystream(tx_domain_dir, active_ssrc, ext_seq, &mut out[RTP_FULL_HDR_LEN..ct_end]);
+                self.xor_keystream(
+                    tx_domain_dir,
+                    active_ssrc,
+                    ext_seq,
+                    &mut out[RTP_FULL_HDR_LEN..ct_end],
+                );
                 let tag = self.auth_tag(
                     tx_domain_dir,
                     &out[..RTP_FULL_HDR_LEN],
@@ -752,8 +764,7 @@ impl SrtpCloakCipher {
             let ext_words = u16::from_be_bytes([packet[hdr_len + 2], packet[hdr_len + 3]]) as usize;
             hdr_len += 4 + ext_words * 4;
         }
-        if packet.len() < hdr_len + SRTP_DATA_PREFIX_LEN + SRTP_TAG_LEN
-            || hdr_len > RTP_MAX_HDR_LEN
+        if packet.len() < hdr_len + SRTP_DATA_PREFIX_LEN + SRTP_TAG_LEN || hdr_len > RTP_MAX_HDR_LEN
         {
             return None;
         }
@@ -776,7 +787,11 @@ impl SrtpCloakCipher {
         let ciphertext = &packet[hdr_len..hdr_len + ct_len];
 
         let (rx_init, rx_roc, rx_highest) = if is_audio {
-            (self.audio_rx_initialized, self.audio_rx_roc, self.audio_rx_highest_seq16)
+            (
+                self.audio_rx_initialized,
+                self.audio_rx_roc,
+                self.audio_rx_highest_seq16,
+            )
         } else {
             (self.rx_initialized, self.rx_roc, self.rx_highest_seq16)
         };

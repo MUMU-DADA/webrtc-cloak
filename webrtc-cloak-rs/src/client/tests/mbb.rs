@@ -113,7 +113,8 @@ fn proactive_mbb_scheduled_rotation_zero_loss() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 256];
@@ -143,7 +144,9 @@ fn proactive_mbb_scheduled_rotation_zero_loss() {
         let msg = format!("MBB_SEQ_{:04}", seq);
         seq += 1;
         app.send(msg.as_bytes()).unwrap();
-        let n = app.recv(&mut rbuf).expect("MBB rotation MUST deliver with zero packet loss!");
+        let n = app
+            .recv(&mut rbuf)
+            .expect("MBB rotation MUST deliver with zero packet loss!");
         assert_eq!(&rbuf[..n], msg.as_bytes());
         ok_cnt += 1;
         if latest_port.load(Ordering::SeqCst) != port1 {
@@ -275,8 +278,8 @@ fn v38_byte_budget_mbb_and_delayed_bye_delivers_slow_backend_replies() {
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
-            rotate_interval_secs: 0,      // time trigger disabled -> pure byte-budget test!
-            rotate_max_bytes: 20 * 1024,  // 20KB base -> random 10..37KB budget!
+            rotate_interval_secs: 0, // time trigger disabled -> pure byte-budget test!
+            rotate_max_bytes: 20 * 1024, // 20KB base -> random 10..37KB budget!
             rotate_cooldown_secs: 1,
             workers: 1,
             max_sessions: 32,
@@ -293,7 +296,8 @@ fn v38_byte_budget_mbb_and_delayed_bye_delivers_slow_backend_replies() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 2048];
@@ -327,7 +331,7 @@ fn v38_byte_budget_mbb_and_delayed_bye_delivers_slow_backend_replies() {
         let _ = app.send(&bulk);
 
         // Every 4th packet is a 500ms-delayed SLOW backend reply to prove old_sess does NOT drop it on cutover!
-        if seq % 4 == 0 {
+        if seq.is_multiple_of(4) {
             let slow_msg = format!("SLOW:{:04}", seq);
             let _ = app.send(slow_msg.as_bytes());
             slow_sent.insert(seq);
@@ -354,7 +358,11 @@ fn v38_byte_budget_mbb_and_delayed_bye_delivers_slow_backend_replies() {
         }
         thread::sleep(Duration::from_millis(40));
     }
-    assert!(cutover_seen, "byte-budget MBB rotation MUST trigger off port {}", port1);
+    assert!(
+        cutover_seen,
+        "byte-budget MBB rotation MUST trigger off port {}",
+        port1
+    );
 
     // Drain all in-flight 500ms SLOW backend replies (proves old session stayed Ready on server!)
     let t_drain = Instant::now();
@@ -489,7 +497,8 @@ fn v38_background_trickle_suspends_proactive_mbb_rotation() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 256];
@@ -524,4 +533,3 @@ fn v38_background_trickle_suspends_proactive_mbb_rotation() {
         "background trickle keepalives (<64KB/5min) MUST suspend proactive MBB rotation!"
     );
 }
-

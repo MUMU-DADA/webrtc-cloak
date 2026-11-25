@@ -54,7 +54,8 @@ impl ServerWorker {
                     // (NOT old_peer_addr or unverified candidate!) so retries & Addr1->Addr2->Addr1
                     // switchbacks always enter the V4 migration path cleanly!
                     let mig_meta = peek_stun_request_username(pkt).and_then(|u| {
-                        let already_same_peer = self.token_by_peer
+                        let already_same_peer = self
+                            .token_by_peer
                             .get(&peer_addr)
                             .and_then(|t| self.sessions_by_token.get(t))
                             .map(|s| {
@@ -105,7 +106,8 @@ impl ServerWorker {
                                                         )
                                                     {
                                                         self.audit.record(1, reply);
-                                                        let _ = self.listen_sock
+                                                        let _ = self
+                                                            .listen_sock
                                                             .send_to(reply, peer_addr);
                                                         send_encrypted_path_challenge(
                                                             sess,
@@ -171,8 +173,8 @@ impl ServerWorker {
                                                         (tok, now + MIGRATION_CHALLENGE_TTL),
                                                     );
                                                     self.audit.record(1, &resp);
-                                                    let _ = self.listen_sock
-                                                        .send_to(&resp, peer_addr);
+                                                    let _ =
+                                                        self.listen_sock.send_to(&resp, peer_addr);
                                                     send_encrypted_path_challenge(
                                                         sess,
                                                         peer_addr,
@@ -189,11 +191,8 @@ impl ServerWorker {
                                 } else {
                                     // P0-4: Bounded `self.cross_worker_pending`
                                     if self.cross_worker_pending.len() >= MAX_MIG_PENDING_MAP {
-                                        self.cross_worker_pending
-                                            .retain(|_, (_, _, e)| now <= *e);
-                                        if self.cross_worker_pending.len()
-                                            >= MAX_MIG_PENDING_MAP
-                                        {
+                                        self.cross_worker_pending.retain(|_, (_, _, e)| now <= *e);
+                                        if self.cross_worker_pending.len() >= MAX_MIG_PENDING_MAP {
                                             self.unauth_drops += 1;
                                             continue;
                                         }
@@ -233,7 +232,8 @@ impl ServerWorker {
                     };
 
                     let uname = parsed.username.unwrap_or_default();
-                    let same_active = self.token_by_peer
+                    let same_active = self
+                        .token_by_peer
                         .get(&peer_addr)
                         .and_then(|tok| self.sessions_by_token.get(tok))
                         .map(|s| {
@@ -271,7 +271,8 @@ impl ServerWorker {
 
                     if same_active {
                         if let Some(&tok) = self.token_by_peer.get(&peer_addr) {
-                            let resp = build_stun_success_response(&parsed.txid, peer_v4, &self.cfg.psk);
+                            let resp =
+                                build_stun_success_response(&parsed.txid, peer_v4, &self.cfg.psk);
                             {
                                 let mut cache = self.seen_txids.lock().unwrap();
                                 cache.record(parsed.txid, peer_addr, now, &resp);
@@ -293,7 +294,8 @@ impl ServerWorker {
                     }
 
                     // P0-3: Reject duplicate ufrag hijacking an active/handshaking session on another peer!
-                    let same_peer_rekey_same_ufrag = self.token_by_peer
+                    let same_peer_rekey_same_ufrag = self
+                        .token_by_peer
                         .get(&peer_addr)
                         .and_then(|t| self.sessions_by_token.get(t))
                         .map(|s| s.peer_addr == peer_addr && s.username == uname)
@@ -310,17 +312,23 @@ impl ServerWorker {
                     // If `peer_addr` was only a draining `old_peer_addr`, detach that drain key cleanly
                     // WITHOUT destroying the live migrated session!
                     if let Some(&old_tok) = self.token_by_peer.get(&peer_addr) {
-                        let is_exact_primary_peer = self.sessions_by_token
+                        let is_exact_primary_peer = self
+                            .sessions_by_token
                             .get(&old_tok)
                             .map(|s| s.peer_addr == peer_addr)
                             .unwrap_or(false);
                         if is_exact_primary_peer {
                             if let Some(mut old) = self.sessions_by_token.remove(&old_tok) {
-                                self.closed_tx_bytes = self.closed_tx_bytes.saturating_add(old.tx_bytes);
-                                self.closed_rx_bytes = self.closed_rx_bytes.saturating_add(old.rx_bytes);
-                                self.closed_tx_pkts = self.closed_tx_pkts.saturating_add(old.tx_pkts);
-                                self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(old.rx_pkts);
-                                self.closed_auth_drops = self.closed_auth_drops.saturating_add(old.auth_drops);
+                                self.closed_tx_bytes =
+                                    self.closed_tx_bytes.saturating_add(old.tx_bytes);
+                                self.closed_rx_bytes =
+                                    self.closed_rx_bytes.saturating_add(old.rx_bytes);
+                                self.closed_tx_pkts =
+                                    self.closed_tx_pkts.saturating_add(old.tx_pkts);
+                                self.closed_rx_pkts =
+                                    self.closed_rx_pkts.saturating_add(old.rx_pkts);
+                                self.closed_auth_drops =
+                                    self.closed_auth_drops.saturating_add(old.auth_drops);
                                 cleanup_session_routes(
                                     self.worker_id,
                                     old_tok,
@@ -350,7 +358,8 @@ impl ServerWorker {
                     }
 
                     if self.sessions_by_token.len() >= self.cfg.max_sessions {
-                        let expired: Vec<Token> = self.sessions_by_token
+                        let expired: Vec<Token> = self
+                            .sessions_by_token
                             .iter()
                             .filter(|(_, s)| {
                                 matches!(s.state, ServerState::Closing(_, _))
@@ -360,12 +369,20 @@ impl ServerWorker {
                             .collect();
                         for t in expired {
                             if let Some(mut s) = self.sessions_by_token.remove(&t) {
-                                self.closed_tx_bytes = self.closed_tx_bytes.saturating_add(s.tx_bytes);
-                                self.closed_rx_bytes = self.closed_rx_bytes.saturating_add(s.rx_bytes);
+                                self.closed_tx_bytes =
+                                    self.closed_tx_bytes.saturating_add(s.tx_bytes);
+                                self.closed_rx_bytes =
+                                    self.closed_rx_bytes.saturating_add(s.rx_bytes);
                                 self.closed_tx_pkts = self.closed_tx_pkts.saturating_add(s.tx_pkts);
                                 self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(s.rx_pkts);
-                                self.closed_auth_drops = self.closed_auth_drops.saturating_add(s.auth_drops);
-                                graceful_teardown_server(&mut s, &self.listen_sock, &mut self.dtls_buf, &mut self.audit);
+                                self.closed_auth_drops =
+                                    self.closed_auth_drops.saturating_add(s.auth_drops);
+                                graceful_teardown_server(
+                                    &mut s,
+                                    &self.listen_sock,
+                                    &mut self.dtls_buf,
+                                    &mut self.audit,
+                                );
                                 cleanup_session_routes(
                                     self.worker_id,
                                     t,
@@ -381,7 +398,10 @@ impl ServerWorker {
                         if self.sessions_by_token.len() >= self.cfg.max_sessions {
                             log(
                                 self.worker_id,
-                                &format!("max_sessions={} reached, rejecting {}", self.cfg.max_sessions, peer_addr),
+                                &format!(
+                                    "max_sessions={} reached, rejecting {}",
+                                    self.cfg.max_sessions, peer_addr
+                                ),
                             );
                             continue;
                         }
@@ -402,14 +422,25 @@ impl ServerWorker {
                                 now,
                             );
                             let _ = dtls.handle_timeout(now);
-                            (ServerState::DtlsHandshake, Some(dtls), None, None, None, None, None)
+                            (
+                                ServerState::DtlsHandshake,
+                                Some(dtls),
+                                None,
+                                None,
+                                None,
+                                None,
+                                None,
+                            )
                         } else {
-                            let chosen = resolve_srtp_suite(self.cfg.cipher_pref, None, &self.cpu, true);
+                            let chosen =
+                                resolve_srtp_suite(self.cfg.cipher_pref, None, &self.cpu, true);
                             let final_key = combine_session_key(&stun_key, None);
                             let mk = derive_ice_migration_key(&final_key);
-                            let mut c = SrtpCloakCipher::new(&final_key, s_s2c, s_c2s, false, chosen);
+                            let mut c =
+                                SrtpCloakCipher::new(&final_key, s_s2c, s_c2s, false, chosen);
                             c.set_wan_mtu(self.cfg.wan_mtu);
-                            self.registry.register_session(&uname, self.worker_id, mk, tie_breaker);
+                            self.registry
+                                .register_session(&uname, self.worker_id, mk, tie_breaker);
                             (
                                 ServerState::Ready,
                                 None,
@@ -576,7 +607,8 @@ impl ServerWorker {
                             }
                         }
                         if became_ready {
-                            let early_pkts: Vec<Vec<u8>> = self.sessions_by_token
+                            let early_pkts: Vec<Vec<u8>> = self
+                                .sessions_by_token
                                 .get_mut(&tok)
                                 .map(|s| s.early_srtp.drain(..).collect())
                                 .unwrap_or_default();
@@ -668,8 +700,7 @@ impl ServerWorker {
                             }
                             _ => {}
                         }
-                    } else if let Some((tok, exp)) =
-                        self.local_mig_pending.get(&peer_addr).copied()
+                    } else if let Some((tok, exp)) = self.local_mig_pending.get(&peer_addr).copied()
                     {
                         // 2) P0-1: Unverified same-worker 1-RTT migration candidate (SRTP-only fallback!)
                         if now <= exp {
@@ -725,7 +756,7 @@ impl ServerWorker {
     }
 
     pub(super) fn handle_backend_readable(&mut self, tok: Token, now: Instant) {
-    if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             loop {
                 let n = match sess.backend {
                     BackendPipe::Owned(ref sock) => match sock.recv(&mut self.rbuf) {
@@ -749,7 +780,11 @@ impl ServerWorker {
                     }
                     if let Some(wn) = cipher.wrap_into(&self.rbuf[..n], &mut self.wbuf) {
                         self.audit.record(1, &self.wbuf[..wn]);
-                        if self.listen_sock.send_to(&self.wbuf[..wn], sess.peer_addr).is_ok() {
+                        if self
+                            .listen_sock
+                            .send_to(&self.wbuf[..wn], sess.peer_addr)
+                            .is_ok()
+                        {
                             sess.tx_pkts += 1;
                             sess.tx_bytes += n as u64;
                             sent_bytes = n as u64;

@@ -152,27 +152,57 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
 
     #[cfg(target_arch = "x86_64")]
     {
-        if std::arch::is_x86_feature_detected!("sse2") { features.push("SSE2"); }
-        if std::arch::is_x86_feature_detected!("ssse3") { features.push("SSSE3"); }
-        if std::arch::is_x86_feature_detected!("sse4.2") { features.push("SSE4.2(CRC32)"); }
-        if std::arch::is_x86_feature_detected!("aes") { features.push("AES-NI"); }
-        if std::arch::is_x86_feature_detected!("pclmulqdq") { features.push("PCLMULQDQ(GCM)"); }
-        if std::arch::is_x86_feature_detected!("sha") { features.push("SHA-NI"); }
-        if std::arch::is_x86_feature_detected!("avx2") { features.push("AVX2"); }
-        if std::arch::is_x86_feature_detected!("avx512f") { features.push("AVX-512F"); }
-        if std::arch::is_x86_feature_detected!("vaes") { features.push("VAES"); }
-        if std::arch::is_x86_feature_detected!("vpclmulqdq") { features.push("VPCLMULQDQ"); }
+        if std::arch::is_x86_feature_detected!("sse2") {
+            features.push("SSE2");
+        }
+        if std::arch::is_x86_feature_detected!("ssse3") {
+            features.push("SSSE3");
+        }
+        if std::arch::is_x86_feature_detected!("sse4.2") {
+            features.push("SSE4.2(CRC32)");
+        }
+        if std::arch::is_x86_feature_detected!("aes") {
+            features.push("AES-NI");
+        }
+        if std::arch::is_x86_feature_detected!("pclmulqdq") {
+            features.push("PCLMULQDQ(GCM)");
+        }
+        if std::arch::is_x86_feature_detected!("sha") {
+            features.push("SHA-NI");
+        }
+        if std::arch::is_x86_feature_detected!("avx2") {
+            features.push("AVX2");
+        }
+        if std::arch::is_x86_feature_detected!("avx512f") {
+            features.push("AVX-512F");
+        }
+        if std::arch::is_x86_feature_detected!("vaes") {
+            features.push("VAES");
+        }
+        if std::arch::is_x86_feature_detected!("vpclmulqdq") {
+            features.push("VPCLMULQDQ");
+        }
         has_hw_aes_gcm = std::arch::is_x86_feature_detected!("aes")
             && std::arch::is_x86_feature_detected!("pclmulqdq");
     }
 
     #[cfg(target_arch = "aarch64")]
     {
-        if std::arch::is_aarch64_feature_detected!("neon") { features.push("NEON"); }
-        if std::arch::is_aarch64_feature_detected!("aes") { features.push("ARMv8-AES"); }
-        if std::arch::is_aarch64_feature_detected!("pmull") { features.push("ARMv8-PMULL(GCM)"); }
-        if std::arch::is_aarch64_feature_detected!("sha2") { features.push("ARMv8-SHA2"); }
-        if std::arch::is_aarch64_feature_detected!("crc") { features.push("ARMv8-CRC32"); }
+        if std::arch::is_aarch64_feature_detected!("neon") {
+            features.push("NEON");
+        }
+        if std::arch::is_aarch64_feature_detected!("aes") {
+            features.push("ARMv8-AES");
+        }
+        if std::arch::is_aarch64_feature_detected!("pmull") {
+            features.push("ARMv8-PMULL(GCM)");
+        }
+        if std::arch::is_aarch64_feature_detected!("sha2") {
+            features.push("ARMv8-SHA2");
+        }
+        if std::arch::is_aarch64_feature_detected!("crc") {
+            features.push("ARMv8-CRC32");
+        }
         has_hw_aes_gcm = std::arch::is_aarch64_feature_detected!("aes")
             && std::arch::is_aarch64_feature_detected!("pmull");
     }
@@ -195,7 +225,6 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
         recommended,
     }
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PacketKind {
@@ -224,7 +253,6 @@ pub fn demux_rfc7983(data: &[u8]) -> PacketKind {
         _ => PacketKind::Unknown,
     }
 }
-
 
 pub fn fill_random(buf: &mut [u8]) {
     getrandom::getrandom(buf).expect("OS CSPRNG failed");
@@ -262,7 +290,7 @@ fn lognormal_factor(sigma: f64, min_factor: f64, max_factor: f64) -> f64 {
     let mut raw = [0u8; 24];
     fill_random(&mut raw);
     let mut sum6 = 0.0f64;
-    for chunk in raw.chunks_exact(4) {
+    for chunk in raw.as_chunks::<4>().0 {
         let u = u32::from_ne_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64
             / (u32::MAX as f64 + 1.0);
         sum6 += u;
@@ -340,8 +368,7 @@ impl RollingByteWindow {
     pub fn bytes_in_window(&mut self, now: Instant) -> u64 {
         self.advance(now);
         let elapsed = now.saturating_duration_since(self.bucket_start);
-        let rem_frac =
-            1.0 - (elapsed.as_secs_f64() / self.window.as_secs_f64()).clamp(0.0, 1.0);
+        let rem_frac = 1.0 - (elapsed.as_secs_f64() / self.window.as_secs_f64()).clamp(0.0, 1.0);
         let weighted_prev = ((self.prev_bytes as f64) * rem_frac) as u64;
         weighted_prev.saturating_add(self.cur_bytes)
     }
@@ -362,4 +389,3 @@ pub fn unix_secs() -> u32 {
         .map(|d| d.as_secs() as u32)
         .unwrap_or(0)
 }
-

@@ -6,9 +6,7 @@ use crate::constants::{
     CTRL_FRAME_BUF_LEN, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS,
     STUN_BINDING_REQUEST, UDP_RECV_BUF_LEN,
 };
-use crate::protocol::{
-    demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind,
-};
+use crate::protocol::{demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind};
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use std::cmp::Ordering as CmpOrdering;
@@ -56,33 +54,30 @@ impl EchoBackend {
         let handle = thread::spawn(move || {
             let mut buf = vec![0u8; UDP_RECV_BUF_LEN];
             while !stop_flag.load(Ordering::Relaxed) {
-                match sock.recv_from(&mut buf) {
-                    Ok((n, peer)) => {
-                        let pkt = &buf[..n];
-                        if pkt.starts_with(b"SINK:") {
-                            let now = Instant::now();
-                            let mut s = st.lock().unwrap();
-                            if s.sink_first.is_none() {
-                                s.sink_first = Some(now);
-                            }
-                            s.sink_last = Some(now);
-                            s.sink_pkts += 1;
-                            s.sink_bytes += n as u64;
-                            continue;
+                if let Ok((n, peer)) = sock.recv_from(&mut buf) {
+                    let pkt = &buf[..n];
+                    if pkt.starts_with(b"SINK:") {
+                        let now = Instant::now();
+                        let mut s = st.lock().unwrap();
+                        if s.sink_first.is_none() {
+                            s.sink_first = Some(now);
                         }
-                        if n >= 12 && &pkt[..4] == b"SEQ:" {
-                            let seq = u64::from_be_bytes(pkt[4..12].try_into().unwrap());
-                            let mut set = seen.lock().unwrap();
-                            let mut s = st.lock().unwrap();
-                            if set.insert(seq) {
-                                s.unique_seqs += 1;
-                            } else {
-                                s.dup_seqs += 1;
-                            }
-                        }
-                        let _ = sock.send_to(pkt, peer);
+                        s.sink_last = Some(now);
+                        s.sink_pkts += 1;
+                        s.sink_bytes += n as u64;
+                        continue;
                     }
-                    Err(_) => {}
+                    if n >= 12 && &pkt[..4] == b"SEQ:" {
+                        let seq = u64::from_be_bytes(pkt[4..12].try_into().unwrap());
+                        let mut set = seen.lock().unwrap();
+                        let mut s = st.lock().unwrap();
+                        if set.insert(seq) {
+                            s.unique_seqs += 1;
+                        } else {
+                            s.dup_seqs += 1;
+                        }
+                    }
+                    let _ = sock.send_to(pkt, peer);
                 }
             }
         });

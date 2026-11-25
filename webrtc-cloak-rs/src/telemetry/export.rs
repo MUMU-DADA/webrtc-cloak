@@ -69,37 +69,108 @@ impl TelemetryInner {
         let v = self.compute_view(now);
         let r = self.role;
         let mut s = String::with_capacity(1400);
-        s.push_str("# HELP webrtc_cloak_up 1 while process is running\n# TYPE webrtc_cloak_up gauge\n");
+        s.push_str(
+            "# HELP webrtc_cloak_up 1 while process is running\n# TYPE webrtc_cloak_up gauge\n",
+        );
         s.push_str(&format!("webrtc_cloak_up{{role=\"{}\"}} 1\n", r));
         s.push_str("# HELP webrtc_cloak_uptime_seconds Process uptime in seconds\n# TYPE webrtc_cloak_uptime_seconds gauge\n");
-        s.push_str(&format!("webrtc_cloak_uptime_seconds{{role=\"{}\"}} {}\n", r, v.uptime_secs));
+        s.push_str(&format!(
+            "webrtc_cloak_uptime_seconds{{role=\"{}\"}} {}\n",
+            r, v.uptime_secs
+        ));
         s.push_str("# HELP webrtc_cloak_health_code 3=good 2=degraded 1=idle 0=critical\n# TYPE webrtc_cloak_health_code gauge\n");
-        s.push_str(&format!("webrtc_cloak_health_code{{role=\"{}\",health=\"{}\"}} {}\n", r, v.health, v.health_code));
+        s.push_str(&format!(
+            "webrtc_cloak_health_code{{role=\"{}\",health=\"{}\"}} {}\n",
+            r, v.health, v.health_code
+        ));
         if let Some(rtt) = self.stun_rtt_ms {
-            s.push_str(&format!("webrtc_cloak_stun_rtt_ms{{role=\"{}\"}} {:.2}\n", r, rtt));
+            s.push_str(&format!(
+                "webrtc_cloak_stun_rtt_ms{{role=\"{}\"}} {:.2}\n",
+                r, rtt
+            ));
         }
         if let Some(ewma) = self.stun_rtt_ewma_ms {
-            s.push_str(&format!("webrtc_cloak_stun_rtt_ewma_ms{{role=\"{}\"}} {:.2}\n", r, ewma));
+            s.push_str(&format!(
+                "webrtc_cloak_stun_rtt_ewma_ms{{role=\"{}\"}} {:.2}\n",
+                r, ewma
+            ));
         }
-        s.push_str(&format!("webrtc_cloak_stun_jitter_ms{{role=\"{}\"}} {:.2}\n", r, self.stun_jitter_ms));
-        s.push_str(&format!("webrtc_cloak_stun_loss_percent{{role=\"{}\"}} {:.2}\n", r, v.stun_loss_pct));
-        s.push_str(&format!("webrtc_cloak_tx_mbps{{role=\"{}\"}} {:.3}\n", r, self.tx_mbps));
-        s.push_str(&format!("webrtc_cloak_rx_mbps{{role=\"{}\"}} {:.3}\n", r, self.rx_mbps));
-        s.push_str(&format!("webrtc_cloak_tx_bytes_total{{role=\"{}\"}} {}\n", r, v.tx_bytes_total));
-        s.push_str(&format!("webrtc_cloak_rx_bytes_total{{role=\"{}\"}} {}\n", r, v.rx_bytes_total));
-        s.push_str(&format!("webrtc_cloak_tx_pkts_total{{role=\"{}\"}} {}\n", r, v.tx_pkts_total));
-        s.push_str(&format!("webrtc_cloak_rx_pkts_total{{role=\"{}\"}} {}\n", r, v.rx_pkts_total));
-        s.push_str(&format!("webrtc_cloak_active_sessions{{role=\"{}\"}} {}\n", r, v.active_sessions));
-        s.push_str(&format!("webrtc_cloak_migrating_sessions{{role=\"{}\"}} {}\n", r, v.migrating_sessions));
-        s.push_str(&format!("webrtc_cloak_blackholes_total{{role=\"{}\"}} {}\n", r, self.blackholes_total));
-        s.push_str(&format!("webrtc_cloak_blackholes_last_10m{{role=\"{}\"}} {}\n", r, v.blackholes_last_10m));
-        s.push_str(&format!("webrtc_cloak_migrations_1rtt_total{{role=\"{}\"}} {}\n", r, self.migrations_1rtt_total));
-        s.push_str(&format!("webrtc_cloak_migrations_1rtt_last_10m{{role=\"{}\"}} {}\n", r, v.migrations_1rtt_last_10m));
-        s.push_str(&format!("webrtc_cloak_mbb_rotations_total{{role=\"{}\"}} {}\n", r, self.mbb_rotations_total));
-        s.push_str(&format!("webrtc_cloak_graceful_reconnects_total{{role=\"{}\"}} {}\n", r, self.graceful_reconnects_total));
-        s.push_str(&format!("webrtc_cloak_auth_drops_total{{role=\"{}\"}} {}\n", r, v.auth_drops_total));
-        s.push_str(&format!("webrtc_cloak_unauth_silent_drops_total{{role=\"{}\"}} {}\n", r, v.unauth_drops_total));
-        s.push_str(&format!("webrtc_cloak_unauth_silent_drops_last_10m{{role=\"{}\"}} {}\n", r, v.unauth_drops_last_10m));
+        s.push_str(&format!(
+            "webrtc_cloak_stun_jitter_ms{{role=\"{}\"}} {:.2}\n",
+            r, self.stun_jitter_ms
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_stun_loss_percent{{role=\"{}\"}} {:.2}\n",
+            r, v.stun_loss_pct
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_tx_mbps{{role=\"{}\"}} {:.3}\n",
+            r, self.tx_mbps
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_rx_mbps{{role=\"{}\"}} {:.3}\n",
+            r, self.rx_mbps
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_tx_bytes_total{{role=\"{}\"}} {}\n",
+            r, v.tx_bytes_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_rx_bytes_total{{role=\"{}\"}} {}\n",
+            r, v.rx_bytes_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_tx_pkts_total{{role=\"{}\"}} {}\n",
+            r, v.tx_pkts_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_rx_pkts_total{{role=\"{}\"}} {}\n",
+            r, v.rx_pkts_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_active_sessions{{role=\"{}\"}} {}\n",
+            r, v.active_sessions
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_migrating_sessions{{role=\"{}\"}} {}\n",
+            r, v.migrating_sessions
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_blackholes_total{{role=\"{}\"}} {}\n",
+            r, self.blackholes_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_blackholes_last_10m{{role=\"{}\"}} {}\n",
+            r, v.blackholes_last_10m
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_migrations_1rtt_total{{role=\"{}\"}} {}\n",
+            r, self.migrations_1rtt_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_migrations_1rtt_last_10m{{role=\"{}\"}} {}\n",
+            r, v.migrations_1rtt_last_10m
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_mbb_rotations_total{{role=\"{}\"}} {}\n",
+            r, self.mbb_rotations_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_graceful_reconnects_total{{role=\"{}\"}} {}\n",
+            r, self.graceful_reconnects_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_auth_drops_total{{role=\"{}\"}} {}\n",
+            r, v.auth_drops_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_unauth_silent_drops_total{{role=\"{}\"}} {}\n",
+            r, v.unauth_drops_total
+        ));
+        s.push_str(&format!(
+            "webrtc_cloak_unauth_silent_drops_last_10m{{role=\"{}\"}} {}\n",
+            r, v.unauth_drops_last_10m
+        ));
         s
     }
 

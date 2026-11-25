@@ -565,15 +565,21 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
     let http_get_body = |addr: SocketAddr, path: &str| -> String {
         let mut s = TcpStream::connect(addr).unwrap();
         s.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let req = format!("GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n", path);
+        let req = format!(
+            "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
+            path
+        );
         s.write_all(req.as_bytes()).unwrap();
         let mut raw = String::new();
         let _ = s.read_to_string(&mut raw);
-        raw.split_once("\r\n\r\n").map(|(_, b)| b.to_string()).unwrap_or_default()
+        raw.split_once("\r\n\r\n")
+            .map(|(_, b)| b.to_string())
+            .unwrap_or_default()
     };
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
     let mut rbuf = [0u8; 512];
     let mut ready = false;
@@ -627,9 +633,24 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
     // Verify client & server HTTP JSON + Prometheus endpoints reflect exact outer events!
     let cli_http_json: serde_json::Value =
         serde_json::from_str(&http_get_body(cli_http_addr, "/status")).unwrap();
-    assert!(cli_http_json["events"]["blackholes_total"].as_u64().unwrap() >= 1);
-    assert!(cli_http_json["events"]["migrations_1rtt_total"].as_u64().unwrap() >= 1);
-    assert_eq!(cli_http_json["events"]["blackholes_last_10m"].as_u64().unwrap(), 1);
+    assert!(
+        cli_http_json["events"]["blackholes_total"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        cli_http_json["events"]["migrations_1rtt_total"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert_eq!(
+        cli_http_json["events"]["blackholes_last_10m"]
+            .as_u64()
+            .unwrap(),
+        1
+    );
     assert!(cli_http_json["link"]["stun_loss_pct"].as_f64().unwrap() > 0.0);
     assert!(matches!(
         cli_http_json["health"].as_str(),
@@ -643,8 +664,18 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
     let srv_http_json: serde_json::Value =
         serde_json::from_str(&http_get_body(srv_http_addr, "/status")).unwrap();
     assert_eq!(srv_http_json["role"], "server");
-    assert!(srv_http_json["events"]["migrations_1rtt_total"].as_u64().unwrap() >= 1);
-    assert!(srv_http_json["sessions"]["unauth_silent_drops_total"].as_u64().unwrap() >= 2);
+    assert!(
+        srv_http_json["events"]["migrations_1rtt_total"]
+            .as_u64()
+            .unwrap()
+            >= 1
+    );
+    assert!(
+        srv_http_json["sessions"]["unauth_silent_drops_total"]
+            .as_u64()
+            .unwrap()
+            >= 2
+    );
     assert!(srv_http_json["sessions"]["backend_sport"].as_u64().unwrap() > 0);
     let srv_file_json: serde_json::Value =
         serde_json::from_str(&std::fs::read_to_string(&srv_status_file).unwrap()).unwrap();

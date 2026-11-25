@@ -10,9 +10,7 @@ mod telemetry;
 
 use crate::bench_tools::{print_cpu_info, run_bench, run_loadgen, run_sink};
 use crate::client::{run_client, ClientConfig};
-use crate::constants::{
-    DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_WAN_MTU,
-};
+use crate::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_WAN_MTU};
 use crate::protocol::{
     detect_cpu_accel, trigger_shutdown_wakers, CipherPref, CipherSuite, DtlsMinVersion,
 };
@@ -329,9 +327,7 @@ fn run() -> Result<(), pico_args::Error> {
             let rtt_iters: usize = args
                 .opt_free_from_str()?
                 .unwrap_or(DEFAULT_LOADGEN_RTT_ITERS);
-            let streams: usize = args
-                .opt_free_from_str()?
-                .unwrap_or(DEFAULT_LOADGEN_STREAMS);
+            let streams: usize = args.opt_free_from_str()?.unwrap_or(DEFAULT_LOADGEN_STREAMS);
             check_no_extra(args);
             run_loadgen(&target, packets, size, rate_mbps, rtt_iters, streams);
         }

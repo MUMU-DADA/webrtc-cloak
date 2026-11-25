@@ -143,9 +143,7 @@ pub(super) enum WorkerCmd {
         pkt: Vec<u8>,
     },
     /// Owner worker delivers verified migrated `ServerSession` (with intact `backend_sock`!) to new worker.
-    MigrateInstall {
-        sess: Box<ServerSession>,
-    },
+    MigrateInstall { sess: Box<ServerSession> },
     /// MBB scheduled DTLS 1.3 rekey: new worker asks old owner worker to verify handover proof and
     /// atomically transfer `backend_sock` ownership to `new_ufrag`.
     HandoverExtract {
@@ -162,10 +160,7 @@ pub(super) enum WorkerCmd {
         backend_lport: u16,
     },
     /// Handover finished without a socket to transfer (unbound old session) or failed verification.
-    HandoverAckOnly {
-        new_ufrag: String,
-        ok: bool,
-    },
+    HandoverAckOnly { new_ufrag: String, ok: bool },
     /// Rare draining-window ECMP-reordered uplink packet forwarded from old session (`ForwardRemote`)
     /// with bounded hop count (`hops_left`) to survive chained MBB handovers / cross-worker migrations.
     DrainUplinkForward {
@@ -174,10 +169,7 @@ pub(super) enum WorkerCmd {
         hops_left: u8,
     },
     /// Bounce an in-flight SRTP packet that raced ahead of `MigrateInstall` back to the new owner worker.
-    ReprocessSrtp {
-        peer_addr: SocketAddr,
-        pkt: Vec<u8>,
-    },
+    ReprocessSrtp { peer_addr: SocketAddr, pkt: Vec<u8> },
 }
 
 struct WorkerInbox {
@@ -233,14 +225,19 @@ impl SharedV4Registry {
     }
 
     /// P0-3 fix: NEVER wildcard-delete when `mi_key_mig` is `None` (unready sessions never registered!).
-    pub(super) fn unregister_session(&self, ufrag: &str, worker_id: usize, mi_key_mig: Option<[u8; 32]>) {
+    pub(super) fn unregister_session(
+        &self,
+        ufrag: &str,
+        worker_id: usize,
+        mi_key_mig: Option<[u8; 32]>,
+    ) {
         let Some(mk) = mi_key_mig else {
             return;
         };
         if let Ok(mut idx) = self.ufrag_index.lock() {
             let matches = idx
                 .get(ufrag)
-                .map_or(false, |m| m.worker_id == worker_id && m.mi_key_mig == mk);
+                .is_some_and(|m| m.worker_id == worker_id && m.mi_key_mig == mk);
             if matches {
                 idx.remove(ufrag);
             }
@@ -248,7 +245,10 @@ impl SharedV4Registry {
     }
 
     pub(super) fn lookup_ufrag(&self, ufrag: &str) -> Option<ActiveSessionMeta> {
-        self.ufrag_index.lock().ok().and_then(|idx| idx.get(ufrag).copied())
+        self.ufrag_index
+            .lock()
+            .ok()
+            .and_then(|idx| idx.get(ufrag).copied())
     }
 
     /// P0-4 fix: Bounded inbox capacity prevents memory exhaustion under same-PSK flooding.

@@ -83,12 +83,24 @@ pub(super) fn print_json_report(
     hi: &Highlights,
     total_s: f64,
 ) {
-    let passed_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Pass).count();
-    let skipped_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Skip).count();
-    let failed_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Fail).count();
+    let passed_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Pass)
+        .count();
+    let skipped_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Skip)
+        .count();
+    let failed_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Fail)
+        .count();
     println!("{{");
     println!("  \"version\": \"{}\",", env!("CARGO_PKG_VERSION"));
-    println!("  \"mode\": \"{}\",", if hi.is_remote { "remote" } else { "local" });
+    println!(
+        "  \"mode\": \"{}\",",
+        if hi.is_remote { "remote" } else { "local" }
+    );
     if let Some(ref tgt) = hi.target_label {
         println!("  \"target\": \"{}\",", json_escape(tgt));
     }
@@ -120,55 +132,79 @@ pub(super) fn print_json_report(
     );
     println!(
         "    \"wan_p50_ms\": {},",
-        hi.wan_p50_ms.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.wan_p50_ms
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"wan_loss_pct\": {},",
-        hi.wan_loss_pct.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.wan_loss_pct
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"wan_mtu_verified\": {},",
-        hi.wan_mtu_pass.map(|v| v.to_string()).unwrap_or_else(|| "null".into())
+        hi.wan_mtu_pass
+            .map(|v| v.to_string())
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"wire_overhead_1200b_pct\": {},",
-        hi.overhead_pct.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.overhead_pct
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!("    \"max_wire_udp_bytes\": {},", hi.max_wire_udp);
     println!(
         "    \"blackhole_recovery_s\": {},",
-        hi.blackhole_recover_s.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.blackhole_recover_s
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"server_restart_recovery_s\": {},",
-        hi.restart_recover_s.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.restart_recover_s
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!("    \"active_probes_blocked\": {},", hi.probes_blocked);
     println!("    \"active_probes_total\": {},", hi.probes_total);
     println!(
         "    \"loopback_goodput_mbps\": {},",
-        hi.goodput_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into())
+        hi.goodput_mbps
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!("    \"cpu_cores\": {},", hi.cpu_cores);
     println!(
         "    \"cpu_1c_aes128_gcm_mbps\": {},",
-        hi.cpu_aes_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into())
+        hi.cpu_aes_mbps
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"cpu_1c_chacha20_mbps\": {},",
-        hi.cpu_chacha_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into())
+        hi.cpu_chacha_mbps
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"cpu_1c_blake2b_mbps\": {},",
-        hi.cpu_blake2b_mbps.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into())
+        hi.cpu_blake2b_mbps
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"cpu_multicore_gbps\": {},",
-        hi.cpu_multicore_gbps.map(|v| format!("{:.2}", v)).unwrap_or_else(|| "null".into())
+        hi.cpu_multicore_gbps
+            .map(|v| format!("{:.2}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!(
         "    \"cpu_p256_certs_per_s\": {}",
-        hi.cpu_p256_certs_per_s.map(|v| format!("{:.1}", v)).unwrap_or_else(|| "null".into())
+        hi.cpu_p256_certs_per_s
+            .map(|v| format!("{:.1}", v))
+            .unwrap_or_else(|| "null".into())
     );
     println!("  }},");
     println!("  \"scenarios\": [");
@@ -200,9 +236,18 @@ pub(super) fn print_pretty_report(
     total_s: f64,
 ) {
     let p = Palette::new(opts.color);
-    let passed_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Pass).count();
-    let skipped_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Skip).count();
-    let failed_cnt = results.iter().filter(|r| r.status == ScenarioStatus::Fail).count();
+    let passed_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Pass)
+        .count();
+    let skipped_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Skip)
+        .count();
+    let failed_cnt = results
+        .iter()
+        .filter(|r| r.status == ScenarioStatus::Fail)
+        .count();
     let total_cnt = results.len();
     let all_ok = failed_cnt == 0;
 
@@ -302,13 +347,38 @@ pub(super) fn print_pretty_report(
     );
     println!(
         "{}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{} {}│{}",
-        p.cyan, p.reset, p.bold, pad_right("ID", w_id), p.reset,
-        p.cyan, p.reset, p.bold, pad_right("Scenario", w_name), p.reset,
-        p.cyan, p.reset, p.bold, pad_right(cond_col_hdr, w_cond), p.reset,
-        p.cyan, p.reset, p.bold, pad_right("Status", w_stat), p.reset,
-        p.cyan, p.reset, p.bold, pad_right("Key Measured Metrics", w_met), p.reset,
-        p.cyan, p.reset, p.bold, pad_left("Time", w_time), p.reset,
-        p.cyan, p.reset
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_right("ID", w_id),
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_right("Scenario", w_name),
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_right(cond_col_hdr, w_cond),
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_right("Status", w_stat),
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_right("Key Measured Metrics", w_met),
+        p.reset,
+        p.cyan,
+        p.reset,
+        p.bold,
+        pad_left("Time", w_time),
+        p.reset,
+        p.cyan,
+        p.reset
     );
     println!(
         "{}├{}┼{}┼{}┼{}┼{}┼{}┤{}",
@@ -332,13 +402,37 @@ pub(super) fn print_pretty_report(
         let time_s = format!("{:.2}s", r.elapsed_s);
         println!(
             "{}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{} {}│{} {}{}{}{} {}│{} {} {}│{} {}{}{} {}│{}",
-            p.cyan, p.reset, p.dim, pad_right(&id_s, w_id), p.reset,
-            p.cyan, p.reset, p.white, pad_right(r.name, w_name), p.reset,
-            p.cyan, p.reset, p.dim, pad_right(r.condition, w_cond), p.reset,
-            p.cyan, p.reset, p.bold, st_col, pad_right(st_txt, w_stat), p.reset,
-            p.cyan, p.reset, pad_right(&r.metrics, w_met),
-            p.cyan, p.reset, p.dim, pad_left(&time_s, w_time), p.reset,
-            p.cyan, p.reset
+            p.cyan,
+            p.reset,
+            p.dim,
+            pad_right(&id_s, w_id),
+            p.reset,
+            p.cyan,
+            p.reset,
+            p.white,
+            pad_right(r.name, w_name),
+            p.reset,
+            p.cyan,
+            p.reset,
+            p.dim,
+            pad_right(r.condition, w_cond),
+            p.reset,
+            p.cyan,
+            p.reset,
+            p.bold,
+            st_col,
+            pad_right(st_txt, w_stat),
+            p.reset,
+            p.cyan,
+            p.reset,
+            pad_right(&r.metrics, w_met),
+            p.cyan,
+            p.reset,
+            p.dim,
+            pad_left(&time_s, w_time),
+            p.reset,
+            p.cyan,
+            p.reset
         );
     }
 
@@ -355,7 +449,9 @@ pub(super) fn print_pretty_report(
     );
 
     let cpu_1c_str = match (hi.cpu_aes_mbps, hi.cpu_chacha_mbps, hi.cpu_blake2b_mbps) {
-        (Some(a), Some(c), Some(b)) => format!("AES {:.0} / ChaCha {:.0} / B2B {:.0} Mbps", a, c, b),
+        (Some(a), Some(c), Some(b)) => {
+            format!("AES {:.0} / ChaCha {:.0} / B2B {:.0} Mbps", a, c, b)
+        }
         _ => "N/A".into(),
     };
     let cpu_mc_str = hi

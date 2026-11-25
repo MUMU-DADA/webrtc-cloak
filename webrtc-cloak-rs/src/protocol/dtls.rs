@@ -120,7 +120,11 @@ pub fn validate_dtls_datagram(pkt: &[u8], ready_only_alert: bool) -> bool {
             if (b0 & DTLS13_FLAG_CID) != 0 {
                 return false; // Connection ID (C=1) not supported
             }
-            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 { 2usize } else { 1usize };
+            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 {
+                2usize
+            } else {
+                1usize
+            };
             let has_len = (b0 & DTLS13_FLAG_LEN) != 0;
             let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
             if pos + hdr_len > pkt.len() {
@@ -281,9 +285,15 @@ pub fn generate_ephemeral_webrtc_cert() -> DtlsCertificate {
         .as_bytes()
         .to_vec();
 
-    let alg_ecdsa_sha256 = der_tlv(0x30, &der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]));
+    let alg_ecdsa_sha256 = der_tlv(
+        0x30,
+        &der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x04, 0x03, 0x02]),
+    );
     let mut spki_alg_inner = der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x02, 0x01]);
-    spki_alg_inner.extend_from_slice(&der_tlv(0x06, &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07]));
+    spki_alg_inner.extend_from_slice(&der_tlv(
+        0x06,
+        &[0x2A, 0x86, 0x48, 0xCE, 0x3D, 0x03, 0x01, 0x07],
+    ));
     let spki_alg = der_tlv(0x30, &spki_alg_inner);
 
     let mut cn_atv = der_tlv(0x06, &[0x55, 0x04, 0x03]);
@@ -347,8 +357,7 @@ pub struct CertCache {
 
 impl CertCache {
     pub fn new() -> Self {
-        let ttl =
-            rand_duration_range_ms(DTLS_CERT_CACHE_TTL_MIN_MS, DTLS_CERT_CACHE_TTL_MAX_MS);
+        let ttl = rand_duration_range_ms(DTLS_CERT_CACHE_TTL_MIN_MS, DTLS_CERT_CACHE_TTL_MAX_MS);
         Self {
             cert: generate_ephemeral_webrtc_cert(),
             expires_at: Instant::now() + ttl,
@@ -461,9 +470,7 @@ fn build_single_dimpl_config(
     // Server only restricts allow-list when forcing ChaCha20 or AES-GCM explicitly.
     if !is_client && want_chacha {
         builder = builder
-            .dtls12_cipher_suites(&[
-                Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256,
-            ])
+            .dtls12_cipher_suites(&[Dtls12CipherSuite::ECDHE_ECDSA_CHACHA20_POLY1305_SHA256])
             .dtls13_cipher_suites(&[Dtls13CipherSuite::CHACHA20_POLY1305_SHA256]);
     } else if !is_client && pref == CipherPref::Fixed(CipherSuite::Aes128Gcm) {
         builder = builder
@@ -490,8 +497,7 @@ pub fn build_dimpl_config_pool(
     let max_dtls_mtu = if wan_mtu > 0 {
         wan_mtu
             .saturating_sub(IPV4_UDP_HDR_LEN)
-            .min(DTLS_MAX_MTU)
-            .max(DTLS_MIN_MTU)
+            .clamp(DTLS_MIN_MTU, DTLS_MAX_MTU)
     } else {
         DTLS_MAX_MTU
     };
@@ -520,7 +526,11 @@ pub fn build_dimpl_config_pool(
 
 /// Build a single `dimpl` DTLS 1.3 / 1.2 Config (default WAN MTU).
 #[allow(dead_code)]
-pub fn build_dimpl_config(pref: CipherPref, cpu: &CpuAccelInfo, is_client: bool) -> Arc<DtlsConfig> {
+pub fn build_dimpl_config(
+    pref: CipherPref,
+    cpu: &CpuAccelInfo,
+    is_client: bool,
+) -> Arc<DtlsConfig> {
     build_single_dimpl_config(pref, cpu, is_client, DTLS_DEFAULT_MTU)
 }
 
@@ -536,7 +546,11 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
             if (b0 & DTLS13_FLAG_CID) != 0 {
                 return None;
             }
-            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 { 2usize } else { 1usize };
+            let seq_len = if (b0 & DTLS13_FLAG_SEQ16) != 0 {
+                2usize
+            } else {
+                1usize
+            };
             let has_len = (b0 & DTLS13_FLAG_LEN) != 0;
             let hdr_len = 1 + seq_len + if has_len { 2 } else { 0 };
             if pos + hdr_len > datagram.len() {
@@ -583,7 +597,7 @@ pub fn extract_dtls_server_hello_suite(datagram: &[u8]) -> Option<u16> {
                 && sh_end <= hs.len()
                 && hs[12] == DTLS_VER_MAJOR
                 && hs[13] == DTLS_VER_MINOR_12
-                && &hs[14..46] != &TLS13_HRR_RANDOM
+                && hs[14..46] != TLS13_HRR_RANDOM
             {
                 let sid_len = hs[46] as usize;
                 let cs_pos = 47 + sid_len;

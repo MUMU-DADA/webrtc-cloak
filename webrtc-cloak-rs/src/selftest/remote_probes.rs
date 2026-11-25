@@ -98,7 +98,8 @@ pub(super) fn run_remote_steps_06_to_09(
                                         if rx_set.insert(s) {
                                             sess.rx_srtp_pkts += 1;
                                             if let Some(t_send) = sent_at.get(&s) {
-                                                rtts_ms.push(t_send.elapsed().as_secs_f64() * 1000.0);
+                                                rtts_ms
+                                                    .push(t_send.elapsed().as_secs_f64() * 1000.0);
                                             }
                                             if let Some(m) = max_seq {
                                                 if s < m {
@@ -116,10 +117,8 @@ pub(super) fn run_remote_steps_06_to_09(
                             PacketKind::Dtls => {
                                 sess.pump_dtls(Some(pkt));
                             }
-                            PacketKind::Srtcp => {
-                                if sess.cipher.verify_srtcp(pkt).is_some() {
-                                    sess.dl_srtcp_verified += 1;
-                                }
+                            PacketKind::Srtcp if sess.cipher.verify_srtcp(pkt).is_some() => {
+                                sess.dl_srtcp_verified += 1;
                             }
                             _ => {}
                         }
@@ -160,10 +159,8 @@ pub(super) fn run_remote_steps_06_to_09(
                                 }
                             }
                         }
-                        PacketKind::Srtcp => {
-                            if sess.cipher.verify_srtcp(pkt).is_some() {
-                                sess.dl_srtcp_verified += 1;
-                            }
+                        PacketKind::Srtcp if sess.cipher.verify_srtcp(pkt).is_some() => {
+                            sess.dl_srtcp_verified += 1;
                         }
                         _ => {}
                     }
@@ -308,7 +305,11 @@ pub(super) fn run_remote_steps_06_to_09(
                     oversize_udp,
                     if guard_dropped { "DROP" } else { "LEAK" }
                 ),
-                detail: format!("probes=[{}] max_wire={}B", size_notes.join(" "), max_wire_seen),
+                detail: format!(
+                    "probes=[{}] max_wire={}B",
+                    size_notes.join(" "),
+                    max_wire_seen
+                ),
                 elapsed_s: t7.elapsed().as_secs_f64(),
             };
             report_step(7, r.name, &r);

@@ -272,7 +272,7 @@ pub fn peek_stun_request_username(data: &[u8]) -> Option<&str> {
     let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
     if msg_type != STUN_BINDING_REQUEST
         || magic != STUN_MAGIC_COOKIE
-        || msg_len % 4 != 0
+        || !msg_len.is_multiple_of(4)
         || STUN_HDR_LEN + msg_len != data.len()
     {
         return None;
@@ -332,7 +332,10 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
     let msg_type = u16::from_be_bytes([data[0], data[1]]);
     let msg_len = u16::from_be_bytes([data[2], data[3]]) as usize;
     let magic = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    if magic != STUN_MAGIC_COOKIE || msg_len % 4 != 0 || STUN_HDR_LEN + msg_len != data.len() {
+    if magic != STUN_MAGIC_COOKIE
+        || !msg_len.is_multiple_of(4)
+        || STUN_HDR_LEN + msg_len != data.len()
+    {
         return None;
     }
     let mut txid = [0u8; 12];

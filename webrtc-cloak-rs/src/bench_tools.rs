@@ -145,7 +145,14 @@ pub(crate) fn run_sink(listen: &str, workers: usize) {
     }
 }
 
-pub(crate) fn run_loadgen(target: &str, packets: u64, size: usize, rate_mbps: f64, rtt_iters: usize, streams: usize) {
+pub(crate) fn run_loadgen(
+    target: &str,
+    packets: u64,
+    size: usize,
+    rate_mbps: f64,
+    rtt_iters: usize,
+    streams: usize,
+) {
     let streams = streams.max(1);
     if streams == 1 {
         let sock = UdpSocket::bind("127.0.0.1:0").expect("bind loadgen");
@@ -273,7 +280,8 @@ pub(crate) fn run_loadgen(target: &str, packets: u64, size: usize, rate_mbps: f6
             // Complete independent STUN + DTLS handshake on this 5-tuple first (with retry)
             let mut rb = [0u8; CTRL_FRAME_BUF_LEN];
             let hi = format!("HI_STREAM_{}", sid);
-            sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+            sock.set_read_timeout(Some(Duration::from_millis(500)))
+                .unwrap();
             let mut ok = false;
             for _ in 0..6 {
                 let _ = sock.send(hi.as_bytes());

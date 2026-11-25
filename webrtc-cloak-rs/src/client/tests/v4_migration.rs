@@ -40,7 +40,9 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
     let b_stop = Arc::clone(&stop_backend);
 
     let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
-    backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    backend_sock
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut locked_peer: Option<SocketAddr> = None;
@@ -163,7 +165,8 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 2048];
@@ -217,7 +220,11 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
         }
         thread::sleep(Duration::from_millis(30));
     }
-    assert_ne!(port2, 0, "MBB byte-budget rotation must switch off port {}", port1);
+    assert_ne!(
+        port2, 0,
+        "MBB byte-budget rotation must switch off port {}",
+        port1
+    );
     assert!(
         *dtls_by_port.lock().unwrap().get(&port2).unwrap_or(&0) >= 2,
         "scheduled MBB rotation MUST run fresh DTLS 1.3 handshake on port2 (unlinkable outer identity!)"
@@ -253,7 +260,11 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
     }
     stop_backend.store(true, Ordering::SeqCst);
 
-    assert!(recovered_after_mig, "1-RTT ICE migration MUST recover from asymmetric blackhole on port {}", port2);
+    assert!(
+        recovered_after_mig,
+        "1-RTT ICE migration MUST recover from asymmetric blackhole on port {}",
+        port2
+    );
     assert_eq!(
         *dtls_by_port.lock().unwrap().get(&port3).unwrap_or(&0),
         0,
@@ -265,7 +276,11 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
         0,
         "StrictPinnedUdpBackend MUST see ZERO backend_lport changes across BOTH MBB handover AND 1-RTT migration!"
     );
-    assert!(ticks_seen >= 5, "async backend ticks must keep flowing across cutovers (got {})", ticks_seen);
+    assert!(
+        ticks_seen >= 5,
+        "async backend ticks must keep flowing across cutovers (got {})",
+        ticks_seen
+    );
 }
 
 /// V4.0 Scenario #2 (Carbon Red-Team):
@@ -285,7 +300,9 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     let stop_all = Arc::new(AtomicBool::new(false));
     let b_stop = Arc::clone(&stop_all);
     let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
-    backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    backend_sock
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let big = vec![0xEEu8; 1000];
@@ -422,7 +439,8 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
     let mut rbuf = [0u8; 2048];
     let mut ready = false;
@@ -440,11 +458,17 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     }
     assert!(ready);
     let port1 = latest_port.load(Ordering::SeqCst);
-    let victim_ufrag = captured_ufrag.lock().unwrap().clone().expect("ufrag captured");
+    let victim_ufrag = captured_ufrag
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("ufrag captured");
 
     // Attack 2a: Same-PSK attacker tries forging STUN migration with victim's plaintext ufrag using global PSK!
     let evil_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
-    evil_sock.set_read_timeout(Some(Duration::from_millis(120))).unwrap();
+    evil_sock
+        .set_read_timeout(Some(Duration::from_millis(120)))
+        .unwrap();
     evil_sock.connect(("127.0.0.1", server_port)).unwrap();
     let parts: Vec<&str> = victim_ufrag.split(':').collect();
     let mut evil_ice = SessionIceParams::generate();
@@ -482,7 +506,9 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     while !e_conn && t_hs.elapsed() < Duration::from_secs(3) {
         loop {
             match edtls.poll_output(&mut dbuf) {
-                DtlsOutput::Packet(p) => { let _ = evil_sock.send(p); }
+                DtlsOutput::Packet(p) => {
+                    let _ = evil_sock.send(p);
+                }
                 DtlsOutput::KeyingMaterial(km, _) => ekm = Some(km.to_vec()),
                 DtlsOutput::Connected => e_conn = true,
                 DtlsOutput::Timeout(_) => break,
@@ -508,13 +534,17 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     forged_ho.extend_from_slice(victim_ufrag.as_bytes());
     forged_ho.extend_from_slice(&[0xAAu8; 32]); // Forged proof!
     let mut wbuf = [0u8; 512];
-    let wn = ecipher.wrap_control_into(SRTP_HANDOVER_MAGIC, &forged_ho, &mut wbuf).unwrap();
+    let wn = ecipher
+        .wrap_control_into(SRTP_HANDOVER_MAGIC, &forged_ho, &mut wbuf)
+        .unwrap();
     let _ = evil_sock.send(&wbuf[..wn]);
     let mut saw_reject_ack = false;
     for _ in 0..5 {
         if let Ok(rn) = evil_sock.recv(&mut rbuf) {
             if demux_rfc7983(&rbuf[..rn]) == PacketKind::Srtp {
-                if let Some(SrtpFrame::Handover(hn)) = ecipher.unwrap_into_ex(&rbuf[..rn], &mut wbuf) {
+                if let Some(SrtpFrame::Handover(hn)) =
+                    ecipher.unwrap_into_ex(&rbuf[..rn], &mut wbuf)
+                {
                     if hn >= 2 && wbuf[0] == 0x02 && wbuf[1] == 0x00 {
                         saw_reject_ack = true;
                         break;
@@ -523,7 +553,10 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
             }
         }
     }
-    assert!(saw_reject_ack, "forged 0xFFFC handover proof MUST be rejected (status=0x00)!");
+    assert!(
+        saw_reject_ack,
+        "forged 0xFFFC handover proof MUST be rejected (status=0x00)!"
+    );
 
     // Attack 1: Trigger blackhole migration while spoofing victim_sock + blasting heavy downlink!
     blackhole_port.store(port1, Ordering::SeqCst);
@@ -541,8 +574,14 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     }
     stop_all.store(true, Ordering::SeqCst);
 
-    assert!(spoof_fired.load(Ordering::SeqCst), "spoof race must have been injected");
-    assert!(healed, "legitimate client MUST still recover via fresh-txid retry despite spoofed racer!");
+    assert!(
+        spoof_fired.load(Ordering::SeqCst),
+        "spoof race must have been injected"
+    );
+    assert!(
+        healed,
+        "legitimate client MUST still recover via fresh-txid retry despite spoofed racer!"
+    );
     let vbytes = victim_rx_bytes.load(Ordering::SeqCst);
     assert!(
         vbytes < 250,
@@ -550,4 +589,3 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
         vbytes
     );
 }
-

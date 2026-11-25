@@ -20,12 +20,21 @@ use std::sync::{Arc, Barrier};
 use std::thread;
 use std::time::{Duration, Instant};
 
-pub(super) fn test_07_asymmetric_blackhole(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_07_asymmetric_blackhole(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-07-blackhole-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
     let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 1, 200);
 
@@ -88,19 +97,38 @@ pub(super) fn test_07_asymmetric_blackhole(opts: &SelftestOptions, hi: &mut High
             "heal {} | {}->{} | dl_rtcp={} | ka_retx={}",
             rec_str, port1, port2, snap.dl_srtcp_during_blackhole, snap.blackhole_ka_retransmits
         ),
-        detail: format!("ports_seen={:?} uplink_dropped={}", snap.ports_seen, snap.dropped_by_proxy),
+        detail: format!(
+            "ports_seen={:?} uplink_dropped={}",
+            snap.ports_seen, snap.dropped_by_proxy
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
 
-pub(super) fn test_08_server_restart(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_08_server_restart(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-08-srv-restart-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let server1 = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let server1 = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
-    let client = ManagedClient::start(proxy.port, psk.clone(), opts.cipher_pref, opts.wan_mtu, 1, 200);
+    let client = ManagedClient::start(
+        proxy.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+        1,
+        200,
+    );
 
     let app = connect_app(client.port, 200);
     if handshake_app(&app, Duration::from_secs(3)).is_none() {
@@ -120,7 +148,13 @@ pub(super) fn test_08_server_restart(opts: &SelftestOptions, hi: &mut Highlights
 
     // Stop server #1 cleanly and immediately start server #2 on the EXACT SAME port!
     server1.shutdown();
-    let _server2 = ManagedServer::start(server_port, backend.port, psk, opts.cipher_pref, opts.wan_mtu);
+    let _server2 = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let rs_t0 = Instant::now();
 
     let mut rbuf = [0u8; CTRL_FRAME_BUF_LEN];
@@ -154,33 +188,53 @@ pub(super) fn test_08_server_restart(opts: &SelftestOptions, hi: &mut Highlights
         name: "Server Restart Recovery",
         condition: "Kill & respawn server",
         status: ScenarioStatus::from_bool(passed),
-        metrics: format!("heal {} | rekey {}->{} | NEW-M-01 OK", rec_str, port1, port2),
-        detail: format!("server_port={} ports_seen={:?}", server_port, snap.ports_seen),
+        metrics: format!(
+            "heal {} | rekey {}->{} | NEW-M-01 OK",
+            rec_str, port1, port2
+        ),
+        detail: format!(
+            "server_port={} ports_seen={:?}",
+            server_port, snap.ports_seen
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
 
 fn send_probe_expect_silence(server_addr: SocketAddr, payload: &[u8]) -> usize {
     let atk = UdpSocket::bind("127.0.0.1:0").expect("bind attacker");
-    atk.set_read_timeout(Some(Duration::from_millis(110))).unwrap();
+    atk.set_read_timeout(Some(Duration::from_millis(110)))
+        .unwrap();
     atk.connect(server_addr).unwrap();
     let _ = atk.send(payload);
     let mut buf = [0u8; PROBE_IO_BUF_LEN];
-    match atk.recv(&mut buf) {
-        Ok(n) => n,
-        Err(_) => 0,
-    }
+    atk.recv(&mut buf).unwrap_or_default()
 }
 
-pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_09_active_probing_defense(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-09-security-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
     let server_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
-    let client = ManagedClient::start(proxy.port, psk.clone(), opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        proxy.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     // Bring up a legitimate tunnel concurrently to verify probes don't disrupt real sessions
     // AND to capture a real valid STUN request for cross-port replay testing!
@@ -275,7 +329,8 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
     hi.probes_blocked = blocked;
     hi.probes_total = probes.len();
 
-    let passed = blocked == probes.len() && leaked_bytes == 0 && legit_ok && !replay_stun.is_empty();
+    let passed =
+        blocked == probes.len() && leaked_bytes == 0 && legit_ok && !replay_stun.is_empty();
     ScenarioResult {
         id: 9,
         code: "active_probe",
@@ -298,12 +353,21 @@ pub(super) fn test_09_active_probing_defense(opts: &SelftestOptions, hi: &mut Hi
     }
 }
 
-pub(super) fn test_10_multistream_throughput(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_10_multistream_throughput(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let psk = b"selftest-10-throughput-psk".to_vec();
     let backend = EchoBackend::start();
     let server_port = reserve_free_port();
-    let _server = ManagedServer::start(server_port, backend.port, psk.clone(), opts.cipher_pref, opts.wan_mtu);
+    let _server = ManagedServer::start(
+        server_port,
+        backend.port,
+        psk.clone(),
+        opts.cipher_pref,
+        opts.wan_mtu,
+    );
     // Direct client -> server (no impairment proxy) to measure true tunnel forwarding engine
     let client = ManagedClient::start(server_port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
 
@@ -382,7 +446,13 @@ pub(super) fn test_10_multistream_throughput(opts: &SelftestOptions, hi: &mut Hi
             "{}/{} streams | {:.0} Mbps ({:.1} kpps) | {:.1}% rx",
             streams_ok, streams, mbps, kpps, delivery_pct
         ),
-        detail: format!("rx={}/{} pkts ({:.2} MB) in {:.3}s", bst.sink_pkts, burst_pkts, bst.sink_bytes as f64 / 1e6, dur),
+        detail: format!(
+            "rx={}/{} pkts ({:.2} MB) in {:.3}s",
+            bst.sink_pkts,
+            burst_pkts,
+            bst.sink_bytes as f64 / 1e6,
+            dur
+        ),
         elapsed_s: t0.elapsed().as_secs_f64(),
     }
 }
@@ -429,26 +499,27 @@ fn bench_single_suite(suite: CipherSuite, count: usize, payload_bytes: usize) ->
     (mbps, kpps, integrity_ok)
 }
 
-pub(super) fn test_11_cpu_single_core_crypto(_opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_11_cpu_single_core_crypto(
+    _opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let count = 40_000usize;
     let payload_bytes = 1200usize;
 
-    let (aes_mbps, aes_kpps, aes_ok) = bench_single_suite(CipherSuite::Aes128Gcm, count, payload_bytes);
+    let (aes_mbps, aes_kpps, aes_ok) =
+        bench_single_suite(CipherSuite::Aes128Gcm, count, payload_bytes);
     let (chacha_mbps, chacha_kpps, chacha_ok) =
         bench_single_suite(CipherSuite::ChaCha20Poly1305, count, payload_bytes);
-    let (b2b_mbps, b2b_kpps, b2b_ok) = bench_single_suite(CipherSuite::Blake2b, count, payload_bytes);
+    let (b2b_mbps, b2b_kpps, b2b_ok) =
+        bench_single_suite(CipherSuite::Blake2b, count, payload_bytes);
 
     hi.cpu_aes_mbps = Some(aes_mbps);
     hi.cpu_chacha_mbps = Some(chacha_mbps);
     hi.cpu_blake2b_mbps = Some(b2b_mbps);
 
-    let passed = aes_ok
-        && chacha_ok
-        && b2b_ok
-        && aes_mbps > 50.0
-        && chacha_mbps > 50.0
-        && b2b_mbps > 50.0;
+    let passed =
+        aes_ok && chacha_ok && b2b_ok && aes_mbps > 50.0 && chacha_mbps > 50.0 && b2b_mbps > 50.0;
 
     ScenarioResult {
         id: 11,
@@ -468,7 +539,10 @@ pub(super) fn test_11_cpu_single_core_crypto(_opts: &SelftestOptions, hi: &mut H
     }
 }
 
-pub(super) fn test_12_cpu_multicore_and_p256(opts: &SelftestOptions, hi: &mut Highlights) -> ScenarioResult {
+pub(super) fn test_12_cpu_multicore_and_p256(
+    opts: &SelftestOptions,
+    hi: &mut Highlights,
+) -> ScenarioResult {
     let t0 = Instant::now();
     let cpu = detect_cpu_accel();
     let suite = match opts.cipher_pref {
@@ -530,8 +604,7 @@ pub(super) fn test_12_cpu_multicore_and_p256(opts: &SelftestOptions, hi: &mut Hi
             }
         }
     }
-    let total_bits =
-        ((joined as u64) * (per_core_pkts as u64) * (payload_bytes as u64) * 8) as f64;
+    let total_bits = ((joined as u64) * (per_core_pkts as u64) * (payload_bytes as u64) * 8) as f64;
     let agg_gbps = total_bits / max_dt / 1e9;
     hi.cpu_multicore_gbps = Some(agg_gbps);
 

@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "webrtc-cloak-rs/**"
+      - ".github/workflows/ci.yml"
+  pull_request:
+    paths:
+      - "webrtc-cloak-rs/**"
+      - ".github/workflows/ci.yml"
+  workflow_dispatch:
+
+jobs:
+  check-and-test:
+    name: Format, Clippy, Test & 32-bit Guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+          targets: armv5te-unknown-linux-musleabi
+
+      - name: Check formatting
+        working-directory: webrtc-cloak-rs
+        run: cargo fmt --all -- --check
+
+      - name: Run clippy
+        working-directory: webrtc-cloak-rs
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Run unit & integration tests
+        working-directory: webrtc-cloak-rs
+        run: cargo test --all-targets
+
+      - name: Verify 32-bit armv5te build (no AtomicU64 regression)
+        working-directory: webrtc-cloak-rs
+        run: cargo check --target armv5te-unknown-linux-musleabi

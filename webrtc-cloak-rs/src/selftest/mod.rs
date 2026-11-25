@@ -14,8 +14,7 @@ use self::local_net::{
 };
 use self::local_resilience::{
     test_07_asymmetric_blackhole, test_08_server_restart, test_09_active_probing_defense,
-    test_10_multistream_throughput, test_11_cpu_single_core_crypto,
-    test_12_cpu_multicore_and_p256,
+    test_10_multistream_throughput, test_11_cpu_single_core_crypto, test_12_cpu_multicore_and_p256,
 };
 use self::remote::run_remote_selftest;
 use self::report::{pad_right, print_json_report, print_pretty_report, Palette};
@@ -187,7 +186,7 @@ pub(super) struct Highlights {
 }
 
 pub fn run_selftest(opts: SelftestOptions) -> bool {
-    if let (Some(server_addr), Some(ref psk)) = (opts.server_addr, opts.psk.as_ref()) {
+    if let (Some(server_addr), Some(psk)) = (opts.server_addr, opts.psk.as_ref()) {
         return run_remote_selftest(&opts, server_addr, psk);
     }
 
@@ -206,10 +205,22 @@ pub fn run_selftest(opts: SelftestOptions) -> bool {
         ("Single STUN Drop Immunity", test_06_single_stun_drop),
         ("Asymmetric Uplink Blackhole", test_07_asymmetric_blackhole),
         ("Server Restart Recovery", test_08_server_restart),
-        ("Active Probe & Replay Defense", test_09_active_probing_defense),
-        ("Multi-Stream & Loopback Speed", test_10_multistream_throughput),
-        ("CPU Single-Core Crypto Bench", test_11_cpu_single_core_crypto),
-        ("CPU Multi-Core & P-256 Certs", test_12_cpu_multicore_and_p256),
+        (
+            "Active Probe & Replay Defense",
+            test_09_active_probing_defense,
+        ),
+        (
+            "Multi-Stream & Loopback Speed",
+            test_10_multistream_throughput,
+        ),
+        (
+            "CPU Single-Core Crypto Bench",
+            test_11_cpu_single_core_crypto,
+        ),
+        (
+            "CPU Multi-Core & P-256 Certs",
+            test_12_cpu_multicore_and_p256,
+        ),
     ];
 
     if !opts.json {

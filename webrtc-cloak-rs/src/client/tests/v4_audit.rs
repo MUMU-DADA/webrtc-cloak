@@ -32,7 +32,9 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
     let b_viol = Arc::clone(&port_violations);
 
     let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
-    backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    backend_sock
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut locked: Option<SocketAddr> = None;
@@ -117,7 +119,9 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
                     } else if pt == crate::constants::RTP_AUDIO_PT {
                         let ts = u32::from_be_bytes([pkt[4], pkt[5], pkt[6], pkt[7]]);
                         if let Some((prev_ts, prev_t)) = last_audio_ts_c2s {
-                            if prev_ts == ts && now.duration_since(prev_t) < Duration::from_millis(18) {
+                            if prev_ts == ts
+                                && now.duration_since(prev_t) < Duration::from_millis(18)
+                            {
                                 r_aviol.fetch_add(1, Ordering::SeqCst);
                             }
                         }
@@ -138,7 +142,13 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
                 if (next_r() % 100) < 20 {
                     delay += 15 + (next_r() % 20);
                 }
-                queue.push_back((now + Duration::from_millis(delay), true, cport, cli_addr, pkt.to_vec()));
+                queue.push_back((
+                    now + Duration::from_millis(delay),
+                    true,
+                    cport,
+                    cli_addr,
+                    pkt.to_vec(),
+                ));
             }
             for (&cport, (usock, cli_addr)) in upstreams.iter() {
                 while let Ok(n) = usock.recv(&mut buf) {
@@ -148,7 +158,13 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
                     if (next_r() % 100) < 20 {
                         delay += 15 + (next_r() % 20);
                     }
-                    queue.push_back((now + Duration::from_millis(delay), false, cport, *cli_addr, pkt.to_vec()));
+                    queue.push_back((
+                        now + Duration::from_millis(delay),
+                        false,
+                        cport,
+                        *cli_addr,
+                        pkt.to_vec(),
+                    ));
                 }
             }
             let mut i = 0;
@@ -198,7 +214,8 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
     let mut rbuf = [0u8; 2048];
     let mut ready = false;
@@ -241,7 +258,10 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
     stop_all.store(true, Ordering::SeqCst);
 
     let port2 = latest_port.load(Ordering::SeqCst);
-    assert_ne!(port2, port1, "byte-budget MBB cutover must fire during high-BDP burst!");
+    assert_ne!(
+        port2, port1,
+        "byte-budget MBB cutover must fire during high-BDP burst!"
+    );
     assert_eq!(
         port_violations.load(Ordering::SeqCst),
         0,
@@ -253,7 +273,10 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
         rx_seqs.len()
     );
     // Outer Wire DPI Audit (Carbon Scenario #6):
-    assert!(max_wire_udp.load(Ordering::SeqCst) <= 1460, "outer wire UDP MUST never exceed 1460B!");
+    assert!(
+        max_wire_udp.load(Ordering::SeqCst) <= 1460,
+        "outer wire UDP MUST never exceed 1460B!"
+    );
     assert_eq!(
         audio_burst_violations.load(Ordering::SeqCst),
         0,
@@ -262,7 +285,14 @@ fn v40_high_bdp_loss_reorder_cutover_and_outer_dpi_wire_audit() {
     let vlens = video_lens.lock().unwrap();
     assert!(vlens.len() >= 50);
     let mean = vlens.iter().map(|&x| x as f64).sum::<f64>() / (vlens.len() as f64);
-    let var = vlens.iter().map(|&x| { let d = x as f64 - mean; d * d }).sum::<f64>() / (vlens.len() as f64);
+    let var = vlens
+        .iter()
+        .map(|&x| {
+            let d = x as f64 - mean;
+            d * d
+        })
+        .sum::<f64>()
+        / (vlens.len() as f64);
     let stddev = var.sqrt();
     assert!(
         stddev > 4.0,
@@ -289,7 +319,9 @@ fn v40_linux_multiworker_reuseport_cross_thread_migration_and_handover() {
     let b_viol = Arc::clone(&port_violations);
 
     let backend_sock = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
-    backend_sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+    backend_sock
+        .set_read_timeout(Some(Duration::from_millis(20)))
+        .unwrap();
     thread::spawn(move || {
         let mut buf = [0u8; 4096];
         let mut locked: Option<SocketAddr> = None;
@@ -395,7 +427,8 @@ fn v40_linux_multiworker_reuseport_cross_thread_migration_and_handover() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
     let mut rbuf = [0u8; 2048];
     let mut ready = false;
@@ -445,11 +478,13 @@ fn v40_linux_multiworker_reuseport_cross_thread_migration_and_handover() {
         thread::sleep(Duration::from_millis(60));
     }
     stop_all.store(true, Ordering::SeqCst);
-    assert!(healed, "4-worker SO_REUSEPORT 1-RTT blackhole migration MUST heal!");
+    assert!(
+        healed,
+        "4-worker SO_REUSEPORT 1-RTT blackhole migration MUST heal!"
+    );
     assert_eq!(
         port_violations.load(Ordering::SeqCst),
         0,
         "4-worker SO_REUSEPORT migration + handover MUST keep backend_lport 100% unchanged!"
     );
 }
-

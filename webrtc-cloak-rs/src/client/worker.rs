@@ -151,7 +151,7 @@ impl ClientWorker {
                 .cfg
                 .stop
                 .as_ref()
-                .map_or(false, |s| s.load(Ordering::Relaxed))
+                .is_some_and(|s| s.load(Ordering::Relaxed))
             {
                 self.graceful_shutdown_all();
                 return Ok(());
@@ -228,84 +228,81 @@ impl ClientWorker {
     }
 
     fn maybe_report_telemetry(&mut self, now: Instant) {
-    if let Some(ref th) = self.telemetry {
-        if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
-            self.last_telemetry = now;
-            let mut snap = WorkerSnapshot {
-                tx_bytes_total: self.closed_tx_bytes,
-                rx_bytes_total: self.closed_rx_bytes,
-                tx_pkts_total: self.closed_tx_pkts,
-                rx_pkts_total: self.closed_rx_pkts,
-                auth_drops_total: self.closed_auth_drops,
-                dtls_version: "none",
-                cipher: "none",
-                ..Default::default()
-            };
-            for sess in self.sessions_by_token.values() {
-                snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
-                snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
-                snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
-                snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
-                snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
-                match sess.state {
-                    HandshakeState::Ready if !sess.is_standby => {
-                        snap.active_sessions += 1;
-                        if snap.active_up_sport == 0 {
-                            snap.active_up_sport = sess.local_port;
-                        }
-                        if snap.cipher == "none" {
-                            if let Some(c) = sess.active_cipher {
-                                snap.cipher = c.name();
+        if let Some(ref th) = self.telemetry {
+            if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
+                self.last_telemetry = now;
+                let mut snap = WorkerSnapshot {
+                    tx_bytes_total: self.closed_tx_bytes,
+                    rx_bytes_total: self.closed_rx_bytes,
+                    tx_pkts_total: self.closed_tx_pkts,
+                    rx_pkts_total: self.closed_rx_pkts,
+                    auth_drops_total: self.closed_auth_drops,
+                    dtls_version: "none",
+                    cipher: "none",
+                    ..Default::default()
+                };
+                for sess in self.sessions_by_token.values() {
+                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+                    match sess.state {
+                        HandshakeState::Ready if !sess.is_standby => {
+                            snap.active_sessions += 1;
+                            if snap.active_up_sport == 0 {
+                                snap.active_up_sport = sess.local_port;
+                            }
+                            if snap.cipher == "none" {
+                                if let Some(c) = sess.active_cipher {
+                                    snap.cipher = c.name();
+                                }
+                            }
+                            if snap.dtls_version == "none" {
+                                snap.dtls_version =
+                                    match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
+                                        Some(ProtocolVersion::DTLS1_3) => {
+                                            snap.dual_ssrc = true;
+                                            "1.3"
+                                        }
+                                        Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                        _ if self.cfg.dtls_decoy => "1.3",
+                                        _ => "none",
+                                    };
                             }
                         }
-                        if snap.dtls_version == "none" {
-                            snap.dtls_version = match sess
-                                .dtls
-                                .as_ref()
-                                .and_then(|d| d.protocol_version())
-                            {
-                                Some(ProtocolVersion::DTLS1_3) => {
-                                    snap.dual_ssrc = true;
-                                    "1.3"
-                                }
-                                Some(ProtocolVersion::DTLS1_2) => "1.2",
-                                _ if self.cfg.dtls_decoy => "1.3",
-                                _ => "none",
-                            };
+                        HandshakeState::Migrating => {
+                            snap.migrating_sessions += 1;
+                            if snap.active_up_sport == 0 {
+                                snap.active_up_sport = sess.local_port;
+                            }
                         }
-                    }
-                    HandshakeState::Migrating => {
-                        snap.migrating_sessions += 1;
-                        if snap.active_up_sport == 0 {
-                            snap.active_up_sport = sess.local_port;
+                        HandshakeState::StunWait
+                        | HandshakeState::DtlsHandshake
+                        | HandshakeState::HandoverWait
+                            if !sess.is_standby =>
+                        {
+                            snap.handshaking_sessions += 1;
                         }
+                        _ => {}
                     }
-                    HandshakeState::StunWait
-                    | HandshakeState::DtlsHandshake
-                    | HandshakeState::HandoverWait
-                        if !sess.is_standby =>
-                    {
-                        snap.handshaking_sessions += 1;
-                    }
-                    _ => {}
                 }
+                th.update_worker(self.worker_id, snap);
             }
-            th.update_worker(self.worker_id, snap);
         }
-    }
     }
 
     fn maybe_log_stats(&mut self, now: Instant) {
-    if now.duration_since(self.last_stats) >= self.stats_dur {
-        self.last_stats = now;
-        for sess in self.sessions_by_token.values() {
-            if matches!(
-                sess.state,
-                HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_)
-            ) {
-                continue;
-            }
-            log(
+        if now.duration_since(self.last_stats) >= self.stats_dur {
+            self.last_stats = now;
+            for sess in self.sessions_by_token.values() {
+                if matches!(
+                    sess.state,
+                    HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_)
+                ) {
+                    continue;
+                }
+                log(
                 self.worker_id,
                 &format!(
                     "stats up_sport={} tx={}pkts/{:.1}KB rx={}pkts/{:.1}KB ka={} rtcp={}/{} drops={}",
@@ -320,7 +317,7 @@ impl ClientWorker {
                     sess.auth_drops
                 ),
             );
+            }
         }
-    }
     }
 }

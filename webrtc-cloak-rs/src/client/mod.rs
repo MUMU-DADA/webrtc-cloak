@@ -206,8 +206,8 @@ pub(super) fn schedule_mbb_timers(sess: &mut ClientSession, cfg: &ClientConfig, 
                 .rotate_interval_secs
                 .saturating_mul(4)
                 .max(CLIENT_MBB_HARD_ROTATE_MIN_SECS);
-            let max_h = (min_h.saturating_mul(8) / 5)
-                .max(min_h + CLIENT_MBB_HARD_ROTATE_MIN_GAP_SECS);
+            let max_h =
+                (min_h.saturating_mul(8) / 5).max(min_h + CLIENT_MBB_HARD_ROTATE_MIN_GAP_SECS);
             Some(now + rand_duration_range_ms(min_h * 1000, max_h * 1000))
         } else {
             Some(now + Duration::from_secs(cfg.rotate_interval_secs.saturating_mul(6)))
@@ -225,9 +225,9 @@ pub(super) fn schedule_mbb_timers(sess: &mut ClientSession, cfg: &ClientConfig, 
 
 #[inline]
 pub(super) fn is_client_in_trickle(sess: &mut ClientSession, now: Instant) -> bool {
-    let age_ge_15s = sess.ready_at.map_or(false, |r| {
-        now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS)
-    });
+    let age_ge_15s = sess
+        .ready_at
+        .is_some_and(|r| now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS));
     age_ge_15s && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES
 }
 
@@ -250,8 +250,8 @@ pub(super) fn record_client_media_bytes(
             }
         }
         if sess.next_srtcp_at > now + Duration::from_millis(CLIENT_SRTCP_ACTIVE_MAX_MS) {
-            sess.next_srtcp_at =
-                now + rand_duration_range_ms(CLIENT_SRTCP_ACTIVE_MIN_MS, CLIENT_SRTCP_ACTIVE_MAX_MS);
+            sess.next_srtcp_at = now
+                + rand_duration_range_ms(CLIENT_SRTCP_ACTIVE_MIN_MS, CLIENT_SRTCP_ACTIVE_MAX_MS);
         }
     }
 }

@@ -86,13 +86,18 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
             // Client -> Server direction
             while let Ok((n, cli_addr)) = relay_front.recv_from(&mut buf) {
                 let cport = cli_addr.port();
-                let _ = relay_first_port.compare_exchange(0, cport, Ordering::SeqCst, Ordering::SeqCst);
+                let _ =
+                    relay_first_port.compare_exchange(0, cport, Ordering::SeqCst, Ordering::SeqCst);
                 relay_latest_port.store(cport, Ordering::SeqCst);
 
                 let pkt = &buf[..n];
                 let is_ka_stun = demux_rfc7983(pkt) == PacketKind::Stun
                     && parse_stun(pkt, &relay_psk)
-                        .map(|p| p.authenticated && p.msg_type == STUN_BINDING_REQUEST && !p.use_candidate)
+                        .map(|p| {
+                            p.authenticated
+                                && p.msg_type == STUN_BINDING_REQUEST
+                                && !p.use_candidate
+                        })
                         .unwrap_or(false);
 
                 // Phase 2: Asymmetric uplink blackhole on blackhole_port (0% uplink reaches server!)
@@ -181,7 +186,8 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
 
     // 5. Local app socket (simulating mihomo Hysteria2 client staying on ONE fixed local port)
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(250))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 256];
@@ -207,7 +213,9 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
 
     // Phase 1: Wait for the 1st STUN keepalive drop + RFC 5389 same-txid retransmission recovery
     let t_p1 = Instant::now();
-    while same_txid_retransmits.load(Ordering::SeqCst) == 0 && t_p1.elapsed() < Duration::from_secs(5) {
+    while same_txid_retransmits.load(Ordering::SeqCst) == 0
+        && t_p1.elapsed() < Duration::from_secs(5)
+    {
         let _ = app.send(b"PING_P1");
         let _ = app.recv(&mut rbuf);
         thread::sleep(Duration::from_millis(100));
@@ -360,7 +368,8 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
 
     thread::sleep(Duration::from_millis(80));
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let t0 = Instant::now();
@@ -379,7 +388,10 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
             }
         }
     }
-    assert!(dropped_f5.load(Ordering::SeqCst), "relay should have intercepted DTLS 1.3 Flight 5");
+    assert!(
+        dropped_f5.load(Ordering::SeqCst),
+        "relay should have intercepted DTLS 1.3 Flight 5"
+    );
     assert!(
         ok,
         "client MUST retransmit dropped DTLS 1.3 Flight 5 from Ready state and recover within 3s!"
@@ -489,7 +501,8 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
     });
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
-    app.set_read_timeout(Some(Duration::from_millis(150))).unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(150)))
+        .unwrap();
     app.connect(("127.0.0.1", client_port)).unwrap();
 
     let mut rbuf = [0u8; 256];
@@ -553,4 +566,3 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
         "client MUST fast-reconnect on server graceful BYE well under 3s (keepalive=30s)!"
     );
 }
-

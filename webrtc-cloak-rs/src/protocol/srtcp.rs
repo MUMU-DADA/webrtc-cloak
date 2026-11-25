@@ -78,7 +78,12 @@ impl SrtpCloakCipher {
     ///   - Encrypted compound body contains primary remainder + session-constant CNAME SDES (PT=202)
     ///     + smooth randomized FB (PT=205/206) + optional trailing BYE (PT=203) when `include_bye == true`.
     ///   - Wire layout for ALL suites: `[8B Hdr] || [Ciphertext] || [16B Tag] || [4B E_SRTCP_Index]` (0-based).
-    pub fn build_srtcp(&mut self, has_rx_media: bool, is_sender: bool, include_bye: bool) -> Vec<u8> {
+    pub fn build_srtcp(
+        &mut self,
+        has_rx_media: bool,
+        is_sender: bool,
+        include_bye: bool,
+    ) -> Vec<u8> {
         let video_sent = self.video_tx_since_rtcp > 0;
         let audio_sent = self.audio_tx_since_rtcp > 0;
         self.video_tx_since_rtcp = 0;
@@ -109,10 +114,10 @@ impl SrtpCloakCipher {
         };
         let rc: u8 = if has_rx_media { 1 } else { 0 };
         let primary_words: u16 = match (effective_sender, has_rx_media) {
-            (true, true) => 12,   // SR + 1 Report Block (52B)
-            (true, false) => 6,   // SR + 0 Report Blocks (28B)
-            (false, true) => 7,   // RR + 1 Report Block (32B)
-            (false, false) => 1,  // Empty RR (8B)
+            (true, true) => 12,  // SR + 1 Report Block (52B)
+            (true, false) => 6,  // SR + 0 Report Blocks (28B)
+            (false, true) => 7,  // RR + 1 Report Block (32B)
+            (false, false) => 1, // Empty RR (8B)
         };
         let primary_rem_len = ((primary_words as usize) - 1) * 4;
 
@@ -197,7 +202,8 @@ impl SrtpCloakCipher {
             }
         };
 
-        let mut pkt = Vec::with_capacity(RTCP_HDR_LEN + body.len() + SRTP_TAG_LEN + SRTCP_INDEX_LEN);
+        let mut pkt =
+            Vec::with_capacity(RTCP_HDR_LEN + body.len() + SRTP_TAG_LEN + SRTCP_INDEX_LEN);
         pkt.extend_from_slice(&hdr);
         pkt.extend_from_slice(&body);
         pkt.extend_from_slice(&tag_bytes);

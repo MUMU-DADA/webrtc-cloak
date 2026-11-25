@@ -197,8 +197,8 @@ pub(super) fn record_server_media_bytes(sess: &mut ServerSession, now: Instant, 
     if sess.rate_15s.bytes_in_window(now) >= TRICKLE_RATE_15S_BYTES {
         sess.last_active_burst = now;
         if sess.next_srtcp_at > now + Duration::from_millis(SERVER_SRTCP_ACTIVE_MAX_MS) {
-            sess.next_srtcp_at =
-                now + rand_duration_range_ms(SERVER_SRTCP_ACTIVE_MIN_MS, SERVER_SRTCP_ACTIVE_MAX_MS);
+            sess.next_srtcp_at = now
+                + rand_duration_range_ms(SERVER_SRTCP_ACTIVE_MIN_MS, SERVER_SRTCP_ACTIVE_MAX_MS);
         }
     }
 }
@@ -251,7 +251,11 @@ pub(super) fn ensure_owned_backend(
             }
         };
         let blport = bs.local_addr().map(|a| a.port()).unwrap_or(0);
-        if poll.registry().register(&mut bs, tok, Interest::READABLE).is_err() {
+        if poll
+            .registry()
+            .register(&mut bs, tok, Interest::READABLE)
+            .is_err()
+        {
             return false;
         }
         sess.backend = BackendPipe::Owned(bs);
@@ -267,6 +271,7 @@ pub(super) fn deregister_backend(poll: &Poll, backend: &mut BackendPipe) {
 }
 
 /// P1-3: Unified route & registry cleanup whenever a session is removed/evicted/rekeyed.
+#[allow(clippy::too_many_arguments)]
 fn cleanup_session_routes(
     worker_id: usize,
     tok: Token,
@@ -327,7 +332,15 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     }
 
     if workers == 1 {
-        let res = run_server_worker(0, cfg, false, dtls_pool, seen_txids, registry, telemetry.clone());
+        let res = run_server_worker(
+            0,
+            cfg,
+            false,
+            dtls_pool,
+            seen_txids,
+            registry,
+            telemetry.clone(),
+        );
         if let Some(ref th) = telemetry {
             th.shutdown();
         }
@@ -348,7 +361,15 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
             }
         }));
     }
-    let res = run_server_worker(0, cfg, true, dtls_pool, seen_txids, registry, telemetry.clone());
+    let res = run_server_worker(
+        0,
+        cfg,
+        true,
+        dtls_pool,
+        seen_txids,
+        registry,
+        telemetry.clone(),
+    );
     for h in handles {
         let _ = h.join();
     }

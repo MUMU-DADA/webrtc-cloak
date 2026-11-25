@@ -39,7 +39,10 @@ pub(super) struct LiveReadySession {
     pub(super) rx_srtp_pkts: u64,
 }
 
-pub(super) fn remote_stun_handshake(server_addr: SocketAddr, psk: &[u8]) -> Result<LiveStunOk, String> {
+pub(super) fn remote_stun_handshake(
+    server_addr: SocketAddr,
+    psk: &[u8],
+) -> Result<LiveStunOk, String> {
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {}", e))?;
     tune_socket(&sock);
     sock.set_read_timeout(Some(Duration::from_millis(750)))
@@ -258,7 +261,7 @@ impl LiveReadySession {
         &mut self,
         psk: &[u8],
         timeout_ms: u64,
-    ) -> Option<(f64, Vec<u8>, [u8; 12], Vec<u8>)> {
+    ) -> Option<StunConsentReply> {
         self.pump_dtls(None);
         let (req, txid) = build_ice_stun_request(psk, &self.ice, None, false);
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
@@ -289,10 +292,8 @@ impl LiveReadySession {
                         PacketKind::Dtls => {
                             self.pump_dtls(Some(pkt));
                         }
-                        PacketKind::Srtcp => {
-                            if self.cipher.verify_srtcp(pkt).is_some() {
-                                self.dl_srtcp_verified += 1;
-                            }
+                        PacketKind::Srtcp if self.cipher.verify_srtcp(pkt).is_some() => {
+                            self.dl_srtcp_verified += 1;
                         }
                         _ => {}
                     }
@@ -330,17 +331,18 @@ impl LiveReadySession {
                                     && p.msg_type == STUN_BINDING_SUCCESS
                                     && p.txid == expected_txid
                                 {
-                                    return Some((ts.elapsed().as_secs_f64() * 1000.0, pkt.to_vec()));
+                                    return Some((
+                                        ts.elapsed().as_secs_f64() * 1000.0,
+                                        pkt.to_vec(),
+                                    ));
                                 }
                             }
                         }
                         PacketKind::Dtls => {
                             self.pump_dtls(Some(pkt));
                         }
-                        PacketKind::Srtcp => {
-                            if self.cipher.verify_srtcp(pkt).is_some() {
-                                self.dl_srtcp_verified += 1;
-                            }
+                        PacketKind::Srtcp if self.cipher.verify_srtcp(pkt).is_some() => {
+                            self.dl_srtcp_verified += 1;
                         }
                         _ => {}
                     }
@@ -354,7 +356,11 @@ impl LiveReadySession {
         None
     }
 
-    pub(super) fn probe_srtp_one(&mut self, payload: &[u8], timeout_ms: u64) -> Option<(f64, usize)> {
+    pub(super) fn probe_srtp_one(
+        &mut self,
+        payload: &[u8],
+        timeout_ms: u64,
+    ) -> Option<(f64, usize)> {
         self.pump_dtls(None);
         let mut wbuf = [0u8; PROBE_IO_BUF_LEN];
         let wn = self.cipher.wrap_probe_into(payload, &mut wbuf)?;
@@ -384,10 +390,8 @@ impl LiveReadySession {
                         PacketKind::Dtls => {
                             self.pump_dtls(Some(pkt));
                         }
-                        PacketKind::Srtcp => {
-                            if self.cipher.verify_srtcp(pkt).is_some() {
-                                self.dl_srtcp_verified += 1;
-                            }
+                        PacketKind::Srtcp if self.cipher.verify_srtcp(pkt).is_some() => {
+                            self.dl_srtcp_verified += 1;
                         }
                         _ => {}
                     }
@@ -422,7 +426,11 @@ impl LiveReadySession {
     }
 }
 
-pub(super) fn send_probe_expect_silence_ms(server_addr: SocketAddr, payload: &[u8], wait_ms: u64) -> usize {
+pub(super) fn send_probe_expect_silence_ms(
+    server_addr: SocketAddr,
+    payload: &[u8],
+    wait_ms: u64,
+) -> usize {
     let atk = match UdpSocket::bind("0.0.0.0:0") {
         Ok(s) => s,
         Err(_) => return 0,
@@ -433,8 +441,7 @@ pub(super) fn send_probe_expect_silence_ms(server_addr: SocketAddr, payload: &[u
     }
     let _ = atk.send(payload);
     let mut buf = [0u8; PROBE_IO_BUF_LEN];
-    match atk.recv(&mut buf) {
-        Ok(n) => n,
-        Err(_) => 0,
-    }
+    atk.recv(&mut buf).unwrap_or_default()
 }
+
+pub(super) type StunConsentReply = (f64, Vec<u8>, [u8; 12], Vec<u8>);

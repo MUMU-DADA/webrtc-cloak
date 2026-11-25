@@ -170,7 +170,7 @@ impl ServerWorker {
                 .cfg
                 .stop
                 .as_ref()
-                .map_or(false, |s| s.load(Ordering::Relaxed))
+                .is_some_and(|s| s.load(Ordering::Relaxed))
             {
                 self.graceful_shutdown_all();
                 return Ok(());
@@ -236,286 +236,292 @@ impl ServerWorker {
     }
 
     fn process_timers(&mut self, now: Instant) -> Duration {
-    // Expire stale local & cross-worker pending migration lookups
-    if !self.local_mig_pending.is_empty() {
-        self.local_mig_pending.retain(|_, (_, exp)| now <= *exp);
-    }
-    if !self.cross_worker_pending.is_empty() {
-        self.cross_worker_pending.retain(|_, (_, _, exp)| now <= *exp);
-    }
+        // Expire stale local & cross-worker pending migration lookups
+        if !self.local_mig_pending.is_empty() {
+            self.local_mig_pending.retain(|_, (_, exp)| now <= *exp);
+        }
+        if !self.cross_worker_pending.is_empty() {
+            self.cross_worker_pending
+                .retain(|_, (_, _, exp)| now <= *exp);
+        }
 
-    let mut wait = if self.sessions_by_token.is_empty() {
-        Duration::from_secs(WORKER_IDLE_POLL_SECS)
-    } else {
-        Duration::from_secs(WORKER_ACTIVE_POLL_SECS)
-    };
-    let mut to_close: Vec<(Token, &'static str)> = Vec::new();
-    let mut newly_ready_early: Vec<Token> = Vec::new();
+        let mut wait = if self.sessions_by_token.is_empty() {
+            Duration::from_secs(WORKER_IDLE_POLL_SECS)
+        } else {
+            Duration::from_secs(WORKER_ACTIVE_POLL_SECS)
+        };
+        let mut to_close: Vec<(Token, &'static str)> = Vec::new();
+        let mut newly_ready_early: Vec<Token> = Vec::new();
 
-    for (&tok, sess) in self.sessions_by_token.iter_mut() {
-        // Expire old_peer_addr and unverified pending_migrations cleanly
-        if let Some((old_p, exp)) = sess.old_peer_addr {
-            if now >= exp {
-                sess.old_peer_addr = None;
-                if old_p != sess.peer_addr && self.token_by_peer.get(&old_p) == Some(&tok) {
-                    self.token_by_peer.remove(&old_p);
+        for (&tok, sess) in self.sessions_by_token.iter_mut() {
+            // Expire old_peer_addr and unverified pending_migrations cleanly
+            if let Some((old_p, exp)) = sess.old_peer_addr {
+                if now >= exp {
+                    sess.old_peer_addr = None;
+                    if old_p != sess.peer_addr && self.token_by_peer.get(&old_p) == Some(&tok) {
+                        self.token_by_peer.remove(&old_p);
+                    }
                 }
             }
-        }
-        if !sess.pending_migrations.is_empty() {
-            sess.pending_migrations.retain(|m| now <= m.expires_at);
-        }
+            if !sess.pending_migrations.is_empty() {
+                sess.pending_migrations.retain(|m| now <= m.expires_at);
+            }
 
-        match sess.state {
-            ServerState::DtlsHandshake => {
-                if now.duration_since(sess.last_data_active)
-                    > Duration::from_secs(SERVER_DTLS_HS_TIMEOUT_SECS)
-                {
-                    to_close.push((tok, "dtls_handshake_timeout"));
-                    continue;
-                }
-                if let Some(t) = sess.dtls_next_timeout {
-                    if now >= t {
-                        let err = if let Some(ref mut dtls) = sess.dtls {
-                            dtls.handle_timeout(now).is_err()
+            match sess.state {
+                ServerState::DtlsHandshake => {
+                    if now.duration_since(sess.last_data_active)
+                        > Duration::from_secs(SERVER_DTLS_HS_TIMEOUT_SECS)
+                    {
+                        to_close.push((tok, "dtls_handshake_timeout"));
+                        continue;
+                    }
+                    if let Some(t) = sess.dtls_next_timeout {
+                        if now >= t {
+                            let err = if let Some(ref mut dtls) = sess.dtls {
+                                dtls.handle_timeout(now).is_err()
+                            } else {
+                                true
+                            };
+                            if err {
+                                to_close.push((tok, "dtls_timeout_err"));
+                                continue;
+                            }
+                            let (peer_closed, became_ready) = drain_server_dtls(
+                                self.worker_id,
+                                sess,
+                                &self.listen_sock,
+                                &mut self.dtls_buf,
+                                &self.cfg,
+                                &self.cpu,
+                                &self.registry,
+                                now,
+                                &mut self.audit,
+                            );
+                            if became_ready && !sess.early_srtp.is_empty() {
+                                newly_ready_early.push(tok);
+                            }
+                            if peer_closed {
+                                sess.state = ServerState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                    false,
+                                );
+                            }
                         } else {
-                            true
-                        };
-                        if err {
-                            to_close.push((tok, "dtls_timeout_err"));
-                            continue;
+                            let rem = t.saturating_duration_since(now);
+                            if rem < wait {
+                                wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
                         }
-                        let (peer_closed, became_ready) = drain_server_dtls(
-                            self.worker_id,
+                    }
+                }
+                ServerState::Ready => {
+                    if now.duration_since(sess.last_peer_rx) > PEER_CONSENT_TIMEOUT {
+                        to_close.push((tok, "consent_timeout"));
+                        continue;
+                    }
+                    let seq_exhausted = sess
+                        .cipher
+                        .as_ref()
+                        .map(|c| c.is_seq_exhausted())
+                        .unwrap_or(false);
+                    if seq_exhausted || now.duration_since(sess.last_data_active) > self.idle_dur {
+                        graceful_teardown_server(
                             sess,
                             &self.listen_sock,
                             &mut self.dtls_buf,
-                            &self.cfg,
-                            &self.cpu,
-                            &self.registry,
-                            now,
                             &mut self.audit,
                         );
-                        if became_ready && !sess.early_srtp.is_empty() {
-                            newly_ready_early.push(tok);
-                        }
-                        if peer_closed {
-                            sess.state = ServerState::Closing(
-                                now + Duration::from_millis(CLOSING_DRAIN_MS),
-                                false,
-                            );
-                        }
-                    } else {
-                        let rem = t.saturating_duration_since(now);
-                        if rem < wait {
-                            wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
-                        }
+                        sess.state = ServerState::Closing(
+                            now + Duration::from_millis(CLOSING_DRAIN_MS),
+                            false,
+                        );
+                        continue;
                     }
-                }
-            }
-            ServerState::Ready => {
-                if now.duration_since(sess.last_peer_rx) > PEER_CONSENT_TIMEOUT {
-                    to_close.push((tok, "consent_timeout"));
-                    continue;
-                }
-                let seq_exhausted = sess
-                    .cipher
-                    .as_ref()
-                    .map(|c| c.is_seq_exhausted())
-                    .unwrap_or(false);
-                if seq_exhausted || now.duration_since(sess.last_data_active) > self.idle_dur {
-                    graceful_teardown_server(sess, &self.listen_sock, &mut self.dtls_buf, &mut self.audit);
-                    sess.state = ServerState::Closing(
-                        now + Duration::from_millis(CLOSING_DRAIN_MS),
-                        false,
-                    );
-                    continue;
-                }
-                if now >= sess.next_srtcp_at {
-                    let age_ge_15s = sess.ready_at.map_or(false, |r| {
-                        now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS)
-                    });
-                    let in_trickle = age_ge_15s
-                        && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES;
-                    let long_trickle = in_trickle
-                        && now.duration_since(sess.last_active_burst)
-                            >= Duration::from_secs(SERVER_LONG_TRICKLE_SECS);
-                    if long_trickle {
-                        sess.next_srtcp_at =
-                            now + Duration::from_secs(SERVER_LONG_TRICKLE_RECHECK_SECS);
-                    } else {
-                        let is_active_media = !in_trickle
-                            && now.duration_since(sess.last_data_active)
-                                <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
-                        let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
-                        let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
-                        sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
-                        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
-                        if let Some(ref mut cipher) = sess.cipher {
-                            let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
-                            self.audit.record(1, &rtcp);
-                            if self.listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
-                                sess.srtcp_tx += 1;
+                    if now >= sess.next_srtcp_at {
+                        let age_ge_15s = sess.ready_at.is_some_and(|r| {
+                            now.duration_since(r) >= Duration::from_secs(TRICKLE_WINDOW_15S_SECS)
+                        });
+                        let in_trickle = age_ge_15s
+                            && sess.rate_15s.bytes_in_window(now) < TRICKLE_RATE_15S_BYTES;
+                        let long_trickle = in_trickle
+                            && now.duration_since(sess.last_active_burst)
+                                >= Duration::from_secs(SERVER_LONG_TRICKLE_SECS);
+                        if long_trickle {
+                            sess.next_srtcp_at =
+                                now + Duration::from_secs(SERVER_LONG_TRICKLE_RECHECK_SECS);
+                        } else {
+                            let is_active_media = !in_trickle
+                                && now.duration_since(sess.last_data_active)
+                                    <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
+                            let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
+                            let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
+                            sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
+                            sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
+                            if let Some(ref mut cipher) = sess.cipher {
+                                let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
+                                self.audit.record(1, &rtcp);
+                                if self.listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
+                                    sess.srtcp_tx += 1;
+                                }
                             }
+                            sess.next_srtcp_at = now
+                                + if is_active_media {
+                                    rand_duration_range_ms(
+                                        SERVER_SRTCP_ACTIVE_MIN_MS,
+                                        SERVER_SRTCP_ACTIVE_MAX_MS,
+                                    )
+                                } else if !in_trickle {
+                                    rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
+                                } else {
+                                    rand_duration_range_ms(
+                                        SRTCP_TRICKLE_MIN_MS,
+                                        SRTCP_TRICKLE_MAX_MS,
+                                    )
+                                };
                         }
-                        sess.next_srtcp_at = now
-                            + if is_active_media {
-                                rand_duration_range_ms(
-                                    SERVER_SRTCP_ACTIVE_MIN_MS,
-                                    SERVER_SRTCP_ACTIVE_MAX_MS,
-                                )
-                            } else if !in_trickle {
-                                rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
-                            } else {
-                                rand_duration_range_ms(SRTCP_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS)
-                            };
-                    }
-                } else {
-                    let rem = sess.next_srtcp_at.saturating_duration_since(now);
-                    if rem < wait {
-                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
+                    } else {
+                        let rem = sess.next_srtcp_at.saturating_duration_since(now);
+                        if rem < wait {
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
+                        }
                     }
                 }
-            }
-            ServerState::Closing(deadline, _) => {
-                if now >= deadline {
-                    to_close.push((tok, "graceful_close"));
-                } else {
-                    let rem = deadline.saturating_duration_since(now);
-                    if rem < wait {
-                        wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
+                ServerState::Closing(deadline, _) => {
+                    if now >= deadline {
+                        to_close.push((tok, "graceful_close"));
+                    } else {
+                        let rem = deadline.saturating_duration_since(now);
+                        if rem < wait {
+                            wait = rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
+                        }
                     }
                 }
             }
         }
-    }
 
-    // Flush any buffered early SRTP on sessions that became Ready during DTLS timeout
-    for tok in newly_ready_early {
-        let (peer_addr, early_pkts): (SocketAddr, Vec<Vec<u8>>) =
-            match self.sessions_by_token.get_mut(&tok) {
-                Some(s) => (s.peer_addr, s.early_srtp.drain(..).collect()),
-                None => continue,
-            };
-        for raw in early_pkts {
-            process_ready_srtp(
-                self.worker_id,
-                tok,
-                peer_addr,
-                &raw,
-                &mut self.sessions_by_token,
-                &mut self.token_by_peer,
-                &mut self.token_by_ufrag,
-                &mut self.local_mig_pending,
-                &self.poll,
-                &self.listen_sock,
-                &self.cfg,
-                &self.registry,
-                self.telemetry.as_ref(),
-                &mut self.wbuf,
-                now,
-                &mut self.audit,
-            );
+        // Flush any buffered early SRTP on sessions that became Ready during DTLS timeout
+        for tok in newly_ready_early {
+            let (peer_addr, early_pkts): (SocketAddr, Vec<Vec<u8>>) =
+                match self.sessions_by_token.get_mut(&tok) {
+                    Some(s) => (s.peer_addr, s.early_srtp.drain(..).collect()),
+                    None => continue,
+                };
+            for raw in early_pkts {
+                process_ready_srtp(
+                    self.worker_id,
+                    tok,
+                    peer_addr,
+                    &raw,
+                    &mut self.sessions_by_token,
+                    &mut self.token_by_peer,
+                    &mut self.token_by_ufrag,
+                    &mut self.local_mig_pending,
+                    &self.poll,
+                    &self.listen_sock,
+                    &self.cfg,
+                    &self.registry,
+                    self.telemetry.as_ref(),
+                    &mut self.wbuf,
+                    now,
+                    &mut self.audit,
+                );
+            }
         }
-    }
 
-    for (tok, reason) in to_close {
-        if let Some(mut sess) = self.sessions_by_token.remove(&tok) {
-            self.closed_tx_bytes = self.closed_tx_bytes.saturating_add(sess.tx_bytes);
-            self.closed_rx_bytes = self.closed_rx_bytes.saturating_add(sess.rx_bytes);
-            self.closed_tx_pkts = self.closed_tx_pkts.saturating_add(sess.tx_pkts);
-            self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(sess.rx_pkts);
-            self.closed_auth_drops = self.closed_auth_drops.saturating_add(sess.auth_drops);
-            cleanup_session_routes(
-                self.worker_id,
-                tok,
-                &mut sess,
-                &self.poll,
-                &mut self.token_by_peer,
-                &mut self.token_by_ufrag,
-                &mut self.local_mig_pending,
-                &self.registry,
-            );
-            log(
-                self.worker_id,
-                &format!(
+        for (tok, reason) in to_close {
+            if let Some(mut sess) = self.sessions_by_token.remove(&tok) {
+                self.closed_tx_bytes = self.closed_tx_bytes.saturating_add(sess.tx_bytes);
+                self.closed_rx_bytes = self.closed_rx_bytes.saturating_add(sess.rx_bytes);
+                self.closed_tx_pkts = self.closed_tx_pkts.saturating_add(sess.tx_pkts);
+                self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(sess.rx_pkts);
+                self.closed_auth_drops = self.closed_auth_drops.saturating_add(sess.auth_drops);
+                cleanup_session_routes(
+                    self.worker_id,
+                    tok,
+                    &mut sess,
+                    &self.poll,
+                    &mut self.token_by_peer,
+                    &mut self.token_by_ufrag,
+                    &mut self.local_mig_pending,
+                    &self.registry,
+                );
+                log(
+                    self.worker_id,
+                    &format!(
                     "close session peer={} reason={} rx={}pkts tx={}pkts ka={} rtcp={}/{} drops={}",
                     sess.peer_addr, reason, sess.rx_pkts, sess.tx_pkts, sess.keepalives,
                     sess.srtcp_tx, sess.srtcp_rx, sess.auth_drops
                 ),
-            );
+                );
+            }
         }
-    }
         wait
     }
 
     fn maybe_report_telemetry(&mut self, now: Instant) {
-    if let Some(ref th) = self.telemetry {
-        if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
-            self.last_telemetry = now;
-            let mut snap = WorkerSnapshot {
-                tx_bytes_total: self.closed_tx_bytes,
-                rx_bytes_total: self.closed_rx_bytes,
-                tx_pkts_total: self.closed_tx_pkts,
-                rx_pkts_total: self.closed_rx_pkts,
-                auth_drops_total: self.closed_auth_drops,
-                unauth_drops_total: self.unauth_drops,
-                dtls_version: "none",
-                cipher: "none",
-                ..Default::default()
-            };
-            for sess in self.sessions_by_token.values() {
-                snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
-                snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
-                snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
-                snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
-                snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
-                match sess.state {
-                    ServerState::Ready => {
-                        snap.active_sessions += 1;
-                        if snap.active_backend_sport == 0 && sess.backend_lport != 0 {
-                            snap.active_backend_sport = sess.backend_lport;
-                        }
-                        if snap.cipher == "none" {
-                            if let Some(c) = sess.negotiated_cipher {
-                                snap.cipher = c.name();
+        if let Some(ref th) = self.telemetry {
+            if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
+                self.last_telemetry = now;
+                let mut snap = WorkerSnapshot {
+                    tx_bytes_total: self.closed_tx_bytes,
+                    rx_bytes_total: self.closed_rx_bytes,
+                    tx_pkts_total: self.closed_tx_pkts,
+                    rx_pkts_total: self.closed_rx_pkts,
+                    auth_drops_total: self.closed_auth_drops,
+                    unauth_drops_total: self.unauth_drops,
+                    dtls_version: "none",
+                    cipher: "none",
+                    ..Default::default()
+                };
+                for sess in self.sessions_by_token.values() {
+                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+                    match sess.state {
+                        ServerState::Ready => {
+                            snap.active_sessions += 1;
+                            if snap.active_backend_sport == 0 && sess.backend_lport != 0 {
+                                snap.active_backend_sport = sess.backend_lport;
+                            }
+                            if snap.cipher == "none" {
+                                if let Some(c) = sess.negotiated_cipher {
+                                    snap.cipher = c.name();
+                                }
+                            }
+                            if snap.dtls_version == "none" {
+                                snap.dtls_version =
+                                    match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
+                                        Some(ProtocolVersion::DTLS1_3) => {
+                                            snap.dual_ssrc = true;
+                                            "1.3"
+                                        }
+                                        Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                        _ if self.cfg.dtls_required => "1.3",
+                                        _ => "none",
+                                    };
                             }
                         }
-                        if snap.dtls_version == "none" {
-                            snap.dtls_version = match sess
-                                .dtls
-                                .as_ref()
-                                .and_then(|d| d.protocol_version())
-                            {
-                                Some(ProtocolVersion::DTLS1_3) => {
-                                    snap.dual_ssrc = true;
-                                    "1.3"
-                                }
-                                Some(ProtocolVersion::DTLS1_2) => "1.2",
-                                _ if self.cfg.dtls_required => "1.3",
-                                _ => "none",
-                            };
+                        ServerState::DtlsHandshake => {
+                            snap.handshaking_sessions += 1;
                         }
+                        ServerState::Closing(_, _) => {}
                     }
-                    ServerState::DtlsHandshake => {
-                        snap.handshaking_sessions += 1;
-                    }
-                    ServerState::Closing(_, _) => {}
                 }
+                th.update_worker(self.worker_id, snap);
             }
-            th.update_worker(self.worker_id, snap);
         }
-    }
     }
 
     fn maybe_log_stats(&mut self, now: Instant) {
-    if now.duration_since(self.last_stats) >= self.stats_dur {
-        self.last_stats = now;
-        for sess in self.sessions_by_token.values() {
-            if matches!(sess.state, ServerState::Closing(_, _)) {
-                continue;
-            }
-            log(
+        if now.duration_since(self.last_stats) >= self.stats_dur {
+            self.last_stats = now;
+            for sess in self.sessions_by_token.values() {
+                if matches!(sess.state, ServerState::Closing(_, _)) {
+                    continue;
+                }
+                log(
                 self.worker_id,
                 &format!(
                     "stats peer={} backend_sport={} rx={}pkts/{:.1}KB tx={}pkts/{:.1}KB ka={} rtcp={}/{} drops={} unauth={}",
@@ -532,7 +538,7 @@ impl ServerWorker {
                     self.unauth_drops
                 ),
             );
+            }
         }
-    }
     }
 }

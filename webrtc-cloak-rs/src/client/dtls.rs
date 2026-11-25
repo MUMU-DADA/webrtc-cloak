@@ -19,6 +19,7 @@ use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::{Duration, Instant};
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn drain_client_dtls(
     worker_id: usize,
     sess: &mut ClientSession,
@@ -96,23 +97,15 @@ pub(super) fn drain_client_dtls(
                 );
                 return true;
             };
-            let is_dtls13 = sess
-                .dtls
-                .as_ref()
-                .and_then(|d| d.protocol_version())
+            let is_dtls13 = sess.dtls.as_ref().and_then(|d| d.protocol_version())
                 == Some(ProtocolVersion::DTLS1_3);
             let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
             let final_key = combine_session_key(&stun_key, Some(km));
             sess.session_key = Some(final_key);
             sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
             sess.active_cipher = Some(chosen);
-            let mut c = SrtpCloakCipher::new(
-                &final_key,
-                sess.ssrc_c2s,
-                sess.ssrc_s2c,
-                true,
-                chosen,
-            );
+            let mut c =
+                SrtpCloakCipher::new(&final_key, sess.ssrc_c2s, sess.ssrc_s2c, true, chosen);
             c.set_wan_mtu(cfg.wan_mtu);
             c.set_dual_ssrc(is_dtls13);
             sess.cipher = Some(c);
@@ -174,9 +167,7 @@ pub(super) fn drain_client_dtls(
 pub(super) fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
     if matches!(
         sess.state,
-        HandshakeState::Ready
-            | HandshakeState::HandoverWait
-            | HandshakeState::DrainingBeforeBye(_)
+        HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::DrainingBeforeBye(_)
     ) {
         let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
         let is_sender = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
@@ -303,7 +294,11 @@ pub(super) fn spawn_client_session(
     if *next_token_id == 0 || *next_token_id == usize::MAX {
         *next_token_id = 1;
     }
-    if poll.registry().register(&mut up, tok, Interest::READABLE).is_err() {
+    if poll
+        .registry()
+        .register(&mut up, tok, Interest::READABLE)
+        .is_err()
+    {
         return None;
     }
     let ice = SessionIceParams::generate();
