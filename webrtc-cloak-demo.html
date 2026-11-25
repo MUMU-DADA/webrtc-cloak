@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>WebRTC-Cloak V3.2 (v0.3.6) 协议原理与抗干扰交互演示</title>
+<title>WebRTC-Cloak V4.0 (v0.4.2) 协议原理与抗干扰交互演示</title>
 <style>
   :root {
     --bg: #070b14;
@@ -496,22 +496,22 @@
 <div class="container">
   <header>
     <div class="title-wrap">
-      <h1>WebRTC-Cloak V3.2 (v0.3.6) 协议原理与抗干扰交互演示</h1>
-      <p>纯 Rust · 零 C 依赖 · 嵌入式真 <strong>RFC 9147 DTLS 1.3 / 1.2 自动协商</strong> (<code>dimpl 0.9.0</code>) + ICE STUN + <strong>音视频双 SSRC</strong> SRTP/SRTCP + 单向上行黑洞自愈 + 内置 12 项实网自测</p>
+      <h1>WebRTC-Cloak V4.0 (v0.4.2) 协议原理与抗干扰交互演示</h1>
+      <p>纯 Rust · 零 C 依赖 · <strong>RFC 9147 DTLS 1.3 / 1.2 自动协商</strong> (<code>dimpl 0.9.0</code>) + ICE STUN + <strong>音视频双 SSRC</strong> SRTP/SRTCP + <strong>1-RTT 黑洞迁移 (0xFFFD)</strong> + <strong>MBB 原子过户 (0xFFFC)</strong> + 外层解耦遥测</p>
     </div>
     <div class="badge-row">
-      <span class="badge green">V3.2 · v0.3.6</span>
+      <span class="badge green">V4.0 · v0.4.2</span>
       <span class="badge purple">DTLS 1.3 加密证书 + 1.2 回退</span>
-      <span class="badge">Dual-SSRC (PT=111 + PT=96)</span>
-      <span class="badge amber">1488B PPPoE Anti-Frag</span>
+      <span class="badge">MBB 0xFFFC 过户 · 0 后端换口</span>
+      <span class="badge amber">1-RTT 迁移 · 1488B Anti-Frag</span>
     </div>
   </header>
 
   <nav class="nav-pills">
-    <a class="nav-pill" href="#sec-sim">1. 全生命周期与实战场景推演 (5 场景)</a>
+    <a class="nav-pill" href="#sec-sim">1. 全生命周期与实战场景推演 (6 场景)</a>
     <a class="nav-pill" href="#sec-packet">2. 字节级报文解剖 &amp; 双流/MTU/填充模拟器</a>
     <a class="nav-pill" href="#sec-crypto">3. Hybrid PFS 密钥域分离 &amp; RFC 7983 分流</a>
-    <a class="nav-pill" href="#sec-bench">4. 协议演进、实网指标与适用边界</a>
+    <a class="nav-pill" href="#sec-bench">4. V4.0 演进、实测指标与适用边界</a>
   </nav>
 
   <!-- ==================== SECTION 1: INTERACTIVE FLOW SIMULATOR ==================== -->
@@ -521,9 +521,10 @@
       <div class="controls">
         <div class="mode-tabs" id="scenarioTabs">
           <button class="tab-btn" data-mode="raw">对照：裸 UDP 五包断流</button>
-          <button class="tab-btn active-green" data-mode="v32">V3.2 DTLS 1.3 + 双流建连</button>
+          <button class="tab-btn active-green" data-mode="v32">V4.0 DTLS 1.3 + 双流建连</button>
+          <button class="tab-btn" data-mode="mbb">V4.0 MBB 无感过户 (0xFFFC)</button>
+          <button class="tab-btn" data-mode="heal">V4.0 1-RTT 黑洞迁移 (0xFFFD)</button>
           <button class="tab-btn" data-mode="attack">主动探测与旁路注入</button>
-          <button class="tab-btn" data-mode="heal">单向上行黑洞自愈</button>
           <button class="tab-btn" data-mode="selftest">在线 0xFFFE 实网自测</button>
         </div>
         <button class="action-btn" id="btnPrev">← 上一步</button>
@@ -752,7 +753,7 @@
       <div style="background:var(--bg-deep);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;justify-content:space-between;">
         <div>
           <div style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:6px;">RFC 7983 §7 + RFC 9147 首字节精准分流图谱 (0x00 ~ 0xFF)</div>
-          <p style="font-size:12px;color:var(--muted);">V3.2 支持完整标准 DTLS 区间 <code>20..=63</code>（<code>20..=23</code> DTLS 1.2/明文 + <code>26</code> DTLS 1.3 ACK + <code>32..=63</code> RFC 9147 Unified Ciphertext <code>001C_SL_EE</code>），入口强校验 <code>C=0</code> 与最小 <code>18B</code> 密文边界。</p>
+          <p style="font-size:12px;color:var(--muted);">V4.0 支持完整标准 DTLS 区间 <code>20..=63</code>（<code>20..=23</code> DTLS 1.2/明文 + <code>26</code> DTLS 1.3 ACK + <code>32..=63</code> RFC 9147 Unified Ciphertext <code>001C_SL_EE</code>），入口强校验 <code>C=0</code> 与最小 <code>18B</code> 密文边界；V4 新增子密钥（<code>ice-pwd-v4</code> / <code>handover-v4</code>）均采用 RFC 5869 HKDF-SHA256 派生。</p>
 
           <div class="demux-bar">
             <div class="demux-seg" style="width:11%;background:rgba(59,130,246,0.35);color:#bfdbfe;" title="0..=3 STUN">0..3<br/>STUN</div>
@@ -789,73 +790,73 @@
   <!-- ==================== SECTION 4: EVOLUTION, BENCHMARKS & BOUNDARIES ==================== -->
   <section class="card" id="sec-bench">
     <div class="card-head">
-      <div class="card-title"><span class="dot amber"></span> 4. V3.1 → V3.2 关键演进、实网实测数据与客观边界</div>
-      <span class="badge green">独立 X 光实包审计 + 跨太平洋公网 12/12 PASS</span>
+      <div class="card-title"><span class="dot amber"></span> 4. V3 → V4.0 (v0.4.2) 关键演进、实测指标与客观边界</div>
+      <span class="badge green">V4.0 协议定型 · 本地 12/12 + 实网 12/12 PASS</span>
     </div>
 
     <div class="evo-grid">
       <div class="evo-card">
-        <div class="ec-tag">v0.3.2 ~ v0.3.4 · 弱网与黑洞硬化</div>
-        <div class="ec-title">跨洋高乱序 + 防分片 + 黑洞自愈</div>
+        <div class="ec-tag">v0.3.2 ~ v0.3.6 · 现代 WebRTC 底座</div>
+        <div class="ec-title">DTLS 1.3 加密证书 + 双 SSRC + MTU 1488</div>
         <ul>
-          <li>SRTP 防重放从 64 槽升级为 <strong>2048 槽 RFC 6479 环形窗口</strong>，容忍跨洋 ECMP 大幅乱序。</li>
-          <li>默认 WAN MTU 锁定 <code>1488B</code>（外层 UDP <code>≤1460B</code>），彻底消除 PPPoE <code>1492B</code> IPv4 分片。</li>
-          <li>严格 RFC 7675 双向 STUN Consent（不被下行 SRTCP 误续命），同 <code>txid</code> 3 次重试 + <code>35s</code> 静默 drain + 自动换五元组。</li>
+          <li><code>Dtls::new_auto</code> 优先 RFC 9147 DTLS 1.3（双向 ECDSA P-256 证书 <strong>100% 加密</strong>、跨洋省 1 RTT），兼容 1.2 滚动升级，支持 <code>--dtls-min-version 1.3</code> 防降级。</li>
+          <li>协商 DTLS 1.3 自动启用<strong>音视频双 SSRC</strong>（<code>PT=111</code> Opus <code>≤50 pps</code> + <code>PT=96</code> 90kHz 严格 <code>M=1</code> 因果），独立 2048 槽 RFC 6479 防重放环与正交 Nonce 域。</li>
+          <li>默认 <code>--mtu 1488</code> 彻底消除 PPPoE <code>1492B</code> IPv4 分片；内置双模式 12 项自测与带内 <code>0xFFFE</code> 加密回显。</li>
         </ul>
       </div>
 
       <div class="evo-card">
-        <div class="ec-tag">v0.3.5 · 生产可观测性</div>
-        <div class="ec-title">双模式 12 项自测 &amp; 带内 0xFFFE 回显</div>
+        <div class="ec-tag">v0.3.7 ~ v0.4.0 (V4.0) · 换路不换门牌</div>
+        <div class="ec-title">1-RTT 黑洞迁移 + MBB 0xFFFC 原子过户</div>
         <ul>
-          <li><code>selftest --server-host</code> 直测运行中的线上服务端，涵盖 NAT 映射、公网 RTT/抖动/丢包、7 类主动探测静默丢弃与 CPU 算力。</li>
-          <li>新增密文带内 <code>0xFFFE</code> SRTP 诊断回显：100% 不可与真实 UDP 冲突、零转发后端、不中断线上 Hysteria 2，可实测公网 Path MTU。</li>
-          <li>保留 <code>--local</code> 本地离线故障注入沙箱，验证线上不便触发的黑洞与重启场景。</li>
+          <li><strong>1-RTT ICE 黑洞迁移（<code>0xFFFD</code>）</strong>：保留 PFS 密钥与 SRTP 序列号，以每会话 HKDF 密钥 <code>ice-pwd-v4</code> 签名迁移 STUN，经防反射（<code>≤1.32x</code>）加密挑战验真后原地更新 <code>peer_addr</code>，0 DTLS 重握、<strong>0 后端换口</strong>。</li>
+          <li><strong>MBB 无感轮换（<code>0xFFFC</code>）</strong>：按对数正态时长或字节预算发起全新不可关联 DTLS 1.3，凭双会话 HKDF 证明原子移交 <code>backend_sock</code>（支持跨 worker 无锁转发），延迟 <code>2–10s</code> 发旧流 BYE，实测 <strong>0 丢包 0 换口</strong>。</li>
+          <li><code>SIGTERM</code> 广播优雅 <code>SRTCP BYE + close_notify</code>（<code>0.23s</code> 快切）；空闲/微流自动退避控制面并严格遵守 RFC 3550 零媒体 <code>RC=0</code> 语义。</li>
         </ul>
       </div>
 
       <div class="evo-card">
-        <div class="ec-tag">v0.3.6 (V3.2) · 现代 WebRTC 协议跃升</div>
-        <div class="ec-title">DTLS 1.3 全加密证书 + 音视频双 SSRC</div>
+        <div class="ec-tag">v0.4.1 ~ v0.4.2 · 解耦遥测与工程收口</div>
+        <div class="ec-title">旁路健康遥测 + 纯 Rust 轻量架构</div>
         <ul>
-          <li>升级至 <code>Dtls::new_auto</code>（RFC 9147 DTLS 1.3 优先 + 1.2 自动回退，可选 <code>--dtls-min-version 1.3</code> 锁定防降级）：多 MTU 预构建配置池打散 ClientHello 尺寸，双向证书 <strong>100% 加密</strong>且握手省 1 RTT，Ready 态持续驱动 Flight 5 重传防尾包黑洞。</li>
-          <li>协商 DTLS 1.3 时自动激活<strong>双 SSRC 分流</strong>：抖动阈值（<code>180..307B</code>）+ 每 20ms 限 1 包的 <code>PT=111</code> 48kHz Opus（<code>≤50 pps</code>），溢出包与大包走 <code>PT=96</code> 90kHz 视频（严格 <code>M=1</code> 帧尾因果律），高 16 位互异 + <code>dir|0x40</code> 正交 Nonce 域。</li>
-          <li>Compound SRTCP 改为 0-based 序号、会话恒定 CNAME、音视频双 SSRC 诚实上报、空闲拆除保持 <code>PT=201 (RR)</code>，加密 <code>SDES</code> 严格补齐 RFC 3550 §6.5 <code>0x00</code> 结束符；Fail-Closed 强制校验 <code>KeyingMaterial</code> 非空。</li>
+          <li>新增严格旁路于热路径的外层健康遥测：支持原子 <code>tmp + rename</code> JSON 落盘（<code>--status-file</code>）及本地只读 HTTP / Prometheus 端点（<code>--status-http</code> <code>/status</code> <code>/healthz</code> <code>/metrics</code>）。</li>
+          <li>全仓重构为 36 个职责清晰子模块 + <code>pico-args</code> 零传递依赖 CLI 解析与分层契约常量，<code>cargo clippy</code> 0 告警、16 架构零 C 依赖静态发布。</li>
+          <li>Linux x86_64 静态 musl 体积仅 <strong><code>2.9 MB</code></strong>，含遥测常驻内存仅 <strong><code>2.1–2.8 MB</code></strong>，纯封装 L3 开销恒定 <strong><code>+2.8%</code></strong>。</li>
         </ul>
       </div>
     </div>
 
     <div class="metric-grid">
       <div class="metric-box">
-        <div class="m-label">典型跨洋链路实测 (selftest)</div>
-        <div class="m-val">~166 ms</div>
-        <div class="m-note">抖动 0.2ms · 0.0% 丢包 · IPv4 1488B MTU 直通</div>
+        <div class="m-label">PPPoE 1492B 纯 L3 封装开销</div>
+        <div class="m-val">+2.8%</div>
+        <div class="m-note">1468B → 1485B (0 分片) · 160ms 跨洋留存 94–98%</div>
       </div>
       <div class="metric-box">
-        <div class="m-label">CGNAT 单向上行黑洞自愈</div>
-        <div class="m-val amber">~654 ms</div>
-        <div class="m-note">3/3 STUN 检出 → 新五元组重握 · 零断流</div>
+        <div class="m-label">MBB 换口 / P8 黑洞自愈</div>
+        <div class="m-val amber">0ms / 5.2s</div>
+        <div class="m-note">33,280 包 0 丢包 0 换口 · 黑洞 1-RTT 满血复速</div>
       </div>
       <div class="metric-box">
         <div class="m-label">低功耗 x86_64 软路由 (AES-NI)</div>
-        <div class="m-val cyan">2,189 Mbps</div>
-        <div class="m-note">单核 AES / 4 核 8.45 Gbps · 运行内存 2.4 MB</div>
+        <div class="m-val cyan">900–1,449 Mbps</div>
+        <div class="m-note">1W 900M / 4W 1,449M · RSS 2.1–2.8 MB</div>
       </div>
       <div class="metric-box">
-        <div class="m-label">Apple Silicon (ARM64)</div>
-        <div class="m-val purple">1,680 Mbps</div>
-        <div class="m-note">单核全隧道环回 175 kpps · 多核加密 83.96 Gbps</div>
+        <div class="m-label">Apple Silicon (ARM64, 12C)</div>
+        <div class="m-val purple">10.6 / 77.1 Gbps</div>
+        <div class="m-note">单核 10,573M / 12核 77.1G · 全隧道 2,109 Mbps</div>
       </div>
     </div>
 
     <div class="boundary-note">
       <strong>客观工程定位与适用边界：</strong>
-      本项目定位为<strong>面向 Hysteria 2 / QUIC / WireGuard 的高性能透明 UDP 抗干扰传输外壳</strong>，核心解决两类现实问题：① 运营商/中间件对裸高熵 UDP 的特征识别、QoS 限速与主动探测暴露；② CGNAT / 状态化防火墙导致的单向上行黑洞与 PPPoE 分片掉速。它<strong>不是通用 TCP/TUN 代理</strong>，也不能绕过“彻底禁止一切 UDP 出口”的网络策略（此类极端场景应保留 TCP/Reality 线路作为兜底），内层业务机密性始终由上层 Hysteria 2 (TLS 1.3) 或 WireGuard 独立保障。
+      本项目定位为<strong>面向 Hysteria 2 / QUIC / WireGuard 的高性能透明 UDP 抗干扰传输外壳</strong>，核心解决两类现实问题：① 状态化中间件对裸高熵 UDP 的特征识别、QoS 限速与主动探测暴露；② CGNAT / 防火墙导致的单向上行黑洞、长流五元组关联与 PPPoE 分片掉速。它<strong>不是通用 TCP/TUN VPN</strong>，内层业务机密性始终由上层协议独立保障；在持续突发丢包 ≥15% 或彻底禁止 100% UDP 出口的网络策略下应回退至常规 TCP 传输线路。
     </div>
   </section>
 
   <footer>
-    WebRTC-Cloak V3.2 / v0.3.6 (Pure Rust · dimpl 0.9.0 DTLS 1.3/1.2 · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
+    WebRTC-Cloak V4.0 / v0.4.2 (Pure Rust · dimpl 0.9.0 DTLS 1.3/1.2 · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
   </footer>
 </div>
 
@@ -901,7 +902,7 @@ const SCENARIOS = {
   },
 
   v32: {
-    name: "V3.2 DTLS 1.3 + 双流建连",
+    name: "V4.0 DTLS 1.3 + 双流建连",
     accent: "green",
     attacker: false,
     steps: [
@@ -1026,50 +1027,98 @@ const SCENARIOS = {
     ]
   },
 
+  mbb: {
+    name: "V4.0 MBB 无感过户 (0xFFFC)",
+    accent: "cyan",
+    attacker: false,
+    steps: [
+      {
+        title: "Step 1 · 触发对数正态定时/流量预算轮换（后台微流自动挂起）",
+        desc: "活跃会话到达随机轮换点（对数正态时长 [0.35x, 2.80x] 或字节预算 [0.50x, 1.85x]，60s 冷却锁），主业务继续在旧口 :58376 无阻转发。",
+        dir: "c2s", pill: "PRIMARY :58376 ACTIVE", pillColor: "#0891b2",
+        cli: "MBB: SPAWN STANDBY", cliEx: "primary=:58376 | 0 stall", dpi: "DPI: NORMAL A/V", dpiSub: "主通话持续转发中", dpiColor: "#10b981",
+        srv: "BACKEND :51481", srvEx: "rx=active | 0 drops", verdict: "PASS", verdictCls: "pass",
+        proto: "Log-Normal MBB Trigger", hdr: "rotate_interval / rotate_bytes", dpiView: "完全无规律换口周期，杜绝固定整点指纹", secAct: "夜间/后台微流 (<64KB/5m) 自动挂起不空转",
+        hex: "[client-rs#0] new standby(MBB) session up_sport=52742 ufrag=WGVr:ytL3 (primary=58376 stays active)",
+        note: "轮换间隔采用右偏对数正态宽分布，并叠加单流随机字节预算（默认 1200 MiB → 600–2220 MiB），兼顾抗宏观长流关联与零震荡。"
+      },
+      {
+        title: "Step 2 · 后台并行完成全新不可关联 DTLS 1.3 握手",
+        desc: "备用会话从全新本地端口 :52742 发起完整 ICE STUN + DTLS 1.3 握手，对外生成全新 ufrag、双 SSRC、CNAME 与 ECDHE PFS 密钥。",
+        dir: "c2s_s2c", pill: "NEW DTLS 1.3 (:52742)", pillColor: "#9333ea",
+        cli: "STANDBY: READY ✓", cliEx: "new ufrag + new SSRC", dpi: "DPI: NEW WEBRTC", dpiSub: "全新独立加密通话流", dpiColor: "#10b981",
+        srv: "STANDBY READY ✓", srvEx: "new PFS key active", verdict: "PASS", verdictCls: "pass",
+        proto: "Unlinkable DTLS 1.3 Handshake", hdr: "0x2e 加密证书 · 全新标识", dpiView: "公网视角与旧流无任何明文字段关联", secAct: "Fail-Closed Hybrid PFS 刷新全新主密钥",
+        hex: "New Standby :52742 -> ufrag=WGVr:ytL3 ssrc=0xb8666cad DTLS 1.3 READY (old :58376 still serving traffic!)",
+        note: "绝不复用旧流的 ufrag / SSRC / CNAME，确保即使观察者捕获换口前后两条流也无法从协议头直接关联。"
+      },
+      {
+        title: "Step 3 · AEAD 密文带内 0xFFFC 过户帧原子移交 backend_sock",
+        desc: "在切换主路径前，新会话在 AEAD 密文内发送 0xFFFC 帧（携带 old_ufrag 与双会话 HKDF-SHA256 证明），服务端验真后原子过户原 backend_sock。",
+        dir: "c2s_s2c", pill: "ENC 0xFFFC HANDOVER", pillColor: "#10b981",
+        cli: "PROMOTE :52742 ✓", cliEx: "0ms cutover | 0 loss", dpi: "DPI: SRTP VIDEO", dpiSub: "完全藏于 0x90 密文内", dpiColor: "#10b981",
+        srv: "HANDOVER OK (:51481)", srvEx: "0 backend port change!", verdict: "PASS", verdictCls: "pass",
+        proto: "In-Band 0xFFFC Atomic Handover", hdr: "HKDF(old_sk, new_sk, 'handover-v4')", dpiView: "线上与普通 SRTP 数据帧 0 差异", secAct: "单次消费幂等验真 · 支持跨 worker 无锁转发",
+        hex: "[server-rs#0] MBB HANDOVER (local) old->WGVr:ytL3 backend_sport=51481 (0 port change!)",
+        note: "即使内层是严格锁定源端口的有状态 UDP 后端（游戏/语音/VPN），也完全察觉不到外层已经换了全新端口与密钥——真正做到“换路不换门牌”。"
+      },
+      {
+        title: "Step 4 · 0 ms 切流 + 旧口延迟 2–10s 发 BYE 优雅排空",
+        desc: "主流量瞬切至 :52742；旧口 :58376 进入 DrainingBeforeBye 继续接收在途慢回包，随机延迟 2–10s 后才发加密 SRTCP BYE + close_notify 退场。",
+        dir: "c2s", pill: "DELAYED BYE (2–10s)", pillColor: "#0ea5e9",
+        cli: "MBB 0ms DONE ✓", cliEx: "33,280/33,280 (0.00%)", dpi: "DPI: CLEAN END", dpiSub: "错峰自然挂断防关联 ✓", dpiColor: "#10b981",
+        srv: "OLD CLOSED CLEANLY", srvEx: "backend=:51481 intact", verdict: "PASS", verdictCls: "pass",
+        proto: "Staggered Graceful Teardown", hdr: "DrainingBeforeBye (2–10s)", dpiView: "新流建立与旧流挂断错开，避免切流时序指纹", secAct: "实测 4 次连续换口 33,280 包 0 丢包 0 换口",
+        hex: "[client-rs#0] MBB 0ms rotation complete old=58376 -> new=52742 (delayed BYE in 5.1s) | drops=0",
+        note: "配合 2–10s 随机延迟 BYE 与 1s post-BYE 排空窗口，既避免在途下行包丢失，也防止“新流建好同一毫秒旧流立刻发 BYE”的关联特征。"
+      }
+    ]
+  },
+
   heal: {
-    name: "单向上行黑洞自愈",
+    name: "V4.0 1-RTT 黑洞迁移 (0xFFFD)",
     accent: "amber",
     attacker: false,
     steps: [
       {
         title: "故障注入 · 运营商 CGNAT 发生单向上行黑洞（下行 SRTCP 仍在回！）",
-        desc: "运营商 CGNAT 家宽经典疑难故障：旧五元组 :51000 上行 100% 被丢弃，但服务端下行 SRTCP/SRTP 仍能回流客户端。",
+        desc: "CGNAT / 状态墙经典单向半残故障：旧五元组 :51000 上行 100% 被丢弃，但服务端下行 SRTCP/SRTP 仍能回流客户端。",
         dir: "s2c", pill: "DL SRTCP ONLY!", pillColor: "#f59e0b",
         cli: "UPLINK BLACKHOLE", cliEx: "下行回包≠上行存活", dpi: "CGNAT :51000", dpiSub: "上行 100% 截断 · 下行放行", dpiColor: "#ef4444",
         srv: "STILL SENDING RTCP", srvEx: "尚不知上行已断", verdict: "WARN", verdictCls: "warn",
-        proto: "Asymmetric Uplink Blackhole", hdr: "C→S 0% / S→C 100%", dpiView: "最难察觉的单向半残映射", secAct: "严禁用下行 SRTCP 刷新上行活性！",
+        proto: "Asymmetric Uplink Blackhole", hdr: "C→S 0% / S→C 100%", dpiView: "裸 HY2 永久卡死在 0 Mbps", secAct: "严禁用下行 SRTCP 刷新上行活性！",
         hex: "Server keeps sending downlink Compound SRTCP -> Client verifies RTCP but does NOT reset uplink STUN consent timer!",
-        note: "早期版本若用任意收包刷新活性，会被服务端每 1~5s 发来的下行 SRTCP 不断续命，导致隧道永久卡死。"
+        note: "若用任意收包刷新活性，会被服务端定期下发的 SRTCP 不断误续命，导致隧道永久假死。"
       },
       {
-        title: "RFC 5389 §7.2.1 · 同 txid 指数退避重传防单包误切",
-        desc: "客户端发出 RFC 7675 STUN 保活无应答，按 1.1s → 1.6s → 2.0s 复用同一 txid 重传 2 次（共 3 次尝试，约 4.7s）。",
+        title: "RFC 5389 §7.2.1 · 同 txid 重传 3/3 确认为真实黑洞",
+        desc: "客户端发出 RFC 7675 STUN 保活无应答，按 1.1s → 1.6s → 2.0s 复用同一 txid 重传 2 次（共 ~4.7s），单包偶发丢包绝不误切。",
         dir: "drop_dpi", pill: "STUN KA (3/3 SAME TXID)", pillColor: "#f59e0b",
         cli: "KA RETRY 2/2", cliEx: "same txid · ~4.7s", dpi: "CGNAT :51000", dpiSub: "3 次上行全被黑洞吞噬", dpiColor: "#ef4444",
         srv: "0 STUN RECEIVED", srvEx: "last_peer_rx 计时中", verdict: "WARN", verdictCls: "warn",
-        proto: "RFC 5389 Same-Txid Retransmit", hdr: "use_candidate = false", dpiView: "单包随机丢包会在第 2 次恢复不误切", secAct: "3/3 均无应答 → 确认为真实黑洞",
-        hex: "[client-rs#0] RFC 7675 consent lost (3/3 STUN unanswered) up_sport=42010 -> draining 35s + rotating to fresh 5-tuple",
-        note: "单次偶发丢包会在 1.1s 同 txid 重传恢复，绝不误换口；连续 3 次无应答才果断判定单向上行黑洞。"
+        proto: "RFC 5389 Same-Txid Retransmit", hdr: "use_candidate = false", dpiView: "偶发单包丢包会在 1.1s 重传恢复", secAct: "3/3 均无应答 → 触发 V4.0 1-RTT 迁移",
+        hex: "[client-rs#0] RFC 7675 consent lost (3/3 STUN unanswered) -> old_path_drains 50s + 1-RTT ICE migration",
+        note: "旧 socket 转入 50s 静默接收排空池（> 服务端 45s TTL），吸收在途尾包避免回弹明文 ICMP Port Unreachable，同时防止内核立刻复用坏口。"
       },
       {
-        title: "35 秒静默 Drain · 旧端口只收不发（零 ICMP + 防 CGNAT 复用坏口）",
-        desc: "旧 socket 不立刻 close()，而是转入 35s 静默接收态吸收服务端尾包；服务端 30s 无认证收包后按 RFC 7675 静默释放旧会话。",
-        dir: "s2c", pill: "SILENT DRAIN (35s)", pillColor: "#a855f7",
-        cli: "OLD: DRAIN 35s", cliEx: "零 ICMP · 防端口复用", dpi: "ZERO ICMP LEAK", dpiSub: "旧端口静默吸收尾包", dpiColor: "#a855f7",
-        srv: "30s CONSENT EXPIRE", srvEx: "reason=consent_timeout", verdict: "PASS", verdictCls: "pass",
-        proto: "Silent Receive-Only Drain", hdr: "35s > Server 30s TTL", dpiView: "无 ICMP Port Unreachable 弹包", secAct: "占住旧本地口防内核立刻复用黑洞映射",
-        hex: "Old up_sport=42010 stays bound (RX drop-only) for 35s; server silently reaps :51000 at t+30s (reason=consent_timeout).",
-        note: "如果立刻 close 旧端口，服务端下一秒发来的下行 SRTCP 会触发路由器回弹 ICMP Port Unreachable，暴露异常状态。"
+        title: "V4.0 1-RTT 迁移 STUN + 防反射加密 0xFFFD 路径挑战",
+        desc: "客户端保留 DTLS-PFS 主密钥与单调 SRTP 序列号，在新端口用每会话 HKDF 派生密钥 ice-pwd-v4 签名迁移 STUN；服务端回 64B STUN + 无填充 57B 0xFFFD 挑战。",
+        dir: "c2s_s2c", pill: "ICE MIG ⇄ 0xFFFD CHAL", pillColor: "#a855f7",
+        cli: "MIGRATING :51088", cliEx: "keep PFS key & seq", dpi: "DPI: ICE NOMINATE", dpiSub: "标准 RFC 8445 路径切换", dpiColor: "#22d3ee",
+        srv: "CHALLENGE (≤1.32x)", srvEx: "验证前绝不改路由!", verdict: "PASS", verdictCls: "pass",
+        proto: "RFC 8445 ICE + 0xFFFD Challenge", hdr: "121B ≤ 1.32x 防反射放大", dpiView: "标准 ICE 候选切换 + SRTP 密文", secAct: "每会话 HKDF 阻断同 PSK 劫持 · 限速 ≤4/s",
+        hex: "C->S: STUN(USE-CANDIDATE, mi_key_mig) -> S->C: 64B STUN OK + 57B Enc(0xFFFD Challenge, nonce, epoch)",
+        note: "服务端收到迁移请求后进入 4 槽位候选表，在收到客户端合法加密 0xFFFD 响应之前绝不修改 token_by_peer 或切走下行流量，彻底防源地址伪造劫持。"
       },
       {
-        title: "无感换口自愈 · 新五元组亚秒级重建隧道并回放缓冲包",
-        desc: "客户端立即分配全新本地端口 (:42088 → CGNAT :51088)，完成新 STUN + DTLS 握手并 flush 缓冲包，上层 Hysteria 2 全程不断线！",
-        dir: "c2s_s2c", pill: "ROTATE :51088 (~654ms)", pillColor: "#10b981",
-        cli: "STATE: READY ✓", cliEx: "new :51088 | flushed=5", dpi: "DPI: NEW WEBRTC", dpiSub: "新五元组畅通放行 ✓", dpiColor: "#10b981",
-        srv: "AUTH + DTLS OK ✓", srvEx: "new PFS key active", verdict: "PASS", verdictCls: "pass",
-        proto: "Fresh 5-Tuple Auto-Rotation", hdr: "USE-CANDIDATE = true", dpiView: "全新 WebRTC 媒体重连会话", secAct: "跨洋实测亚秒级 (~654ms) 零断流自愈",
-        hex: "ICE STUN OK mapped=198.51.100.24:51088 rtt=162ms -> DTLS OK -> READY total_hs=654ms flushed=5",
-        note: "同理适用于云端服务端重启（NEW-M-01 拒绝孤儿保活 → 客户端自动换口重握），无需人工干预或重启服务。"
+        title: "1-RTT 满血恢复 · 0 DTLS 重握、0 后端换口（实测 P8 5.2s 复速）",
+        desc: "客户端回显加密 0xFFFD 响应，服务端原地切换 peer_addr 并保留原 backend_sock（跨 worker 无锁迁移），内层 HY2 无需重连直接拉回满速！",
+        dir: "c2s_s2c", pill: "0xFFFD OK · 0 PORT CHG", pillColor: "#10b981",
+        cli: "STATE: READY ✓", cliEx: "new :51088 | 0 DTLS HS", dpi: "DPI: NEW 5-TUPLE", dpiSub: "新五元组畅通放行 ✓", dpiColor: "#10b981",
+        srv: "MIGRATED IN-PLACE ✓", srvEx: "same backend_sock!", verdict: "PASS", verdictCls: "pass",
+        proto: "1-RTT In-Place Path Migration", hdr: "0 DTLS 重握 · 5s 旧路 ECMP 排空", dpiView: "无缝续传加密 WebRTC 媒体流", secAct: "兼容旧版 v0.3.8 服务端自动回退重握",
+        hex: "[server-rs#0] ICE 1-RTT MIGRATION OK old=:51000 -> new=:51088 backend_sport=51481 (0 DTLS, 0 port change!)",
+        note: "对比 P8 黑洞压测：t=3.5s 断上行后裸 HY2 永久死锁在 0 Mbps，而 V4.0 在 t=8.7s（约 5.2s）满血拉回 18.9 Mbps 全程不断流。"
       }
     ]
   },
@@ -1305,10 +1354,10 @@ const PACKETS = {
         v32: "100% 对齐 libwebrtc draft-holmer-rmcat-transport-wide-cc 行为，独立 X 光审计确认 global_twcc_mono=True。"
       },
       {
-        off: "20..21", len: "2B", name: "inner_len / 0xFFFE 探针", val: "Enc(u16 BE ≤65400 | 0xFFFE)", tone: "tone-enc",
+        off: "20..21", len: "2B", name: "inner_len / V4 带内控制帧", val: "Enc(≤65400 | 0xFFFE | 0xFFFD | 0xFFFC)", tone: "tone-enc",
         scope: "AEAD 密文内层（线上完全不可见）",
-        dpi: "DPI 仅见高熵密文，既看不到真实载荷长度，也无法区分正常业务流量与 selftest 0xFFFE 诊断探针。",
-        v32: "v0.3.5 新增 0xFFFE 保留魔数（严格 > MAX_INNER_UDP_LEN=65400 零冲突），服务端直接 1:1 加密回显，永不转发后端。"
+        dpi: "DPI 仅见高熵密文，无法区分正常业务流量与 0xFFFE 诊断回显、0xFFFD 1-RTT 迁移挑战或 0xFFFC MBB 原子过户帧。",
+        v32: "全部保留魔数严格 > MAX_INNER_UDP_LEN (65400) 零冲突且永不转发后端，所有控制帧同步计入 SRTP 收发计数以保持 RFC 3550 RTCP 因果律。"
       },
       {
         off: "22..N", len: "Var", name: "原始 UDP 载荷 (密文)", val: "Enc(Hysteria2 / WG)", tone: "tone-enc",
@@ -1503,7 +1552,7 @@ function renderPacket() {
     </div>
     <div class="wire-hex" style="margin-bottom:10px">${sel.val}</div>
     <div class="sec"><strong>DPI / Wireshark 线上视角</strong>${sel.dpi}</div>
-    <div class="sec"><strong>V3.2 工程与安全加固点</strong>${sel.v32}</div>
+    <div class="sec"><strong>V4.0 工程与安全加固点</strong>${sel.v32}</div>
   `;
 
   document.getElementById("padSimBox").style.display = pk.showPadSim ? "block" : "none";

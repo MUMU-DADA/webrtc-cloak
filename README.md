@@ -11,7 +11,7 @@
 一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用与透明 UDP 封装实验原型。基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 9147 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550 / 7587），完整实现 `ICE STUN + 真双向加密证书 DTLS 1.3/1.2 + 音视频双 SSRC SRTP/SRTCP` 传输层框架，用于研究现代协议识别（DPI）、UDP 状态化防火墙/CGNAT 黑洞自愈、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
 
 > [!TIP]
-> - **在线交互式原理演示**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**（5 种对抗与自愈推演、字节级报文解剖、双 SSRC / PPPoE MTU 1488 模拟，亦可离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）
+> - **在线交互式原理演示**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**（6 种对抗与自愈推演、字节级报文解剖、双 SSRC / PPPoE MTU 1488 模拟，亦可离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）
 > - **协议规范文档（线格式 / 密钥派生 / 状态机）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.4.2`）
 > - **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
