@@ -1,4 +1,4 @@
-# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.4.3`)
+# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.4.4`)
 
 This document specifies the wire format, cryptographic schedule, state machine, and security boundaries of `webrtc-cloak-rs`.
 
@@ -90,7 +90,7 @@ iv[8..12] = ext_seq[31:0]
   - `PT=111` (Opus 48 kHz, 960 ticks/20ms): packets smaller than jittered threshold `180..=307B`, strictly capped to **at most 1 packet per 20ms frame (`<= 50 pps`)**; talkspurt `M=1` after `>=200ms` silence.
   - `PT=96` (Video 90 kHz): all remaining and overflow packets; strict RFC 3550 `M=1` causality guarantees no packet ever reuses a closed frame's timestamp after `M=1`.
   - Independent 2048-packet RFC 6479 sliding replay rings per SSRC; shared global `0xBEDE` TWCC sequence.
-- **PPPoE Anti-Fragmentation**: Default `--mtu 1488` enforces outer UDP `<= 1460B` (`IPv4 <= 1488B < 1492B PPPoE`); oversized inner packets are dropped cleanly to converge inner QUIC DPLPMTUD.
+- **PPPoE Anti-Fragmentation (IPv4 & IPv6)**: Default `--mtu 1488` enforces outer UDP `<= 1460B` on IPv4 (28B IPv4+UDP header) and `<= 1440B` on IPv6 (48B IPv6+UDP header, `< 1492B` PPPoE); STUN `XOR-MAPPED-ADDRESS` implements RFC 5389 §15.2 for both IPv4 (`64B` total reply) and IPv6 (`76B` total reply). Oversized inner packets are dropped cleanly to converge inner QUIC DPLPMTUD.
 
 ### 5.2 Compound SRTCP Wire Frame (RFC 3550 §6.1 / RFC 7714 §9.1)
 ```text
@@ -119,7 +119,11 @@ iv[8..12] = ext_seq[31:0]
    - Before promoting the standby session, client sends an encrypted in-band `0xFFFC` handover frame carrying `old_ufrag` and `HKDF-SHA256(old_session_key, new_session_key, "handover-v4")` (4 × 380ms retries). Server verifies the proof in constant time (single-use per old session, idempotent on retransmit) and atomically transfers exclusive ownership of `old_sess`'s live `backend_sock` (`BackendPipe::Owned` → `ForwardLocal`/`ForwardRemote`, chained forwarding up to 4 hops, zero `dup()` races, works across Linux `SO_REUSEPORT` workers) so **even strict source-port-pinned UDP backends see 0 port changes and 0 packet loss**. All `0xFFFD`/`0xFFFC` control frames account into SRTP `tx_pkts`/`rx_pkts` for strict RFC 3550 RTCP causality.
    - Dual triggers: right-skewed **log-normal duration** (`[0.35x, 2.80x]` around `--rotate-interval`) AND randomized **single-session byte-volume budget** (`--rotate-bytes`, default `1200 MiB` → `600–2220 MiB`, 60s cooldown), suspended during background trickle (`< 64 KB / 5 min`, 5–8h fallback cap).
    - Tracks explicit `standby_for_primary` ownership, cancels orphan standbys on primary failure/restart/close, and delays old-session `BYE` by randomized **2–10s** (`DrainingBeforeBye`) + 1s post-BYE client drain + 250ms server `Closing` downlink flush.
-4. **Decoupled Outer Health Telemetry (`--status-file` / `--status-http`, `v0.4.1`)**:
+4. **Non-Blocking ECMP Fast-Lane Hunting (`--lane-hunt`, `v0.4.4`)**:
+   - Designed for multi-path / ECMP networks where per-5-tuple hashing maps different UDP ephemeral source ports to distinct routing paths.
+   - At startup, client runs a staggered multi-candidate STUN race (`--lane-probes`, default `4`, `--lane-rounds`, default `3`, `--lane-target-rtt`), early-stops once a fast lane is found, pre-warms DTLS 1.3 to `Ready`, and hands off with 0ms delay on the first local application packet (keeping the lane warm via minimal `0xFFFE` probes while idle).
+   - Continuously monitors STUN keepalive RTT; 3 consecutive samples exceeding the configured or adaptive threshold (subject to `--lane-cooldown`, default `60s`) trigger a background multi-candidate probe and atomic MBB `0xFFFC` handover **only if** a strictly faster candidate is found (0 backend source-port change). Scheduled MBB rotations and 1-RTT blackhole migrations likewise race multiple candidate source ports (aligned with server `MAX_CHALLENGES_PER_SEC=4`).
+5. **Decoupled Outer Health Telemetry (`--status-file` / `--status-http`, `v0.4.1`)**:
    - Exposes real outer link quality (STUN RTT / EWMA / RFC 3550 jitter / rolling 20-probe loss %, smoothed Mbps throughput, 10-minute blackhole & 1-RTT migration counts, MBB handover counters, and server unauthenticated silent-drop scan counters) strictly off the SRTP hot path.
    - Available simultaneously via zero-dependency atomic `tmp + rename` RFC 8259 JSON file (`--status-file`) and/or a lightweight single-thread `mio::Poll` read-only HTTP listener (`--status-http`, 64 KiB stack, zero idle wakeups, serving JSON on `/`, `/status`, `/health`, `/healthz` with `503` on critical, and Prometheus exposition text on `/metrics`), enabling external controllers or adaptive inner protocols to react to outer path degradation without coupling to tunnel internals.
-5. **Known Scope Boundaries**: `webrtc-cloak` is a transparent UDP transport wrapper (not a TCP/TUN VPN), cannot bypass networks blocking 100% of UDP egress, cannot erase single-tenant `(src_ip, dst_ip)` macro NetFlow correlation on a single server, and carries pure-Rust `dimpl` JA4D stack characteristics distinct from C++ BoringSSL.
+6. **Known Scope Boundaries**: `webrtc-cloak` is a transparent UDP transport wrapper (not a TCP/TUN VPN), cannot bypass networks blocking 100% of UDP egress, cannot erase single-tenant `(src_ip, dst_ip)` macro NetFlow correlation on a single server, and carries pure-Rust `dimpl` JA4D stack characteristics distinct from C++ BoringSSL.

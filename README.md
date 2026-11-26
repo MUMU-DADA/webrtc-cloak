@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-Pure%20Rust%20%7C%20Zero%20C%20Deps-orange.svg)](#从源码构建与目录结构)
-[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.4.3-6366f1.svg)](./SPEC.md)
+[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.4.4-6366f1.svg)](./SPEC.md)
 [![Interactive Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-0ea5e9.svg)](https://mumu-dada.github.io/webrtc-cloak/)
 [![Release](https://img.shields.io/github/v/release/MUMU-DADA/webrtc-cloak?color=10b981)](https://github.com/MUMU-DADA/webrtc-cloak/releases)
 
@@ -12,7 +12,7 @@
 
 > [!TIP]
 > - **在线交互式原理演示**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**（6 种对抗与自愈推演、字节级报文解剖、双 SSRC / PPPoE MTU 1488 模拟，亦可离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）
-> - **协议规范文档（线格式 / 密钥派生 / 状态机）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.4.3`）
+> - **协议规范文档（线格式 / 密钥派生 / 状态机）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.4.4`）
 > - **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
 ---
@@ -58,7 +58,10 @@ flowchart LR
   - **定时/定量无感轮换（MBB）**：按对数正态宽分布时长或字节预算发起全新 DTLS 1.3 握手（全新 `ufrag`/`SSRC`/`CNAME` 防关联），通过 AEAD 密文内 `0xFFFC` 原子过户服务端 `backend_sock`（含 Linux 多核 `SO_REUSEPORT` 跨线程无锁迁移），有状态 UDP 后端 **0 端口变化、0 丢包**。
   - **单向上行黑洞 1-RTT 迁移**：经 RFC 7675 同 `txid` 重传确认黑洞后，客户端用每会话 HKDF 派生密钥在新端口 1-RTT 原地迁移（防反射挑战验真、0 DTLS 重握、保留后端源端口，旧口静默排空避免 ICMP 弹包）。
   - **优雅重启与微流静音**：服务端 `SIGTERM` 广播加密 `SRTCP BYE + close_notify`，客户端 `80–350ms` 抖动快切；空闲/微流态自动退避控制面报文，来包秒恢复。
-- **PPPoE MTU 1488 防分片与零指纹响应**：默认 `--mtu 1488`（`< 1492B` PPPoE）自动引导内层 QUIC/Hysteria 2 收敛至零 IPv4 分片；主动探测与孤儿保活严格 0 字节静默丢弃。
+- **双栈 IPv6 与 ECMP 优车道自适应优选（`v0.4.4`）**：
+  - 全链路原生支持 IPv4 / IPv6 双栈（`--listen-host` / `--server-host` / `selftest`，遵循 RFC 5389 §15.2 IPv6 `XOR-MAPPED-ADDRESS` 与 48B IPv6+UDP 外层 MTU/DTLS 精确核算）。
+  - 可选客户端 `--lane-hunt` 非阻塞 ECMP 优车道引擎：启动即并发错峰 STUN 探测并预热低延迟优车道（0ms 衔接首包）、运行期连续 STUN RTT 劣化自动后台 MBB 寻优切换（`0xFFFC` 原子过户，后端 0 换口，若无更优候选则平稳取消），并在定时轮换与 1-RTT 黑洞迁移阶段同样优中选优。
+- **PPPoE MTU 1488 防分片与零指纹响应**：默认 `--mtu 1488`（`< 1492B` PPPoE）自动按 IPv4/IPv6 报头开销引导内层 QUIC/Hysteria 2 收敛至零分片；主动探测与孤儿保活严格 0 字节静默丢弃。
 - **解耦外层健康遥测（`v0.4.1+`）**：严格旁路于 SRTP 热路径，采用零外部依赖手写 RFC 8259 JSON 原子落盘（`--status-file`）与单线程事件驱动 `mio::Poll` 本地只读 HTTP / Prometheus 端点（`--status-http`，64 KiB 栈、空闲 0 唤醒）。
 - **轻量极致性能**：默认 `--workers 1` 单线程无锁 `mio` 事件循环即可承载千级并发会话（静态 musl 二进制 `x86_64` 仅 **`1.95 MiB`**、`aarch64` **`1.62 MiB`**、`macos-arm64` **`1.49 MiB`**；Unix 采用无锁 `sigaction` 自管道优雅退出，纯隧道常驻 **1 线程**、开启 HTTP 遥测 **2 线程**，macOS 实测 RSS **`2.7–3.4 MiB`**），Linux 多核按需支持 `--workers <N|auto>`。
 
@@ -104,7 +107,7 @@ flowchart LR
 
 ### 综合对抗与工程边界总览
 
-| 对抗 / 故障场景 | 裸 UDP / 早期版本 | **WebRTC-Cloak V4.0 (`v0.4.3`)** |
+| 对抗 / 故障场景 | 裸 UDP / 早期版本 | **WebRTC-Cloak V4.0 (`v0.4.4`)** |
 | :--- | :--- | :--- |
 | **严苛 NAT 5 包截断 & 主动探测** | 裸 UDP/QUIC 第 6 包起截断 | ICE STUN 握手后 `100%` 放行；双 SSRC 将 7 类固定包长展宽为 `168` 种长度；主动探测 `0 B` 静默丢弃 |
 | **定时 / 定量五元组轮换 (MBB)** | 固定五元组易关联；硬重连断流 | **4 次全新 DTLS 1.3 换口 + `0xFFFC` 密文过户**：`33,280 / 33,280` 实收（`0.00%` 丢包、`0 ms` 卡顿、后端 `0` 换口） |
@@ -151,13 +154,18 @@ chmod 600 /tmp/webrtc-cloak.psk
 | `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 | 预置共享密钥（推荐文件或环境变量，避免进程列表泄露） |
 | `--cipher <auto\|aes-gcm\|chacha20\|blake2b>` | `auto` | 加密套件；`auto` 经 DTLS 握手按两端 CPU 指令集自动协商 |
 | `--dtls-min-version <auto\|1.2\|1.3>` | `auto` | DTLS 最低版本；默认优先 1.3 兼容 1.2 滚动升级，双端升完可设为 `1.3` 防降级 |
+| `--lane-hunt` | 关闭 | 启用客户端非阻塞 ECMP 优车道优选（启动并发 STUN 预热 + 运行期 RTT 劣化后台 MBB 寻优 + 轮换/黑洞迁移多候选竞速） |
+| `--lane-probes <2..=8>` | `4` | 单轮 `--lane-hunt` 并发 STUN 候选探测口数量（默认 4，与服务端每会话限流对齐） |
+| `--lane-rounds <1..=6>` | `3` | 未达目标 RTT 阈值时的最大多轮重试次数 |
+| `--lane-target-rtt <MS>` | `0`（自适应） | 目标优选 RTT 阈值（毫秒）；`0` 时按历史最小 RTT 自适应触发劣化寻优 |
+| `--lane-cooldown <5..=3600>` | `60` | 两次劣化寻优之间的冷却间隔（秒） |
 | `--rotate-interval <SECS>` | `0`（关闭） | 定时 MBB 无感五元组轮换中位间隔（对数正态 `[0.35x, 2.80x]`，后台微流自动挂起，配合 `0xFFFC` 过户实现 0 后端换口） |
 | `--rotate-bytes <MB>` | 随轮换启 `1200`（`0` 关） | 单流字节预算 MBB 轮换基线（对数正态 `[0.50x, 1.85x]`，含 60s 冷却锁） |
 | `--workers <1\|N\|auto>` | `1` | 工作线程数；默认 `1` 单线程，Linux 可选多核 `SO_REUSEPORT` |
 | `--keepalive <SECS>` | `5` | RFC 7675 STUN Consent 保活间隔（`±20%` 抖动；连续 3 次无应答自动触发 1-RTT 黑洞迁移） |
 | `--idle-timeout <SECS>` | `120` | 空闲超时后发送加密 `SRTCP BYE + DTLS close_notify` 优雅退出 |
 | `--max-sessions <N>` | `4096` | 单 worker 最大并发 UDP 会话数 |
-| `--mtu <BYTES>` | `1488` | 外层 IPv4 WAN MTU 上限（适配 `1492B` PPPoE 零分片；`0` 表示不限制） |
+| `--mtu <BYTES>` | `1488` | 外层 IPv4/IPv6 WAN MTU 上限（适配 `1492B` PPPoE 零分片；`0` 表示不限制） |
 | `--status-file <PATH>` | 关闭 | 外层健康快照原子 JSON 落盘路径（`tmp + rename`，适合 `/tmp` 内存盘） |
 | `--status-http <IP:PORT>` | 关闭 | 本地只读 HTTP 遥测端点（`/status` `/health` `/healthz` `/metrics`） |
 | `--status-interval <SECS>` | `5` | 遥测快照刷新周期（`1..=60s`；黑洞/迁移/轮换事件即时刷新） |
@@ -225,7 +233,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 │   ├── bandwidth-overhead.svg             # 4. 带宽损耗与外层流量放大折线图
 │   └── benchmark-performance.svg          # 5. 多平台加解密算力与全隧道环回跑分图
 ├── README.md                              # 项目说明、实测图表与快速上手指南
-├── SPEC.md                                # V4.0 / v0.4.3 线格式、密码学与状态机协议规范
+├── SPEC.md                                # V4.0 / v0.4.4 线格式、密码学与状态机协议规范
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示页（离线 / GitHub Pages）
 ├── LICENSE                                # MIT 开源许可证
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 C 外部库依赖 / 零 OpenSSL）

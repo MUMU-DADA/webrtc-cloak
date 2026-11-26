@@ -18,6 +18,7 @@ jobs:
   test:
     name: Cargo Test (Ubuntu)
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -205,6 +206,10 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Full Dual-Stack IPv6 & Non-Blocking ECMP Fast-Lane Hunting (`v0.4.4`)**:
+            - End-to-end IPv4/IPv6 dual-stack support across `client`, `server`, `selftest`, and `bench_tools` (`RFC 5389 §15.2` IPv6 `XOR-MAPPED-ADDRESS`, 48B IPv6+UDP outer MTU/DTLS accounting, bracketed & raw IPv6 CLI parsing)
+            - Optional `--lane-hunt` non-blocking ECMP lane hunter (`--lane-probes`, `--lane-rounds`, `--lane-target-rtt`, `--lane-cooldown`): staggered multi-candidate startup STUN race with DTLS 1.3 pre-warm, continuous RTT-degradation guard triggering background MBB `0xFFFC` handover (0 backend port change), multi-candidate racing during scheduled rotations & 1-RTT blackhole migrations, and `lane_hunts_total` / `lane_switches_total` telemetry
+            - Fixed Linux `epoll` `mio::Waker` early-drop shutdown race in `TelemetryHub::shutdown()` so `--status-http` tears down deterministically across Linux, macOS, and Windows
           - **Binary Size, Memory & Thread Footprint Optimization (`v0.4.3`)**:
             - Aligned all RustCrypto crates (`aes-gcm`/`chacha20poly1305`/`sha1`/`sha2`/`blake2 0.11`, `p256 0.14`, `hmac 0.13`, `getrandom 0.4`) to the `dimpl 0.9.0` generation (37 duplicate crates → **0**) with `fat LTO`, `-C force-unwind-tables=no`, and hybrid `-O3`/`-Os` compilation (`linux-x86_64-musl` `2.78 → 1.95 MiB`, `linux-aarch64-musl` `2.31 → 1.62 MiB`, `macos-arm64` `2.08 → 1.49 MiB`, while accelerating single-core AEAD throughput)
             - Replaced `tiny_http`, `serde`/`serde_json`, `crc32fast`, and Unix `ctrlc` with a zero-dependency single-thread `mio::Poll` HTTP telemetry server (64 KiB stack, 0 idle wakeups), hand-written RFC 8259 JSON, 64 B nibble-LUT IEEE CRC32, and async-signal-safe `sigaction` + self-pipe shutdown (`--workers 1` now runs in **1 OS thread** pure tunnel / **2 OS threads** with `--status-http`, down from 8)
