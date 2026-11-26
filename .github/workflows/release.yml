@@ -206,6 +206,11 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Universal Multi-Metric Adaptive Lane Scoring & Continuous Reinforcement (`v0.4.5`, 100% wire-compatible with `v0.4.x`)**:
+            - **Zero-hardcoded-threshold cold-start calibration (`--lane-target-rtt 0`)**: automatically samples across multiple staggered STUN rounds (`>= 2` rounds / up to 3 rounds for background `PreWarm`) with universal early-settle `(best_rtt + 45ms).clamp(80, 550)` to lock onto the global minimum RTT across 5ms–250ms geographies
+            - **Zero-wire-overhead SRTP data-plane packet loss + composite lane score (`0–100`)**: `SrtpCloakCipher::rx_settled_stats()` tracks exact downlink loss across Video+Audio SSRCs while excluding the trailing 24-packet reorder tail (0% false loss under heavy ECMP reordering) and isolating 1-RTT migration gaps via `reset_rx_loss_epoch()`; catches low-RTT throttled/lossy ("fake-good") lanes (`>= 8%` loss) and escapes via 0ms MBB `0xFFFC` handover
+            - **Canary trial confirmation & anti-flap hysteresis**: new/switched lanes confirm after 2 clean windows (`lane_confirmed = true`) or fast-escape on trial failure with 2^k exponential backoff during network-wide congestion; strict target-vs-degrade hysteresis, smoothed EWMA downward reinforcement, and gentle upward baseline relaxation prevent trap-band loops
+            - **Extended telemetry**: exposes `data_loss_pct`, `lane_score`, `lane_best_rtt_ms`, and `lane_confirmed` in `/status` JSON and `/metrics` Prometheus
           - **Full Dual-Stack IPv6 & Non-Blocking ECMP Fast-Lane Hunting (`v0.4.4`)**:
             - End-to-end IPv4/IPv6 dual-stack support across `client`, `server`, `selftest`, and `bench_tools` (`RFC 5389 §15.2` IPv6 `XOR-MAPPED-ADDRESS`, 48B IPv6+UDP outer MTU/DTLS accounting, bracketed & raw IPv6 CLI parsing)
             - Optional `--lane-hunt` non-blocking ECMP lane hunter (`--lane-probes`, `--lane-rounds`, `--lane-target-rtt`, `--lane-cooldown`): staggered multi-candidate startup STUN race with DTLS 1.3 pre-warm, continuous RTT-degradation guard triggering background MBB `0xFFFC` handover (0 backend port change), multi-candidate racing during scheduled rotations & 1-RTT blackhole migrations, and `lane_hunts_total` / `lane_switches_total` telemetry

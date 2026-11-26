@@ -47,8 +47,12 @@ const TELEMETRY_RTT_EWMA_ALPHA: f64 = 0.25;
 const TELEMETRY_HEALTH_CRITICAL_BLACKHOLES: usize = 2;
 /// STUN 滑动丢包率达到该百分比时判定链路健康状态为 `critical`。
 const TELEMETRY_HEALTH_CRITICAL_LOSS_PCT: f64 = 15.0;
+/// 数据面下行丢包率达到该百分比时判定链路健康状态为 `critical`。
+const TELEMETRY_HEALTH_CRITICAL_DATA_LOSS_PCT: f64 = 15.0;
 /// STUN 滑动丢包率达到该百分比时判定链路健康状态为 `degraded`。
 const TELEMETRY_HEALTH_DEGRADED_LOSS_PCT: f64 = 2.0;
+/// 数据面下行丢包率达到该百分比时判定链路健康状态为 `degraded`。
+const TELEMETRY_HEALTH_DEGRADED_DATA_LOSS_PCT: f64 = 5.0;
 /// STUN 抖动达到该毫秒阈值时判定链路健康状态为 `degraded`。
 const TELEMETRY_HEALTH_DEGRADED_JITTER_MS: f64 = 30.0;
 /// Prometheus `webrtc_cloak_health_code` 数值编码：`critical`。
@@ -100,6 +104,10 @@ pub struct WorkerSnapshot {
     pub unauth_drops_total: u64,
     pub active_up_sport: u16,
     pub active_backend_sport: u16,
+    pub data_loss_pct: f64,
+    pub lane_score: Option<f64>,
+    pub lane_best_rtt_ms: Option<f64>,
+    pub lane_confirmed: bool,
     pub dtls_version: &'static str,
     pub cipher: &'static str,
     pub dual_ssrc: bool,
@@ -217,6 +225,10 @@ pub(super) struct AggregatedView {
     pub(super) active_up_sport: u16,
     pub(super) active_backend_sport: u16,
     pub(super) stun_loss_pct: f64,
+    pub(super) data_loss_pct: f64,
+    pub(super) lane_score: Option<f64>,
+    pub(super) lane_best_rtt_ms: Option<f64>,
+    pub(super) lane_confirmed: bool,
     pub(super) blackholes_last_10m: usize,
     pub(super) migrations_1rtt_last_10m: usize,
 }
@@ -238,6 +250,11 @@ impl TelemetryInner {
         let mut unauth_drops_total = 0u64;
         let mut active_up_sport = 0u16;
         let mut active_backend_sport = 0u16;
+        let mut data_loss_pct = 0.0f64;
+        let mut lane_score: Option<f64> = None;
+        let mut lane_best_rtt_ms: Option<f64> = None;
+        let mut scored_workers = 0usize;
+        let mut all_scored_confirmed = true;
         let mut dtls_version = "none";
         let mut cipher = "none";
         let mut dual_ssrc = false;
@@ -258,6 +275,25 @@ impl TelemetryInner {
             if active_backend_sport == 0 && w.active_backend_sport != 0 {
                 active_backend_sport = w.active_backend_sport;
             }
+            if w.data_loss_pct.is_finite() && w.data_loss_pct > data_loss_pct {
+                data_loss_pct = w.data_loss_pct;
+            }
+            if let Some(s) = w.lane_score.filter(|v| v.is_finite()) {
+                scored_workers += 1;
+                if !w.lane_confirmed {
+                    all_scored_confirmed = false;
+                }
+                lane_score = Some(match lane_score {
+                    Some(prev) => prev.min(s),
+                    None => s,
+                });
+            }
+            if let Some(b) = w.lane_best_rtt_ms.filter(|v| v.is_finite()) {
+                lane_best_rtt_ms = Some(match lane_best_rtt_ms {
+                    Some(prev) => prev.min(b),
+                    None => b,
+                });
+            }
             if dtls_version == "none" && !w.dtls_version.is_empty() && w.dtls_version != "none" {
                 dtls_version = w.dtls_version;
             }
@@ -268,6 +304,7 @@ impl TelemetryInner {
                 dual_ssrc = true;
             }
         }
+        let lane_confirmed = scored_workers > 0 && all_scored_confirmed;
 
         // Track 10-minute unauthenticated silent-drop delta for scan alerting
         if unauth_drops_total > self.unauth_prev_total {
@@ -287,17 +324,23 @@ impl TelemetryInner {
         let blackholes_last_10m = self.blackhole_times.len();
         let migrations_1rtt_last_10m = self.migration_times.len();
 
+        let jitter_degrade_thresh = lane_best_rtt_ms
+            .map(|b| (b * 0.25).max(TELEMETRY_HEALTH_DEGRADED_JITTER_MS))
+            .unwrap_or(TELEMETRY_HEALTH_DEGRADED_JITTER_MS);
+
         let (health, health_code) =
             if active_sessions == 0 && migrating_sessions == 0 && handshaking_sessions == 0 {
                 ("idle", HEALTH_CODE_IDLE)
             } else if migrating_sessions > 0
                 || blackholes_last_10m >= TELEMETRY_HEALTH_CRITICAL_BLACKHOLES
                 || stun_loss_pct >= TELEMETRY_HEALTH_CRITICAL_LOSS_PCT
+                || data_loss_pct >= TELEMETRY_HEALTH_CRITICAL_DATA_LOSS_PCT
             {
                 ("critical", HEALTH_CODE_CRITICAL)
             } else if blackholes_last_10m == 1
                 || stun_loss_pct >= TELEMETRY_HEALTH_DEGRADED_LOSS_PCT
-                || self.stun_jitter_ms >= TELEMETRY_HEALTH_DEGRADED_JITTER_MS
+                || data_loss_pct >= TELEMETRY_HEALTH_DEGRADED_DATA_LOSS_PCT
+                || self.stun_jitter_ms >= jitter_degrade_thresh
                 || (active_sessions == 0 && handshaking_sessions > 0)
             {
                 ("degraded", HEALTH_CODE_DEGRADED)
@@ -326,6 +369,10 @@ impl TelemetryInner {
             active_up_sport,
             active_backend_sport,
             stun_loss_pct,
+            data_loss_pct,
+            lane_score,
+            lane_best_rtt_ms,
+            lane_confirmed,
             blackholes_last_10m,
             migrations_1rtt_last_10m,
         }

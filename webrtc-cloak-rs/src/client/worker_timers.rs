@@ -1,7 +1,7 @@
 //! 客户端超时驱动、黑洞 1-RTT 迁移、MBB 备选拉起与会话清理。
 
 use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_session};
-use super::lane_hunt::HuntPurpose;
+use super::lane_hunt::{HuntPurpose, MbbHuntReason};
 use super::worker::ClientWorker;
 use super::{
     alloc_token, cancel_standby_for_client, is_client_in_trickle, log, make_udp_socket,
@@ -897,7 +897,7 @@ impl ClientWorker {
                         HuntPurpose::MbbStandby {
                             primary_tok: prim_tok,
                             client_addr,
-                            degrade_baseline_ms: None,
+                            reason: MbbHuntReason::ScheduledRotate,
                         },
                         now,
                         VecDeque::new(),

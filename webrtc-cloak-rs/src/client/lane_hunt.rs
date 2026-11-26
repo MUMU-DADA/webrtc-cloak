@@ -45,20 +45,63 @@ pub const MAX_LANE_DEGRADE_COOLDOWN_SECS: u64 = 3600;
 const MIGRATE_1RTT_MAX_PROBES: usize = 4;
 /// 同轮候选之间的自然发包错峰间隔（毫秒，模拟 ICE trickle 节奏避免瞬时微突发）。
 const LANE_PROBE_STAGGER_MS: u64 = 15;
-/// 连续多少次 STUN 保活 RTT 超标后判定活跃信道退化并触发后台 MBB 抽卡。
-pub(super) const LANE_DEGRADE_CONSECUTIVE: u8 = 3;
+/// 自动阈值冷启动校准默认最少采样轮次（跨越至少 2 轮取全局最低 RTT，彻底避免硬编码 ms 阈值与单轮抽黑）。
+const LANE_COLD_CALIBRATION_ROUNDS: usize = 2;
+/// 冷启动自动校准期望的最小独立端口探测总数（`probes` 较小时自动补足到最多 3 轮）。
+const LANE_COLD_MIN_PROBES: usize = 6;
+/// 成熟已确认活跃信道连续多少次综合评分退化后触发后台 MBB 重抽。
+const LANE_DEGRADE_CONSECUTIVE: u8 = 3;
+/// 新切换/刚采用信道的试用确认期（Canary）连续多少次退化即快速淘汰重抽。
+const LANE_TRIAL_DEGRADE_CONSECUTIVE: u8 = 2;
+/// 试用确认期快速淘汰的缩短冷却上限（秒），连续失败过多时自动退回完整冷却防止风暴。
+const LANE_TRIAL_FAIL_COOLDOWN_SECS: u64 = 15;
+/// 允许启用缩短试用冷却的最大连续试用失败次数。
+const LANE_MAX_FAST_TRIAL_RETRIES: u8 = 2;
+/// 新信道连续多少个健康评估窗（高评分且低丢包）后晋升为「已强化确认」信道。
+const LANE_CONFIRM_GOOD_WINDOWS: u16 = 2;
+/// 持续处于亚健康区间（未触发退化但明显弱于历史最优）多少个评估窗后尝试一次低优先级后台寻优。
+const LANE_SUBOPT_MIN_WINDOWS: u16 = 6;
+/// 低优先级后台寻优的冷却倍率（避免平稳期频繁抽卡）。
+const LANE_SUBOPT_COOLDOWN_MULT: u64 = 3;
 /// 活跃信道 RTT EWMA 新样本权重。
-pub(super) const LANE_RTT_EWMA_ALPHA: f64 = 0.35;
+const LANE_RTT_EWMA_ALPHA: f64 = 0.35;
+/// 数据面下行丢包率评估所需的最小已稳定预期包数（低流量时跨保活周期累加直至达标）。
+const LANE_DATA_LOSS_MIN_PKTS: u64 = 24;
+/// 数据面下行丢包率 EWMA 新样本权重（偏敏捷，及时捕捉突发限速/拥塞丢包）。
+const LANE_DATA_LOSS_EWMA_ALPHA: f64 = 0.60;
+/// 静默无下行数据面窗口内，历史数据面丢包率的平滑衰减系数。
+const LANE_DATA_LOSS_IDLE_DECAY: f64 = 0.75;
+/// 触发「丢包主导退化」归类的有效丢包率阈值（8%）。
+const LANE_DATA_LOSS_DEGRADE_RATE: f64 = 0.08;
+/// 单会话 STUN 保活丢包滑动窗口容量（条，配合单丢包免疫防止偶发 1 包丢失误切）。
+const LANE_STUN_WINDOW_CAP: usize = 16;
+/// 跨地域无量纲综合评分的 RTT 归一化下限（毫秒，防止本机/局域网 1->5ms 调度抖动误判）。
+const LANE_SCORE_RTT_FLOOR_MS: f64 = 30.0;
+/// 综合评分中有效丢包率的惩罚权重（8% 丢包 -> 代价 +0.84 -> 评分 54.3 < 55，与 8% 退化线精确对齐）。
+const LANE_SCORE_LOSS_WEIGHT: f64 = 10.5;
+/// 综合评分中归一化抖动的惩罚权重与上限。
+const LANE_SCORE_JITTER_WEIGHT: f64 = 0.45;
+const LANE_SCORE_JITTER_CAP: f64 = 1.5;
+/// 综合评分低于该值判定信道退化（0..=100，满分 100）。
+pub(super) const LANE_DEGRADE_SCORE_THRESHOLD: f64 = 55.0;
+/// 综合评分达到该值且低丢包才可累计试用确认并强化最优基线。
+const LANE_CONFIRM_SCORE_THRESHOLD: f64 = 70.0;
 /// 退化重抽未能命中目标阈值时，仍值得切换的最小绝对收益（毫秒）。
 const LANE_IMPROVE_MIN_DELTA_MS: f64 = 25.0;
-/// 退化重抽未能命中目标阈值时，仍值得切换的最大 RTT 比例（需至少快 20%）。
+/// 低优先级后台寻优要求候选比当前信道至少快多少毫秒。
+const LANE_OPT_MIN_DELTA_MS: f64 = 15.0;
+/// 退化/寻优重抽仍值得切换的最大 RTT 比例（需至少快 20%）。
 const LANE_IMPROVE_MIN_RATIO: f64 = 0.80;
 /// 自动阈值模式下，后续抽卡判定优秀信道的基线倍率与最小增量（毫秒）。
-const LANE_AUTO_TARGET_MULT: f64 = 1.65;
-const LANE_AUTO_TARGET_ADD_MS: f64 = 40.0;
-/// 自动阈值模式下，活跃信道退化守护的基线倍率与最小增量（毫秒）。
-const LANE_AUTO_DEGRADE_MULT: f64 = 1.80;
-const LANE_AUTO_DEGRADE_ADD_MS: f64 = 50.0;
+/// 严格低于 `score < 55` 对应的无丢包退化上界（`b + 0.818 * max(b, 30)`），形成无陷阱带迟滞区间。
+const LANE_AUTO_TARGET_MULT: f64 = 1.40;
+const LANE_AUTO_TARGET_ADD_MS: f64 = 20.0;
+/// 冷启动自动校准单轮探测等待超时（毫秒，覆盖跨洋高延迟链路）。
+const LANE_COLD_ROUND_TIMEOUT_MS: u64 = 750;
+/// 冷启动自动校准早停附加余量与上下限（毫秒，确保同轮更快兄弟必能到达，同时不傻等绕路慢道）。
+const LANE_EARLY_SETTLE_AUTO_MARGIN_MS: f64 = 45.0;
+const LANE_EARLY_SETTLE_AUTO_MIN_MS: u64 = 80;
+const LANE_EARLY_SETTLE_AUTO_MAX_MS: u64 = 550;
 /// 单轮探测等待超时下限与上限（毫秒）。
 const LANE_ROUND_TIMEOUT_MIN_MS: u64 = 450;
 const LANE_ROUND_TIMEOUT_MAX_MS: u64 = 1200;
@@ -67,6 +110,26 @@ const PREWARM_FAIL_RETRY_MS: u64 = 3_000;
 const PREWARM_IDLE_REARM_MS: u64 = 1_500;
 /// 1-RTT 迁移成功后 `0xFFFD` 响应的补发次数（与 `worker_io::CLIENT_MIG_ECHO_COUNT` 对齐）。
 const MIG_ECHO_COUNT: u8 = 3;
+
+/// 跨地域无量纲综合信道评分（`0.0..=100.0`，越高越好）。
+/// 融合相对延迟倍率、真实数据面/STUN 有效丢包率与归一化抖动，在 5ms 局域网到 250ms 跨洲链路上通用一致。
+pub(super) fn compute_lane_score(
+    rtt_ewma_ms: f64,
+    ref_rtt_ms: f64,
+    loss_eff: f64,
+    jitter_ms: f64,
+) -> f64 {
+    if !rtt_ewma_ms.is_finite() || !ref_rtt_ms.is_finite() {
+        return 100.0;
+    }
+    let scale = ref_rtt_ms.max(LANE_SCORE_RTT_FLOOR_MS);
+    let rtt_term = 1.0 + (rtt_ewma_ms - ref_rtt_ms).max(0.0) / scale;
+    let loss_term = loss_eff.clamp(0.0, 1.0) * LANE_SCORE_LOSS_WEIGHT;
+    let jitter_term =
+        (jitter_ms.max(0.0) / scale).min(LANE_SCORE_JITTER_CAP) * LANE_SCORE_JITTER_WEIGHT;
+    let cost = (rtt_term + loss_term + jitter_term).max(1.0);
+    (100.0 / cost).clamp(0.0, 100.0)
+}
 
 /// ECMP 信道抽卡探测与活跃信道优选守护配置。
 #[derive(Clone, Copy, Debug)]
@@ -109,6 +172,21 @@ impl LaneHuntConfig {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(super) enum MbbHuntReason {
+    /// 定时或字节预算触发的计划 5-tuple 轮换：始终切换到本轮抽卡最优候选。
+    ScheduledRotate,
+    /// 活跃信道延迟/抖动退化：仅当候选达标或明显优于当前信道时才切换，避免全局拥塞抖动。
+    DegradeRtt { cur_ewma_ms: u64 },
+    /// 活跃信道数据面或 STUN 丢包退化：接受任何达标或不显著慢于当前信道的健康候选以逃离限速/高丢包通道。
+    DegradeLoss { cur_ewma_ms: u64, loss_pct_x10: u16 },
+    /// 长期处于亚健康区间后的低优先级后台寻优：仅在抽到严格更优信道时切换，零打扰强化最优信道。
+    Optimize {
+        cur_ewma_ms: u64,
+        cur_loss_pct_x10: u16,
+    },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(super) enum HuntPurpose {
     /// 启动预热或空闲重热：抽中优秀信道并完成握手后暂存，供下个本地客户端 0ms 秒连。
     PreWarm,
@@ -121,9 +199,7 @@ pub(super) enum HuntPurpose {
     MbbStandby {
         primary_tok: Token,
         client_addr: SocketAddr,
-        /// `Some(cur_ewma_ms)` 表示退化触发的重抽，若未抽到明显更优信道则放弃切换保稳定；
-        /// `None` 表示定时/字节预算触发的计划轮换，始终择优切换。
-        degrade_baseline_ms: Option<u64>,
+        reason: MbbHuntReason,
     },
     /// 黑洞 1-RTT ICE 路径迁移多候选竞速：最多 4 路并发挑战，仅对最快信道回复 `0xFFFD RESP`。
     Migrate1Rtt {
@@ -139,13 +215,21 @@ impl HuntPurpose {
             HuntPurpose::PreWarm => "prewarm",
             HuntPurpose::NewPrimary { .. } => "new-primary",
             HuntPurpose::MbbStandby {
-                degrade_baseline_ms: Some(_),
-                ..
-            } => "mbb-degrade",
-            HuntPurpose::MbbStandby {
-                degrade_baseline_ms: None,
+                reason: MbbHuntReason::ScheduledRotate,
                 ..
             } => "mbb-rotate",
+            HuntPurpose::MbbStandby {
+                reason: MbbHuntReason::DegradeRtt { .. },
+                ..
+            } => "mbb-degrade-rtt",
+            HuntPurpose::MbbStandby {
+                reason: MbbHuntReason::DegradeLoss { .. },
+                ..
+            } => "mbb-degrade-loss",
+            HuntPurpose::MbbStandby {
+                reason: MbbHuntReason::Optimize { .. },
+                ..
+            } => "mbb-optimize",
             HuntPurpose::Migrate1Rtt { .. } => "migrate-1rtt",
         }
     }
@@ -188,6 +272,7 @@ impl HuntCandidate {
 pub(super) struct LaneHunt {
     pub(super) id: usize,
     pub(super) purpose: HuntPurpose,
+    pub(super) cold_calibration: bool,
     pub(super) round: usize,
     pub(super) max_rounds: usize,
     pub(super) total_probed: usize,
@@ -209,26 +294,44 @@ impl ClientWorker {
         }
     }
 
-    /// 计算活跃信道退化触发阈值（毫秒）。
-    pub(super) fn effective_degrade_ceiling_rtt(&self) -> Option<f64> {
-        if self.cfg.lane_hunt.target_rtt_ms > 0 {
-            Some(self.cfg.lane_hunt.target_rtt_ms as f64)
+    /// 计算新信道试用确认期（Canary）允许的最短重抽冷却：正常时缩短至 15s 快速逃离劣化新通道；
+    /// 若连续试用失败过多（表明网络或本地链路整体拥塞/丢包），按 2^k 指数退避（上限 `MAX_LANE_DEGRADE_COOLDOWN_SECS`）防止切换风暴。
+    pub(super) fn trial_cooldown_dur(&self) -> Duration {
+        let base_secs = self.cfg.lane_hunt.normalized().degrade_cooldown_secs;
+        if self.consecutive_trial_failures < LANE_MAX_FAST_TRIAL_RETRIES {
+            Duration::from_secs(base_secs.min(LANE_TRIAL_FAIL_COOLDOWN_SECS))
         } else {
-            self.best_observed_rtt_ms
-                .map(|b| (b * LANE_AUTO_DEGRADE_MULT).max(b + LANE_AUTO_DEGRADE_ADD_MS))
+            let exp = (self.consecutive_trial_failures - LANE_MAX_FAST_TRIAL_RETRIES).min(3);
+            let backed_off = base_secs
+                .saturating_mul(1u64 << exp)
+                .min(MAX_LANE_DEGRADE_COOLDOWN_SECS);
+            Duration::from_secs(backed_off)
         }
     }
 
-    /// 保守更新观测到的优秀信道基线 RTT（偏向最小值，防止劣质信道拉高基线）。
+    /// 强化更新观测到的最优信道基线 RTT（使用保守平滑步长仅向更优方向收紧，防止单次毛刺棘轮下漂）。
     pub(super) fn observe_good_rtt(&mut self, rtt_ms: f64) {
         if !rtt_ms.is_finite() || rtt_ms <= 0.0 || rtt_ms > 30_000.0 {
             return;
         }
         self.best_observed_rtt_ms = Some(match self.best_observed_rtt_ms {
-            Some(prev) if rtt_ms < prev => prev * 0.3 + rtt_ms * 0.7,
-            Some(prev) => prev.min(rtt_ms * 0.05 + prev * 0.95),
+            Some(prev) if rtt_ms < prev => prev * 0.50 + rtt_ms * 0.50,
+            Some(prev) => prev,
             None => rtt_ms,
         });
+    }
+
+    /// 当一整次多轮抽卡穷尽全部轮次后仍无法达到历史基线（例如从 Wi-Fi 切到 5G 或网络全局抬升），
+    /// 温和向上松弛基线 RTT，使自适应评分逐步收敛到新的真实地板而不永久误报。
+    fn relax_baseline_rtt(&mut self, observed_best_ms: f64) {
+        if !observed_best_ms.is_finite() || observed_best_ms <= 0.0 || observed_best_ms > 30_000.0 {
+            return;
+        }
+        if let Some(prev) = self.best_observed_rtt_ms {
+            if observed_best_ms > prev {
+                self.best_observed_rtt_ms = Some(prev * 0.85 + observed_best_ms * 0.15);
+            }
+        }
     }
 
     /// 计算预热会话为保活服务端 `idle_timeout` 而发送微小 `0xFFFE` 探测包的间隔。
@@ -355,9 +458,13 @@ impl ClientWorker {
             HuntPurpose::Migrate1Rtt { .. } => 1,
             _ => cfg.max_rounds,
         };
+        let cold_calibration = cfg.target_rtt_ms == 0
+            && self.best_observed_rtt_ms.is_none()
+            && !matches!(purpose, HuntPurpose::Migrate1Rtt { .. });
         let mut hunt = LaneHunt {
             id,
             purpose,
+            cold_calibration,
             round: 0,
             max_rounds,
             total_probed: 0,
@@ -382,9 +489,13 @@ impl ClientWorker {
                 purpose.label(),
                 hunt.max_rounds,
                 hunt.candidates.len(),
-                self.effective_hunt_target_rtt()
-                    .map(|t| format!("<={:.0}ms", t))
-                    .unwrap_or_else(|| "auto".into())
+                if hunt.cold_calibration {
+                    "auto-calibrate(min-rtt)".into()
+                } else {
+                    self.effective_hunt_target_rtt()
+                        .map(|t| format!("<={:.0}ms", t))
+                        .unwrap_or_else(|| "auto".into())
+                }
             ),
         );
         self.lane_hunts.insert(id, hunt);
@@ -398,7 +509,7 @@ impl ClientWorker {
         } else if let Some(b) = self.best_observed_rtt_ms {
             ((b * 3.0) as u64 + 180).clamp(LANE_ROUND_TIMEOUT_MIN_MS, LANE_ROUND_TIMEOUT_MAX_MS)
         } else {
-            650
+            LANE_COLD_ROUND_TIMEOUT_MS
         };
         let stagger_ms = (probe_count.saturating_sub(1) as u64) * LANE_PROBE_STAGGER_MS;
         Duration::from_millis(base_ms + stagger_ms)
@@ -578,7 +689,10 @@ impl ClientWorker {
                             None
                         }
                     } else {
-                        let grace_ms = ((best_rtt * 2.0) as u64).clamp(80, 240);
+                        // 通用自适应早停：等待至少 `best_rtt + 45ms`（钳位 80..=550ms），保证跨洲高延迟
+                        // 链路下任何可能更快（< best_rtt）的兄弟探针都能完整到达，同时不傻等绕路慢包。
+                        let grace_ms = ((best_rtt + LANE_EARLY_SETTLE_AUTO_MARGIN_MS) as u64)
+                            .clamp(LANE_EARLY_SETTLE_AUTO_MIN_MS, LANE_EARLY_SETTLE_AUTO_MAX_MS);
                         Some(ls + Duration::from_millis(grace_ms))
                     }
                 } else {
@@ -777,30 +891,59 @@ impl ClientWorker {
 
         let eff_target = self.effective_hunt_target_rtt();
         let best_rtt = hunt.best_fallback.as_ref().and_then(|c| c.rtt_ms);
-        let target_met = match (best_rtt, eff_target) {
-            (Some(r), Some(t)) => r <= t,
-            (Some(_), None) => true,
-            (None, _) => false,
+        let target_met = if hunt.cold_calibration {
+            // PreWarm 在后台异步执行，probes 较小时可补足至最多 3 轮凑够 >=6 端口；
+            // NewPrimary 有首包在等待，最多 2 轮即可避免跨洲链路首连延迟过长。
+            let desired_rounds = if hunt.purpose == HuntPurpose::PreWarm
+                && hunt.total_probed < LANE_COLD_MIN_PROBES
+            {
+                hunt.max_rounds.min(3)
+            } else {
+                hunt.max_rounds.min(LANE_COLD_CALIBRATION_ROUNDS)
+            };
+            best_rtt.is_some() && hunt.round >= desired_rounds
+        } else {
+            match (best_rtt, eff_target) {
+                (Some(r), Some(t)) => r <= t,
+                (Some(_), None) => true,
+                (None, _) => false,
+            }
         };
 
-        // 未达标且还有剩余轮次 -> 继续下一轮抽卡（保留最佳候选做保底）
+        // 未达标（或处于冷启动多轮最低延迟校准期）且还有剩余轮次 -> 继续下一轮抽卡（保留最佳候选做保底）
         if !target_met && hunt.round < hunt.max_rounds {
-            log(
-                self.worker_id,
-                &format!(
-                    "LANE HUNT [{}] round {}/{} [{}] best={} > target={} -> retrying next round",
-                    hunt.purpose.label(),
-                    hunt.round,
-                    hunt.max_rounds,
-                    round_rtts.join(" "),
-                    best_rtt
-                        .map(|r| format!("{:.1}ms", r))
-                        .unwrap_or_else(|| "none".into()),
-                    eff_target
-                        .map(|t| format!("<={:.0}ms", t))
-                        .unwrap_or_else(|| "auto".into())
-                ),
-            );
+            if hunt.cold_calibration {
+                log(
+                    self.worker_id,
+                    &format!(
+                        "LANE HUNT [{}] calibration round {}/{} [{}] best={} -> sampling next round for global minimum",
+                        hunt.purpose.label(),
+                        hunt.round,
+                        hunt.max_rounds,
+                        round_rtts.join(" "),
+                        best_rtt
+                            .map(|r| format!("{:.1}ms", r))
+                            .unwrap_or_else(|| "none".into()),
+                    ),
+                );
+            } else {
+                log(
+                    self.worker_id,
+                    &format!(
+                        "LANE HUNT [{}] round {}/{} [{}] best={} > target={} -> retrying next round",
+                        hunt.purpose.label(),
+                        hunt.round,
+                        hunt.max_rounds,
+                        round_rtts.join(" "),
+                        best_rtt
+                            .map(|r| format!("{:.1}ms", r))
+                            .unwrap_or_else(|| "none".into()),
+                        eff_target
+                            .map(|t| format!("<={:.0}ms", t))
+                            .unwrap_or_else(|| "auto".into())
+                    ),
+                );
+            }
             if self.spawn_hunt_round(&mut hunt, now) {
                 self.lane_hunts.insert(hunt_id, hunt);
                 return;
@@ -916,7 +1059,7 @@ impl ClientWorker {
             HuntPurpose::MbbStandby {
                 primary_tok,
                 client_addr,
-                degrade_baseline_ms,
+                reason,
             } => {
                 // 校验归属主会话依然存活
                 let prim_alive = self.token_by_client.get(&client_addr) == Some(&primary_tok)
@@ -929,39 +1072,101 @@ impl ClientWorker {
                     return;
                 }
 
-                // 若是退化触发的后台重抽：只有在命中优秀目标或明显优于当前信道时才切换，避免全局波动抖动
-                if let Some(cur_ms_u64) = degrade_baseline_ms {
-                    let cur_ms = cur_ms_u64 as f64;
-                    let clearly_better = target_met
-                        || (winner_rtt + LANE_IMPROVE_MIN_DELTA_MS < cur_ms
-                            && winner_rtt <= cur_ms * LANE_IMPROVE_MIN_RATIO);
-                    if !clearly_better {
-                        let _ = self.poll.registry().deregister(&mut winner.sock);
-                        if let Some(prim) = self.sessions_by_token.get_mut(&primary_tok) {
-                            prim.standby_spawned = false;
-                            prim.next_lane_hunt_at = now
-                                + Duration::from_secs(
-                                    self.cfg.lane_hunt.normalized().degrade_cooldown_secs,
-                                );
-                        }
-                        log(
-                            self.worker_id,
-                            &format!(
-                                "LANE HUNT [mbb-degrade] no better lane (best={:.1}ms vs cur={:.0}ms, probed={}) -> keeping active primary",
-                                winner_rtt, cur_ms, hunt.total_probed
-                            ),
-                        );
-                        if let Some(ref th) = self.telemetry {
-                            th.record_lane_hunt(
-                                false,
-                                format!("keep-active best={:.1}ms cur={:.0}ms", winner_rtt, cur_ms),
-                            );
-                        }
-                        return;
+                // 按触发原因决策是否切换：计划轮换始终择优切换；延迟退化必须真正优于当前信道（杜绝
+                // 基线抬升期因 target_met 短路导致的同类延迟反复切换死循环）；丢包退化接受健康低延迟候选。
+                let (accept_switch, cur_desc) = match reason {
+                    MbbHuntReason::ScheduledRotate => (true, String::new()),
+                    MbbHuntReason::DegradeRtt { cur_ewma_ms } => {
+                        let cur_ms = cur_ewma_ms as f64;
+                        let clear_gain = winner_rtt + LANE_IMPROVE_MIN_DELTA_MS < cur_ms
+                            && winner_rtt <= cur_ms * LANE_IMPROVE_MIN_RATIO;
+                        let target_gain = target_met
+                            && winner_rtt + LANE_OPT_MIN_DELTA_MS < cur_ms
+                            && winner_rtt <= cur_ms * 0.85;
+                        (clear_gain || target_gain, format!("cur={:.0}ms", cur_ms))
                     }
+                    MbbHuntReason::DegradeLoss {
+                        cur_ewma_ms,
+                        loss_pct_x10,
+                    } => {
+                        let cur_ms = cur_ewma_ms as f64;
+                        let max_ok = (cur_ms * 1.50 + 35.0).max(eff_target.unwrap_or(0.0));
+                        let ok = target_met || winner_rtt <= max_ok;
+                        (
+                            ok,
+                            format!(
+                                "cur={:.0}ms/loss={:.1}%",
+                                cur_ms,
+                                (loss_pct_x10 as f64) / 10.0
+                            ),
+                        )
+                    }
+                    MbbHuntReason::Optimize {
+                        cur_ewma_ms,
+                        cur_loss_pct_x10,
+                    } => {
+                        let cur_ms = cur_ewma_ms as f64;
+                        // 阈值与确认期的 3.0% 丢包界限严格对齐，避免 3.0%~3.9% 区间反复白抽卡
+                        let ok = if cur_loss_pct_x10 >= 30 {
+                            winner_rtt <= cur_ms * 1.15 + 15.0
+                        } else {
+                            winner_rtt + LANE_OPT_MIN_DELTA_MS < cur_ms
+                                && winner_rtt <= cur_ms * LANE_IMPROVE_MIN_RATIO
+                        };
+                        (
+                            ok,
+                            format!(
+                                "cur={:.0}ms/loss={:.1}%",
+                                cur_ms,
+                                (cur_loss_pct_x10 as f64) / 10.0
+                            ),
+                        )
+                    }
+                };
+
+                if !accept_switch {
+                    let _ = self.poll.registry().deregister(&mut winner.sock);
+                    // 退化重抽找不到明显更优信道时，说明网络真实地板可能已上移，温和松弛历史基线
+                    if matches!(reason, MbbHuntReason::DegradeRtt { .. })
+                        || (!target_met && hunt.round >= hunt.max_rounds)
+                    {
+                        self.relax_baseline_rtt(winner_rtt);
+                    }
+                    let full_cd =
+                        Duration::from_secs(self.cfg.lane_hunt.normalized().degrade_cooldown_secs);
+                    let next_cd = if matches!(reason, MbbHuntReason::Optimize { .. }) {
+                        full_cd.saturating_mul(LANE_SUBOPT_COOLDOWN_MULT as u32)
+                    } else {
+                        self.trial_cooldown_dur().max(full_cd)
+                    };
+                    if let Some(prim) = self.sessions_by_token.get_mut(&primary_tok) {
+                        prim.standby_spawned = false;
+                        prim.next_lane_hunt_at = now + next_cd;
+                    }
+                    log(
+                        self.worker_id,
+                        &format!(
+                            "LANE HUNT [{}] no better lane (best={:.1}ms vs {}, probed={}) -> keeping active primary",
+                            hunt.purpose.label(),
+                            winner_rtt,
+                            cur_desc,
+                            hunt.total_probed
+                        ),
+                    );
+                    if let Some(ref th) = self.telemetry {
+                        th.record_lane_hunt(
+                            false,
+                            format!("keep-active best={:.1}ms {}", winner_rtt, cur_desc),
+                        );
+                    }
+                    return;
                 }
 
-                self.observe_good_rtt(winner_rtt);
+                if !target_met && hunt.round >= hunt.max_rounds {
+                    self.relax_baseline_rtt(winner_rtt);
+                } else {
+                    self.observe_good_rtt(winner_rtt);
+                }
                 log(
                     self.worker_id,
                     &format!(
@@ -1042,6 +1247,7 @@ impl ClientWorker {
         if let Some(ref th) = self.telemetry {
             th.record_stun_ok(rtt_ms, 0, winner.mapped_addr);
         }
+        let initial_lane_cooldown = self.trial_cooldown_dur();
         let mut sess = build_session_after_stun(
             self.worker_id,
             client_addr,
@@ -1062,6 +1268,7 @@ impl ClientWorker {
             standby_for_primary,
             is_prewarm,
             next_keepwarm_at,
+            initial_lane_cooldown,
             pending,
             pending_bytes,
             &mut self.dtls_buf,
@@ -1100,6 +1307,7 @@ impl ClientWorker {
         let mut flushed_bytes = 0u64;
         let old_port: u16;
 
+        let trial_cooldown = self.trial_cooldown_dur();
         if let Some(sess) = self.sessions_by_token.get_mut(&session_tok) {
             let mut old_up = std::mem::replace(&mut sess.upstream, winner.sock);
             let _ = self.poll.registry().deregister(&mut old_up);
@@ -1125,10 +1333,24 @@ impl ClientWorker {
             } else {
                 KA_MAX_RETRIES
             };
+            // 重置新迁移信道的丢包纪元、抖动与试用期状态，彻底隔离旧黑洞断层与旧路径尾包
+            if let Some(ref mut cipher) = sess.cipher {
+                cipher.reset_rx_loss_epoch();
+            }
+            sess.lane_prev_settled_exp = 0;
+            sess.lane_prev_settled_rx = 0;
+            sess.lane_last_ka_settled_exp = 0;
             sess.lane_rtt_ewma_ms = Some(winner_rtt);
+            sess.lane_rtt_last_ms = Some(winner_rtt);
+            sess.lane_jitter_ms = 0.0;
+            sess.lane_data_loss_rate = 0.0;
+            sess.lane_stun_outcomes.clear();
+            sess.lane_score = None;
+            sess.lane_confirmed = false;
+            sess.lane_good_windows = 0;
+            sess.lane_subopt_windows = 0;
             sess.lane_degrade_streak = 0;
-            sess.next_lane_hunt_at =
-                now + Duration::from_secs(self.cfg.lane_hunt.normalized().degrade_cooldown_secs);
+            sess.next_lane_hunt_at = now + trial_cooldown;
 
             let mut resp_payload = [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
             resp_payload[0] = PATH_CHALLENGE_OP_RESP;
@@ -1338,6 +1560,7 @@ impl ClientWorker {
             self.prewarm_tok = None;
             return None;
         }
+        let trial_cooldown = self.trial_cooldown_dur();
         self.prewarm_tok = None;
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             sess.is_prewarm = false;
@@ -1345,6 +1568,19 @@ impl ClientWorker {
             sess.next_keepwarm_at = None;
             sess.last_data_active = now;
             sess.last_active_burst = now;
+            // 领用后开启真实负载试用确认窗，避免空载 STUN 表现掩盖满载丢包/限速
+            if let Some(ref cipher) = sess.cipher {
+                let (se, sr) = cipher.rx_settled_stats();
+                sess.lane_prev_settled_exp = se;
+                sess.lane_prev_settled_rx = sr;
+                sess.lane_last_ka_settled_exp = se;
+            }
+            sess.lane_data_loss_rate = 0.0;
+            sess.lane_confirmed = false;
+            sess.lane_good_windows = 0;
+            sess.lane_subopt_windows = 0;
+            sess.lane_degrade_streak = 0;
+            sess.next_lane_hunt_at = now + trial_cooldown;
             if sess.state == HandshakeState::Ready {
                 schedule_mbb_timers(sess, &self.cfg, now);
             }
@@ -1366,81 +1602,257 @@ impl ClientWorker {
         Some(tok)
     }
 
-    /// 每次 STUN 保活应答后评估当前活跃/预热信道质量，持续退化时触发后台 0ms MBB 重抽。
-    pub(super) fn evaluate_lane_quality_on_ka(&mut self, tok: Token, ka_rtt_ms: f64, now: Instant) {
-        if !self.cfg.lane_hunt.enabled || !ka_rtt_ms.is_finite() || ka_rtt_ms <= 0.0 {
+    /// 每次 STUN 保活应答后综合评估活跃/预热信道的多维质量（延迟、真实数据面丢包、STUN 丢包与抖动），
+    /// 负责试用期确认、最优基线持续强化、退化 0ms MBB 逃逸以及亚健康后台寻优。
+    pub(super) fn evaluate_lane_quality_on_ka(
+        &mut self,
+        tok: Token,
+        ka_rtt_ms: f64,
+        ka_retries: u8,
+        now: Instant,
+    ) {
+        if !ka_rtt_ms.is_finite() || ka_rtt_ms <= 0.0 {
             return;
         }
-        let ceiling = self.effective_degrade_ceiling_rtt();
         enum Action {
             None,
             ReplacePrewarm,
-            StartMbbDegrade {
+            StartMbb {
                 client_addr: SocketAddr,
-                ewma_ms: f64,
+                reason: MbbHuntReason,
             },
         }
         let mut action = Action::None;
-        let mut observed_good = false;
-        let cooldown = Duration::from_secs(self.cfg.lane_hunt.normalized().degrade_cooldown_secs);
+        let mut observed_good_ewma: Option<f64> = None;
+        let mut trial_confirmed_now = false;
+        let mut trial_failed_now = false;
+        let lane_enabled = self.cfg.lane_hunt.enabled;
+        let explicit_target_ms = self.cfg.lane_hunt.target_rtt_ms;
+        let best_rtt_snap = self.best_observed_rtt_ms;
+        let full_cooldown =
+            Duration::from_secs(self.cfg.lane_hunt.normalized().degrade_cooldown_secs);
+        let backed_off_cooldown = self.trial_cooldown_dur().max(full_cooldown);
 
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             if sess.is_standby || sess.state != HandshakeState::Ready {
                 return;
             }
+
+            // 1) 更新真实数据面下行丢包率（基于 SRTP 双 SSRC 已稳定序号窗口，0 额外线开销且免疫 ECMP 乱序）
+            if let Some(ref cipher) = sess.cipher {
+                let (settled_exp, settled_rx) = cipher.rx_settled_stats();
+                let new_since_last_ka = settled_exp.saturating_sub(sess.lane_last_ka_settled_exp);
+                sess.lane_last_ka_settled_exp = settled_exp;
+                let d_exp = settled_exp.saturating_sub(sess.lane_prev_settled_exp);
+                let d_rx = settled_rx.saturating_sub(sess.lane_prev_settled_rx);
+                if d_exp >= LANE_DATA_LOSS_MIN_PKTS {
+                    let raw_loss =
+                        (d_exp.saturating_sub(d_rx) as f64 / d_exp as f64).clamp(0.0, 1.0);
+                    sess.lane_data_loss_rate = if sess.lane_data_loss_rate == 0.0 {
+                        raw_loss
+                    } else {
+                        sess.lane_data_loss_rate * (1.0 - LANE_DATA_LOSS_EWMA_ALPHA)
+                            + raw_loss * LANE_DATA_LOSS_EWMA_ALPHA
+                    };
+                    sess.lane_prev_settled_exp = settled_exp;
+                    sess.lane_prev_settled_rx = settled_rx;
+                } else if new_since_last_ka == 0 && sess.lane_data_loss_rate > 0.0 {
+                    // 相邻两次保活间无新增已稳定包（含低速流转静默的 1..=23 残留情况）-> 平滑衰减防历史高丢包永久锁死
+                    sess.lane_data_loss_rate *= LANE_DATA_LOSS_IDLE_DECAY;
+                    if sess.lane_data_loss_rate < 0.001 {
+                        sess.lane_data_loss_rate = 0.0;
+                        sess.lane_prev_settled_exp = settled_exp;
+                        sess.lane_prev_settled_rx = settled_rx;
+                    }
+                }
+            }
+
+            if !lane_enabled {
+                return;
+            }
+
+            // 2) 更新单会话 STUN 抖动、RTT EWMA 与 STUN 上行同意丢包窗口
+            if let Some(prev_rtt) = sess.lane_rtt_last_ms {
+                let d = (ka_rtt_ms - prev_rtt).abs();
+                sess.lane_jitter_ms += (d - sess.lane_jitter_ms) / 4.0;
+            }
+            sess.lane_rtt_last_ms = Some(ka_rtt_ms);
             let ewma = match sess.lane_rtt_ewma_ms {
                 Some(prev) => prev * (1.0 - LANE_RTT_EWMA_ALPHA) + ka_rtt_ms * LANE_RTT_EWMA_ALPHA,
                 None => ka_rtt_ms,
             };
             sess.lane_rtt_ewma_ms = Some(ewma);
 
-            if let Some(ceil) = ceiling {
-                if ka_rtt_ms > ceil {
-                    sess.lane_degrade_streak = sess.lane_degrade_streak.saturating_add(1);
-                    if sess.lane_degrade_streak >= LANE_DEGRADE_CONSECUTIVE
-                        && !sess.standby_spawned
-                        && now >= sess.next_lane_hunt_at
+            for _ in 0..ka_retries {
+                if sess.lane_stun_outcomes.len() >= LANE_STUN_WINDOW_CAP {
+                    sess.lane_stun_outcomes.pop_front();
+                }
+                sess.lane_stun_outcomes.push_back(false);
+            }
+            if sess.lane_stun_outcomes.len() >= LANE_STUN_WINDOW_CAP {
+                sess.lane_stun_outcomes.pop_front();
+            }
+            sess.lane_stun_outcomes.push_back(true);
+            // 免疫单次偶发 STUN 丢包（仅在窗口内累计 >=2 次重传丢失时才按满窗容量折算上行丢包率）
+            let stun_lost = sess.lane_stun_outcomes.iter().filter(|&&ok| !ok).count();
+            let stun_loss_rate = if stun_lost <= 1 {
+                0.0
+            } else {
+                (stun_lost as f64) / (LANE_STUN_WINDOW_CAP as f64)
+            };
+
+            // 3) 计算跨地域无量纲综合信道评分（0..=100）
+            let ref_rtt = if explicit_target_ms > 0 {
+                let t = explicit_target_ms as f64;
+                best_rtt_snap.unwrap_or(t).max(t * 0.55)
+            } else {
+                best_rtt_snap.unwrap_or(ewma)
+            };
+            let loss_eff = sess.lane_data_loss_rate.max(stun_loss_rate).clamp(0.0, 1.0);
+            let score = compute_lane_score(ewma, ref_rtt, loss_eff, sess.lane_jitter_ms);
+            sess.lane_score = Some(score);
+
+            let explicit_rtt_breach =
+                explicit_target_ms > 0 && ka_rtt_ms > (explicit_target_ms as f64);
+            let is_degraded = explicit_rtt_breach || score < LANE_DEGRADE_SCORE_THRESHOLD;
+            let needed_streak = if !sess.lane_confirmed && !sess.is_prewarm {
+                LANE_TRIAL_DEGRADE_CONSECUTIVE
+            } else {
+                LANE_DEGRADE_CONSECUTIVE
+            };
+
+            if is_degraded {
+                sess.lane_good_windows = 0;
+                sess.lane_subopt_windows = 0;
+                sess.lane_degrade_streak = sess.lane_degrade_streak.saturating_add(1);
+                if sess.lane_degrade_streak >= needed_streak
+                    && !sess.standby_spawned
+                    && now >= sess.next_lane_hunt_at
+                {
+                    sess.lane_degrade_streak = 0;
+                    sess.next_lane_hunt_at = now + backed_off_cooldown;
+                    if !sess.lane_confirmed && !sess.is_prewarm {
+                        trial_failed_now = true;
+                    }
+                    let reason = if loss_eff >= LANE_DATA_LOSS_DEGRADE_RATE {
+                        MbbHuntReason::DegradeLoss {
+                            cur_ewma_ms: ewma.round() as u64,
+                            loss_pct_x10: (loss_eff * 1000.0).round().min(1000.0) as u16,
+                        }
+                    } else {
+                        MbbHuntReason::DegradeRtt {
+                            cur_ewma_ms: ewma.round() as u64,
+                        }
+                    };
+                    if sess.is_prewarm {
+                        log(
+                            self.worker_id,
+                            &format!(
+                                "LANE GUARD: pre-warmed up_sport={} degraded (score={:.1}, rtt={:.1}ms, ewma={:.1}ms, loss={:.1}%, jit={:.1}ms x{}) -> re-hunting",
+                                sess.local_port,
+                                score,
+                                ka_rtt_ms,
+                                ewma,
+                                loss_eff * 100.0,
+                                sess.lane_jitter_ms,
+                                needed_streak
+                            ),
+                        );
+                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                        sess.state = HandshakeState::Closing(
+                            now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
+                        );
+                        action = Action::ReplacePrewarm;
+                    } else {
+                        log(
+                            self.worker_id,
+                            &format!(
+                                "LANE GUARD: active up_sport={} {} (score={:.1}, rtt={:.1}ms, ewma={:.1}ms, data_loss={:.1}%, stun_loss={:.1}%, jit={:.1}ms x{}) -> background MBB lane hunt",
+                                sess.local_port,
+                                if !sess.lane_confirmed { "failed canary" } else { "degraded" },
+                                score,
+                                ka_rtt_ms,
+                                ewma,
+                                sess.lane_data_loss_rate * 100.0,
+                                stun_loss_rate * 100.0,
+                                sess.lane_jitter_ms,
+                                needed_streak
+                            ),
+                        );
+                        action = Action::StartMbb {
+                            client_addr: sess.client_addr,
+                            reason,
+                        };
+                    }
+                }
+            } else {
+                sess.lane_degrade_streak = 0;
+                if score >= LANE_CONFIRM_SCORE_THRESHOLD && loss_eff < 0.03 {
+                    sess.lane_subopt_windows = 0;
+                    sess.lane_good_windows = sess.lane_good_windows.saturating_add(1);
+                    if !sess.lane_confirmed
+                        && !sess.is_prewarm
+                        && sess.lane_good_windows >= LANE_CONFIRM_GOOD_WINDOWS
                     {
-                        sess.lane_degrade_streak = 0;
-                        sess.next_lane_hunt_at = now + cooldown;
-                        if sess.is_prewarm {
+                        sess.lane_confirmed = true;
+                        trial_confirmed_now = true;
+                        log(
+                            self.worker_id,
+                            &format!(
+                                "LANE CONFIRMED: up_sport={} passed canary (score={:.1}, ewma={:.1}ms, data_loss={:.1}%, jit={:.1}ms)",
+                                sess.local_port,
+                                score,
+                                ewma,
+                                sess.lane_data_loss_rate * 100.0,
+                                sess.lane_jitter_ms
+                            ),
+                        );
+                    }
+                    if sess.lane_confirmed || sess.is_prewarm {
+                        // 使用平滑后的 EWMA 强化历史最优基线，防止单次偶发毛刺棘轮下漂
+                        observed_good_ewma = Some(ewma);
+                    }
+                } else {
+                    sess.lane_good_windows = 0;
+                    if !sess.is_prewarm && !sess.standby_spawned {
+                        sess.lane_subopt_windows = sess.lane_subopt_windows.saturating_add(1);
+                        if sess.lane_subopt_windows >= LANE_SUBOPT_MIN_WINDOWS
+                            && now >= sess.next_lane_hunt_at
+                        {
+                            sess.lane_subopt_windows = 0;
+                            sess.next_lane_hunt_at = now
+                                + full_cooldown.saturating_mul(LANE_SUBOPT_COOLDOWN_MULT as u32);
                             log(
                                 self.worker_id,
                                 &format!(
-                                    "LANE GUARD: pre-warmed up_sport={} degraded (rtt={:.1}ms, ewma={:.1}ms > {:.0}ms x{}) -> re-hunting",
-                                    sess.local_port, ka_rtt_ms, ewma, ceil, LANE_DEGRADE_CONSECUTIVE
+                                    "LANE OPTIMIZE: up_sport={} sustained sub-optimal (score={:.1}, ewma={:.1}ms, loss={:.1}%) -> quiet background MBB hunt",
+                                    sess.local_port,
+                                    score,
+                                    ewma,
+                                    loss_eff * 100.0
                                 ),
                             );
-                            graceful_teardown_client(sess, &mut self.dtls_buf);
-                            sess.state = HandshakeState::Closing(
-                                now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
-                            );
-                            action = Action::ReplacePrewarm;
-                        } else {
-                            log(
-                                self.worker_id,
-                                &format!(
-                                    "LANE GUARD: active up_sport={} degraded (rtt={:.1}ms, ewma={:.1}ms > {:.0}ms x{}) -> background MBB lane hunt",
-                                    sess.local_port, ka_rtt_ms, ewma, ceil, LANE_DEGRADE_CONSECUTIVE
-                                ),
-                            );
-                            action = Action::StartMbbDegrade {
+                            action = Action::StartMbb {
                                 client_addr: sess.client_addr,
-                                ewma_ms: ewma,
+                                reason: MbbHuntReason::Optimize {
+                                    cur_ewma_ms: ewma.round() as u64,
+                                    cur_loss_pct_x10: (loss_eff * 1000.0).round().min(1000.0)
+                                        as u16,
+                                },
                             };
                         }
                     }
-                } else {
-                    sess.lane_degrade_streak = 0;
-                    observed_good = true;
                 }
-            } else {
-                observed_good = true;
             }
         }
 
-        if observed_good {
-            self.observe_good_rtt(ka_rtt_ms);
+        if trial_confirmed_now {
+            self.consecutive_trial_failures = 0;
+        } else if trial_failed_now {
+            self.consecutive_trial_failures = self.consecutive_trial_failures.saturating_add(1);
+        }
+        if let Some(good_ewma) = observed_good_ewma {
+            self.observe_good_rtt(good_ewma);
         }
 
         match action {
@@ -1451,15 +1863,15 @@ impl ClientWorker {
                 }
                 let _ = self.start_lane_hunt(HuntPurpose::PreWarm, now, VecDeque::new(), 0);
             }
-            Action::StartMbbDegrade {
+            Action::StartMbb {
                 client_addr,
-                ewma_ms,
+                reason,
             } => {
                 let _ = self.start_lane_hunt(
                     HuntPurpose::MbbStandby {
                         primary_tok: tok,
                         client_addr,
-                        degrade_baseline_ms: Some(ewma_ms.round() as u64),
+                        reason,
                     },
                     now,
                     VecDeque::new(),

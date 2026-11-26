@@ -44,6 +44,7 @@ pub(super) struct ClientWorker {
     pub(super) prewarm_tok: Option<Token>,
     pub(super) next_prewarm_at: Option<Instant>,
     pub(super) best_observed_rtt_ms: Option<f64>,
+    pub(super) consecutive_trial_failures: u8,
     pub(super) next_token_id: usize,
     pub(super) cert_cache: CertCache,
     pub(super) dtls_pool: DtlsConfigPool,
@@ -129,6 +130,7 @@ pub(super) fn run_client_worker(
         prewarm_tok: None,
         next_prewarm_at: None,
         best_observed_rtt_ms: None,
+        consecutive_trial_failures: 0,
         next_token_id: 1,
         cert_cache: CertCache::new(),
         dtls_pool,
@@ -263,10 +265,12 @@ impl ClientWorker {
                     tx_pkts_total: self.closed_tx_pkts,
                     rx_pkts_total: self.closed_rx_pkts,
                     auth_drops_total: self.closed_auth_drops,
+                    lane_best_rtt_ms: self.best_observed_rtt_ms,
                     dtls_version: "none",
                     cipher: "none",
                     ..Default::default()
                 };
+                let mut has_primary_metrics = false;
                 for sess in self.sessions_by_token.values() {
                     snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
                     snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
@@ -276,8 +280,17 @@ impl ClientWorker {
                     match sess.state {
                         HandshakeState::Ready if !sess.is_standby => {
                             snap.active_sessions += 1;
-                            if snap.active_up_sport == 0 {
+                            if snap.active_up_sport == 0
+                                || (!has_primary_metrics && !sess.is_prewarm)
+                            {
                                 snap.active_up_sport = sess.local_port;
+                                snap.data_loss_pct =
+                                    (sess.lane_data_loss_rate * 100.0).clamp(0.0, 100.0);
+                                snap.lane_score = sess.lane_score;
+                                snap.lane_confirmed = sess.lane_confirmed;
+                                if !sess.is_prewarm {
+                                    has_primary_metrics = true;
+                                }
                             }
                             if snap.cipher == "none" {
                                 if let Some(c) = sess.active_cipher {

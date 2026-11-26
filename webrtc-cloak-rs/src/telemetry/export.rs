@@ -80,6 +80,13 @@ impl TelemetryInner {
         push_json_f64(&mut s, round_n(self.stun_jitter_ms, 100.0));
         s.push_str(",\n    \"stun_loss_pct\": ");
         push_json_f64(&mut s, round_n(v.stun_loss_pct, 100.0));
+        s.push_str(",\n    \"data_loss_pct\": ");
+        push_json_f64(&mut s, round_n(v.data_loss_pct, 100.0));
+        s.push_str(",\n    \"lane_score\": ");
+        push_json_opt_f64(&mut s, v.lane_score, 100.0);
+        s.push_str(",\n    \"lane_best_rtt_ms\": ");
+        push_json_opt_f64(&mut s, v.lane_best_rtt_ms, 100.0);
+        let _ = write!(s, ",\n    \"lane_confirmed\": {}", v.lane_confirmed);
         s.push_str(",\n    \"tx_mbps\": ");
         push_json_f64(&mut s, round_n(self.tx_mbps, 1000.0));
         s.push_str(",\n    \"rx_mbps\": ");
@@ -218,6 +225,27 @@ impl TelemetryInner {
             s,
             "webrtc_cloak_stun_loss_percent{{role=\"{}\"}} {:.2}",
             r, v.stun_loss_pct
+        );
+        let _ = writeln!(
+            s,
+            "webrtc_cloak_data_loss_percent{{role=\"{}\"}} {:.2}",
+            r, v.data_loss_pct
+        );
+        if let Some(score) = v.lane_score {
+            let _ = writeln!(s, "webrtc_cloak_lane_score{{role=\"{}\"}} {:.2}", r, score);
+        }
+        if let Some(best_rtt) = v.lane_best_rtt_ms {
+            let _ = writeln!(
+                s,
+                "webrtc_cloak_lane_best_rtt_ms{{role=\"{}\"}} {:.2}",
+                r, best_rtt
+            );
+        }
+        let _ = writeln!(
+            s,
+            "webrtc_cloak_lane_confirmed{{role=\"{}\"}} {}",
+            r,
+            if v.lane_confirmed { 1 } else { 0 }
         );
         let _ = writeln!(
             s,

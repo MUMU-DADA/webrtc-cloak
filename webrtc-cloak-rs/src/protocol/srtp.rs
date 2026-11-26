@@ -54,6 +54,8 @@ const MAX_SRTCP_IDX: u32 = 0x7FFF_FF00;
 const SRTP_REPLAY_RING_WORDS: usize = 64;
 /// SRTP RFC 6479 防重放滑动窗口宽度（2048 包，容忍跨洋 ECMP 乱序）。
 const SRTP_REPLAY_WINDOW: u64 = 2048;
+/// 数据面下行丢包统计排除的尾部乱序缓冲带宽度（24 包，免疫跨洋 ECMP 乱序误报）。
+const SRTP_LOSS_REORDER_TAIL: u64 = 24;
 /// 16 位 RTP 序列号 ROC 回绕判定低阈值（< 0x4000）。
 const SRTP_ROC_WRAP_LOW: u16 = 0x4000;
 /// 16 位 RTP 序列号 ROC 回绕判定高阈值（> 0xC000）。
@@ -192,10 +194,18 @@ pub struct SrtpCloakCipher {
     pub(super) rx_initialized: bool,
     pub rx_roc: u32,
     pub(super) rx_highest_seq16: u16,
+    pub(super) rx_base_ext_seq: u64,
+    pub(super) rx_unique_total: u64,
+    pub(super) rx_loss_epoch_floor: u64,
+    pub(super) rx_loss_reset_pending: bool,
     pub(super) rx_replay_ring: [u64; SRTP_REPLAY_RING_WORDS],
     pub(super) audio_rx_initialized: bool,
     pub(super) audio_rx_roc: u32,
     pub(super) audio_rx_highest_seq16: u16,
+    pub(super) audio_rx_base_ext_seq: u64,
+    pub(super) audio_rx_unique_total: u64,
+    pub(super) audio_rx_loss_epoch_floor: u64,
+    pub(super) audio_rx_loss_reset_pending: bool,
     pub(super) audio_rx_replay_ring: [u64; SRTP_REPLAY_RING_WORDS],
     pub(super) tx_srtcp_idx: u32,
     pub(super) rx_srtcp_seen: bool,
@@ -289,10 +299,18 @@ impl SrtpCloakCipher {
             rx_initialized: false,
             rx_roc: 0,
             rx_highest_seq16: 0,
+            rx_base_ext_seq: 0,
+            rx_unique_total: 0,
+            rx_loss_epoch_floor: 0,
+            rx_loss_reset_pending: false,
             rx_replay_ring: [0u64; SRTP_REPLAY_RING_WORDS],
             audio_rx_initialized: false,
             audio_rx_roc: 0,
             audio_rx_highest_seq16: 0,
+            audio_rx_base_ext_seq: 0,
+            audio_rx_unique_total: 0,
+            audio_rx_loss_epoch_floor: 0,
+            audio_rx_loss_reset_pending: false,
             audio_rx_replay_ring: [0u64; SRTP_REPLAY_RING_WORDS],
             tx_srtcp_idx: 0,
             rx_srtcp_seen: false,
@@ -983,12 +1001,114 @@ impl SrtpCloakCipher {
     }
 
     #[inline]
+    fn settled_rx_stream(
+        initialized: bool,
+        reset_pending: bool,
+        base_ext_seq: u64,
+        roc: u32,
+        highest_seq16: u16,
+        ring: &[u64; SRTP_REPLAY_RING_WORDS],
+        unique_total: u64,
+    ) -> (u64, u64) {
+        if !initialized || reset_pending {
+            return (0, 0);
+        }
+        let highest = ((roc as u64) << 16) | (highest_seq16 as u64);
+        if highest < base_ext_seq {
+            return (0, 0);
+        }
+        let span = highest.saturating_sub(base_ext_seq).saturating_add(1);
+        if span <= SRTP_LOSS_REORDER_TAIL {
+            return (0, 0);
+        }
+        let ring_mask = SRTP_REPLAY_RING_WORDS - 1;
+        let tail_start = highest.saturating_sub(SRTP_LOSS_REORDER_TAIL - 1);
+        let mut tail_received = 0u64;
+        let mut seq = tail_start;
+        while seq <= highest {
+            let word_idx = ((seq >> 6) as usize) & ring_mask;
+            let bit_idx = seq & 63;
+            if ((ring[word_idx] >> bit_idx) & 1) != 0 {
+                tail_received += 1;
+            }
+            if seq == u64::MAX {
+                break;
+            }
+            seq += 1;
+        }
+        let settled_expected = span - SRTP_LOSS_REORDER_TAIL;
+        let settled_received = unique_total
+            .saturating_sub(tail_received)
+            .min(settled_expected);
+        (settled_expected, settled_received)
+    }
+
+    /// 1-RTT 路径迁移完成后重置数据面丢包统计纪元：
+    /// 隔离旧黑洞路径产生的序号断层以及经 `old_path_drains` 延迟到达的旧路径尾包，
+    /// 待新路径首包到达后再重新锚定统计基线，同时 100% 保持防重放窗口完整不降级。
+    pub fn reset_rx_loss_epoch(&mut self) {
+        if self.rx_initialized {
+            let highest = ((self.rx_roc as u64) << 16) | (self.rx_highest_seq16 as u64);
+            self.rx_loss_epoch_floor = highest.saturating_add(1);
+            self.rx_loss_reset_pending = true;
+            self.rx_unique_total = 0;
+        }
+        if self.audio_rx_initialized {
+            let highest = ((self.audio_rx_roc as u64) << 16) | (self.audio_rx_highest_seq16 as u64);
+            self.audio_rx_loss_epoch_floor = highest.saturating_add(1);
+            self.audio_rx_loss_reset_pending = true;
+            self.audio_rx_unique_total = 0;
+        }
+    }
+
+    /// 返回视频与音频双 SSRC 合并后的已稳定累计下行 `(expected_pkts, received_pkts)`。
+    /// 排除每个流最新 24 个序号的在途乱序尾窗，零额外线开销即可精确观测数据面丢包率且免疫 ECMP 乱序。
+    pub fn rx_settled_stats(&self) -> (u64, u64) {
+        let (ve, vr) = Self::settled_rx_stream(
+            self.rx_initialized,
+            self.rx_loss_reset_pending,
+            self.rx_base_ext_seq,
+            self.rx_roc,
+            self.rx_highest_seq16,
+            &self.rx_replay_ring,
+            self.rx_unique_total,
+        );
+        let (ae, ar) = if self.dual_ssrc {
+            Self::settled_rx_stream(
+                self.audio_rx_initialized,
+                self.audio_rx_loss_reset_pending,
+                self.audio_rx_base_ext_seq,
+                self.audio_rx_roc,
+                self.audio_rx_highest_seq16,
+                &self.audio_rx_replay_ring,
+                self.audio_rx_unique_total,
+            )
+        } else {
+            (0, 0)
+        };
+        (ve.saturating_add(ae), vr.saturating_add(ar))
+    }
+
+    #[inline]
     fn update_rx_seq_stream(&mut self, is_audio: bool, roc: u32, seq16: u16) {
-        let (rx_initialized, rx_roc, rx_highest_seq16, rx_replay_ring) = if is_audio {
+        let (
+            rx_initialized,
+            rx_roc,
+            rx_highest_seq16,
+            rx_base_ext_seq,
+            rx_unique_total,
+            rx_loss_epoch_floor,
+            rx_loss_reset_pending,
+            rx_replay_ring,
+        ) = if is_audio {
             (
                 &mut self.audio_rx_initialized,
                 &mut self.audio_rx_roc,
                 &mut self.audio_rx_highest_seq16,
+                &mut self.audio_rx_base_ext_seq,
+                &mut self.audio_rx_unique_total,
+                &mut self.audio_rx_loss_epoch_floor,
+                &mut self.audio_rx_loss_reset_pending,
                 &mut self.audio_rx_replay_ring,
             )
         } else {
@@ -996,6 +1116,10 @@ impl SrtpCloakCipher {
                 &mut self.rx_initialized,
                 &mut self.rx_roc,
                 &mut self.rx_highest_seq16,
+                &mut self.rx_base_ext_seq,
+                &mut self.rx_unique_total,
+                &mut self.rx_loss_epoch_floor,
+                &mut self.rx_loss_reset_pending,
                 &mut self.rx_replay_ring,
             )
         };
@@ -1008,11 +1132,16 @@ impl SrtpCloakCipher {
             *rx_initialized = true;
             *rx_roc = roc;
             *rx_highest_seq16 = seq16;
+            *rx_base_ext_seq = ext_seq;
+            *rx_unique_total = 1;
+            *rx_loss_epoch_floor = ext_seq;
+            *rx_loss_reset_pending = false;
             *rx_replay_ring = [0u64; SRTP_REPLAY_RING_WORDS];
             rx_replay_ring[(new_block as usize) & ring_mask] = bit_mask;
             return;
         }
         let highest = ((*rx_roc as u64) << 16) | (*rx_highest_seq16 as u64);
+        let mut newly_accepted = false;
         if ext_seq > highest {
             let old_block = highest >> 6;
             let diff_blocks = new_block - old_block;
@@ -1026,8 +1155,25 @@ impl SrtpCloakCipher {
             rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
             *rx_roc = roc;
             *rx_highest_seq16 = seq16;
+            newly_accepted = true;
         } else if highest - ext_seq < SRTP_REPLAY_WINDOW {
-            rx_replay_ring[(new_block as usize) & ring_mask] |= bit_mask;
+            let slot = &mut rx_replay_ring[(new_block as usize) & ring_mask];
+            if (*slot & bit_mask) == 0 {
+                *slot |= bit_mask;
+                newly_accepted = true;
+            }
+        }
+        if newly_accepted && ext_seq >= *rx_loss_epoch_floor {
+            if *rx_loss_reset_pending {
+                *rx_loss_reset_pending = false;
+                *rx_base_ext_seq = ext_seq;
+                *rx_unique_total = 1;
+            } else {
+                *rx_unique_total = rx_unique_total.saturating_add(1);
+                if ext_seq < *rx_base_ext_seq {
+                    *rx_base_ext_seq = ext_seq;
+                }
+            }
         }
     }
 }

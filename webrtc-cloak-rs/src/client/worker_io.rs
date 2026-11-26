@@ -276,7 +276,7 @@ impl ClientWorker {
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
     ) {
-        let mut ka_rtt_sample: Option<f64> = None;
+        let mut ka_sample: Option<(f64, u8)> = None;
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             loop {
                 let n = match sess.upstream.recv(&mut self.rbuf) {
@@ -496,13 +496,14 @@ impl ClientWorker {
                                             now.saturating_duration_since(t).as_secs_f64() * 1000.0
                                         })
                                         .unwrap_or(0.0);
+                                    let ka_retries_before_ok = sess.ka_retries;
                                     if ka_rtt > 0.0 {
-                                        ka_rtt_sample = Some(ka_rtt);
+                                        ka_sample = Some((ka_rtt, ka_retries_before_ok));
                                     }
                                     if let Some(ref th) = self.telemetry {
                                         th.record_stun_ok(
                                             ka_rtt,
-                                            sess.ka_retries,
+                                            ka_retries_before_ok,
                                             parsed.xor_mapped,
                                         );
                                     }
@@ -786,6 +787,23 @@ impl ClientWorker {
                                             );
                                             sess.mig_echo_left = CLIENT_MIG_ECHO_COUNT;
                                             if was_migrating {
+                                                // 重置新路径的丢包纪元、RTT/抖动与试用期基线，隔离旧黑洞路径的历史断层与残留延迟
+                                                if let Some(ref mut cipher) = sess.cipher {
+                                                    cipher.reset_rx_loss_epoch();
+                                                }
+                                                sess.lane_prev_settled_exp = 0;
+                                                sess.lane_prev_settled_rx = 0;
+                                                sess.lane_last_ka_settled_exp = 0;
+                                                sess.lane_rtt_ewma_ms = None;
+                                                sess.lane_rtt_last_ms = None;
+                                                sess.lane_data_loss_rate = 0.0;
+                                                sess.lane_stun_outcomes.clear();
+                                                sess.lane_jitter_ms = 0.0;
+                                                sess.lane_score = None;
+                                                sess.lane_confirmed = false;
+                                                sess.lane_good_windows = 0;
+                                                sess.lane_subopt_windows = 0;
+                                                sess.lane_degrade_streak = 0;
                                                 sess.next_keepalive_at =
                                                     now + jitter_duration_ms(self.ka_base_ms);
                                                 if flushed_bytes > 0 {
@@ -868,8 +886,8 @@ impl ClientWorker {
                 }
             }
         }
-        if let Some(ka_rtt) = ka_rtt_sample {
-            self.evaluate_lane_quality_on_ka(tok, ka_rtt, now);
+        if let Some((ka_rtt, ka_retries)) = ka_sample {
+            self.evaluate_lane_quality_on_ka(tok, ka_rtt, ka_retries, now);
         }
     }
 
@@ -979,11 +997,17 @@ impl ClientWorker {
                 continue;
             }
 
+            let trial_cooldown = self.trial_cooldown_dur();
             let new_port = match self.sessions_by_token.get_mut(&new_tok) {
                 Some(new_sess) if new_sess.state == HandshakeState::Ready => {
                     new_sess.is_standby = false;
                     new_sess.standby_for_primary = None;
                     new_sess.standby_spawned = false;
+                    new_sess.lane_confirmed = false;
+                    new_sess.lane_good_windows = 0;
+                    new_sess.lane_subopt_windows = 0;
+                    new_sess.lane_degrade_streak = 0;
+                    new_sess.next_lane_hunt_at = now + trial_cooldown;
                     schedule_mbb_timers(new_sess, &self.cfg, now);
                     new_sess.local_port
                 }

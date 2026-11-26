@@ -1,13 +1,14 @@
 //! IPv6 端到端隧道与 ECMP 信道抽卡探测（启动预热/多轮重抽/退化 0ms MBB/黑洞 1-RTT 竞速）集成测试。
 
 use super::reserve_free_port;
+use crate::client::lane_hunt::{compute_lane_score, LANE_DEGRADE_SCORE_THRESHOLD};
 use crate::client::{run_client, ClientConfig, LaneHuntConfig};
-use crate::protocol::{CipherPref, DtlsMinVersion};
+use crate::protocol::{demux_rfc7983, CipherPref, DtlsMinVersion, PacketKind};
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -31,6 +32,10 @@ struct EcmpSimState {
     degraded_port: AtomicU16,
     /// 动态注入黑洞的特定端口（设为非 0 时该端口 100% 丢弃所有上行与下行包）。
     blackholed_port: AtomicU16,
+    /// 动态注入下行 SRTP 数据面丢包的特定端口（模拟「STUN 0ms 假优但数据面限速丢包 25%」信道）。
+    lossy_data_port: AtomicU16,
+    /// 确定性下行 SRTP 丢包计数器（每 4 个下行 SRTP 丢弃 1 个 = 精确 25% 数据面丢包）。
+    lossy_data_counter: AtomicU32,
 }
 
 impl EcmpSimState {
@@ -41,7 +46,22 @@ impl EcmpSimState {
             fast_indices: fast_indices.iter().copied().collect(),
             degraded_port: AtomicU16::new(0),
             blackholed_port: AtomicU16::new(0),
+            lossy_data_port: AtomicU16::new(0),
+            lossy_data_counter: AtomicU32::new(0),
         })
+    }
+
+    fn should_drop_downlink_data(&self, client_port: u16, pkt: &[u8]) -> bool {
+        if self.lossy_data_port.load(Ordering::Relaxed) != client_port {
+            return false;
+        }
+        if demux_rfc7983(pkt) != PacketKind::Srtp {
+            return false;
+        }
+        // 精确丢弃 25% 下行 SRTP 数据包，同时放行 100% STUN/DTLS/SRTCP 控制面！
+        self.lossy_data_counter
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(4)
     }
 
     fn oneway_delay_for(&self, client_port: u16) -> Option<u64> {
@@ -121,6 +141,9 @@ fn spawn_ecmp_proxy(
             // 2) 读取来自服务端的回包
             for (&caddr, u) in upstreams.iter() {
                 while let Ok(n) = u.recv(&mut buf) {
+                    if state.should_drop_downlink_data(caddr.port(), &buf[..n]) {
+                        continue;
+                    }
                     if let Some(delay_ms) = state.oneway_delay_for(caddr.port()) {
                         if delay_ms == 0 {
                             let _ = front.send_to(&buf[..n], caddr);
@@ -788,6 +811,379 @@ fn lane_hunt_blackhole_1rtt_migration_picks_fast_lane() {
         last_backend_port.load(Ordering::Relaxed),
         backend_sport_before,
         "1-RTT lane migration must preserve server backend_lport"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(80));
+    let _ = std::fs::remove_file(&status_file);
+}
+
+#[test]
+fn lane_score_scale_invariant_and_loss_sensitive() {
+    // 1. 跨地域 10ms / 40ms / 150ms / 250ms 基线在最优零丢包下均为满分 100
+    for base in [10.0, 40.0, 150.0, 250.0] {
+        let ideal = compute_lane_score(base, base, 0.0, 0.0);
+        assert!(
+            (ideal - 100.0).abs() < 1e-6,
+            "ideal score at {}ms must be 100 (got {})",
+            base,
+            ideal
+        );
+        // 正常 ±12% 小幅波动 + 1% 偶发丢包仍保持健康（远高于 55 退化线）
+        let healthy = compute_lane_score(base * 1.12, base, 0.01, base * 0.05);
+        assert!(
+            healthy > 75.0,
+            "healthy variation at {}ms should score >75 (got {})",
+            base,
+            healthy
+        );
+    }
+
+    // 2. 低延迟假优信道（RTT 与基线齐平，但满载数据面丢包 8% 及以上）必须立即被判退化 (< 55)，无 8%~10.2% 死角
+    let fake_good_8pct = compute_lane_score(40.0, 40.0, 0.08, 0.0);
+    assert!(
+        fake_good_8pct < LANE_DEGRADE_SCORE_THRESHOLD,
+        "low-RTT 8%-loss lane must degrade below {} (got {})",
+        LANE_DEGRADE_SCORE_THRESHOLD,
+        fake_good_8pct
+    );
+    let fake_good_15pct = compute_lane_score(42.0, 40.0, 0.15, 2.0);
+    assert!(
+        fake_good_15pct < LANE_DEGRADE_SCORE_THRESHOLD,
+        "low-RTT 15%-loss lane must degrade below {} (got {})",
+        LANE_DEGRADE_SCORE_THRESHOLD,
+        fake_good_15pct
+    );
+
+    // 3. 跨洲 150ms 链路绕路至 290ms（零丢包）必须判退化，而 175ms 正常波动不误判
+    assert!(compute_lane_score(290.0, 150.0, 0.0, 5.0) < LANE_DEGRADE_SCORE_THRESHOLD);
+    assert!(compute_lane_score(175.0, 150.0, 0.0, 5.0) > 75.0);
+
+    // 4. 迟滞一致性校验：全地域基线下自动抽卡达标线 (max(1.40*b, b+20)) 严格低于无丢包退化线 (score < 55)
+    for base in [5.0f64, 15.0, 40.0, 150.0, 250.0] {
+        let auto_target = (base * 1.40).max(base + 20.0);
+        let score_at_target = compute_lane_score(auto_target, base, 0.0, 0.0);
+        assert!(
+            score_at_target > LANE_DEGRADE_SCORE_THRESHOLD,
+            "auto_target ({:.1}ms) at base={:.1}ms must score above degrade line (got {:.1}) to prevent trap-band loops",
+            auto_target,
+            base,
+            score_at_target
+        );
+    }
+}
+
+#[test]
+fn lane_hunt_auto_cold_start_multiround_calibration_without_target_rtt() {
+    let backend_port = reserve_free_port();
+    let server_port = reserve_free_port();
+    let proxy_port = reserve_free_port();
+    let client_port = reserve_free_port();
+    let psk = b"lane-hunt-auto-cold-cal-psk".to_vec();
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_backend_port = Arc::new(AtomicU16::new(0));
+
+    // 纯自动模式（target_rtt_ms = 0）：第 1 轮 3 个端口 (0,1,2) 全是 220ms 慢道，
+    // 第 2 轮序号 4 是 0ms 高速道 -> 必须自动跨轮校准选出全局最低延迟信道，不写死任何 ms 阈值！
+    let sim = EcmpSimState::new(&[4, 8]);
+    let status_file = std::env::temp_dir()
+        .join(format!("wc_lane_auto_cal_{}.json", client_port))
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_file(&status_file);
+
+    let _b = spawn_backend_echo_recording_port(
+        backend_port,
+        Arc::clone(&last_backend_port),
+        Arc::clone(&stop),
+    );
+    let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+    let s_stop = Arc::clone(&stop);
+    let s_psk = psk.clone();
+    let _s = thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: srv_addr,
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+            psk: s_psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: 1488,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(s_stop),
+        });
+    });
+    let _p = spawn_ecmp_proxy(proxy_port, srv_addr, Arc::clone(&sim), Arc::clone(&stop));
+    thread::sleep(Duration::from_millis(80));
+
+    let c_stop = Arc::clone(&stop);
+    let c_status = status_file.clone();
+    let _c = thread::spawn(move || {
+        let _ = run_client(ClientConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port),
+            psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_decoy: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            rotate_interval_secs: 0,
+            rotate_max_bytes: 0,
+            rotate_cooldown_secs: 60,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: 1488,
+            retry_ms: 150,
+            max_retries: 8,
+            keepalive_secs: 2,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            lane_hunt: LaneHuntConfig {
+                enabled: true,
+                probes: 3,
+                max_rounds: 3,
+                target_rtt_ms: 0, // 纯自适应通用模式！
+                degrade_cooldown_secs: 5,
+            },
+            telemetry: TelemetryConfig {
+                status_file: Some(c_status),
+                status_http: None,
+                status_interval_secs: 1,
+            },
+            quiet: true,
+            stop: Some(c_stop),
+        });
+    });
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut prewarm_port = 0u16;
+    let mut best_rtt_reported = 999.0f64;
+    while Instant::now() < deadline {
+        if let Some(j) = read_json_file(&status_file) {
+            let active = j["sessions"]["active"].as_u64().unwrap_or(0);
+            let up_sport = j["sessions"]["up_sport"].as_u64().unwrap_or(0) as u16;
+            let hunts = j["events"]["lane_hunts_total"].as_u64().unwrap_or(0);
+            if active >= 1 && up_sport != 0 && hunts >= 1 {
+                prewarm_port = up_sport;
+                best_rtt_reported = j["link"]["lane_best_rtt_ms"].as_f64().unwrap_or(999.0);
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(
+        prewarm_port, 0,
+        "auto cold-start calibration must establish a Ready pre-warm session"
+    );
+    assert!(
+        sim.seen_port_count() >= 6,
+        "auto cold-start calibration must probe at least 2 rounds (seen={})",
+        sim.seen_port_count()
+    );
+    assert!(
+        sim.is_fast_port(prewarm_port),
+        "auto cold-start calibration MUST pick global minimum fast port (got {})",
+        prewarm_port
+    );
+    assert!(
+        best_rtt_reported < 50.0,
+        "calibrated lane_best_rtt_ms must reflect fast tier (got {:.1}ms)",
+        best_rtt_reported
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(80));
+    let _ = std::fs::remove_file(&status_file);
+}
+
+#[test]
+fn lane_guard_data_plane_packet_loss_triggers_zero_ms_mbb_escape() {
+    let backend_port = reserve_free_port();
+    let server_port = reserve_free_port();
+    let proxy_port = reserve_free_port();
+    let client_port = reserve_free_port();
+    let psk = b"lane-guard-data-loss-mbb-psk".to_vec();
+    let stop = Arc::new(AtomicBool::new(false));
+    let last_backend_port = Arc::new(AtomicU16::new(0));
+
+    // 所有候选端口延迟均为 0ms（模拟「延迟全低但某条 ECMP 信道被 QoS 丢包 25%」的假优场景）
+    let sim = EcmpSimState::new(&[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15]);
+    let status_file = std::env::temp_dir()
+        .join(format!("wc_lane_dataloss_{}.json", client_port))
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_file(&status_file);
+
+    let _b = spawn_backend_echo_recording_port(
+        backend_port,
+        Arc::clone(&last_backend_port),
+        Arc::clone(&stop),
+    );
+    let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+    let s_stop = Arc::clone(&stop);
+    let s_psk = psk.clone();
+    let _s = thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: srv_addr,
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+            psk: s_psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: 1488,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(s_stop),
+        });
+    });
+    let _p = spawn_ecmp_proxy(proxy_port, srv_addr, Arc::clone(&sim), Arc::clone(&stop));
+    thread::sleep(Duration::from_millis(80));
+
+    let c_stop = Arc::clone(&stop);
+    let c_status = status_file.clone();
+    let _c = thread::spawn(move || {
+        let _ = run_client(ClientConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port),
+            psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_decoy: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            rotate_interval_secs: 0,
+            rotate_max_bytes: 0,
+            rotate_cooldown_secs: 60,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: 1488,
+            retry_ms: 150,
+            max_retries: 8,
+            keepalive_secs: 1,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            lane_hunt: LaneHuntConfig {
+                enabled: true,
+                probes: 3,
+                max_rounds: 2,
+                target_rtt_ms: 0, // 纯自适应多维评分模式！
+                degrade_cooldown_secs: 5,
+            },
+            telemetry: TelemetryConfig {
+                status_file: Some(c_status),
+                status_http: None,
+                status_interval_secs: 1,
+            },
+            quiet: true,
+            stop: Some(c_stop),
+        });
+    });
+
+    // 等待预热完成
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let mut initial_port = 0u16;
+    while Instant::now() < deadline {
+        if let Some(j) = read_json_file(&status_file) {
+            let active = j["sessions"]["active"].as_u64().unwrap_or(0);
+            let sp = j["sessions"]["up_sport"].as_u64().unwrap_or(0) as u16;
+            if active >= 1 && sp != 0 {
+                initial_port = sp;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(initial_port, 0);
+
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_nonblocking(true).unwrap();
+    app.connect(SocketAddr::new(
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+        client_port,
+    ))
+    .unwrap();
+    let payload = vec![0x5Au8; 420]; // >=400B 确保走 Video SSRC 稳定触发已稳定丢包统计
+    let mut rbuf = [0u8; 1024];
+
+    // 先建立活跃映射并记录初始后端源端口
+    let first_deadline = Instant::now() + Duration::from_secs(3);
+    while last_backend_port.load(Ordering::Relaxed) == 0 && Instant::now() < first_deadline {
+        let _ = app.send(&payload);
+        thread::sleep(Duration::from_millis(30));
+        while app.recv(&mut rbuf).is_ok() {}
+    }
+    let backend_sport_before = last_backend_port.load(Ordering::Relaxed);
+    assert_ne!(backend_sport_before, 0);
+
+    // 注入「STUN 0ms 零丢包但下行 SRTP 数据面 25% 丢包」的假优信道故障！
+    sim.lossy_data_port.store(initial_port, Ordering::SeqCst);
+
+    let switch_deadline = Instant::now() + Duration::from_secs(14);
+    let mut new_port = 0u16;
+    while Instant::now() < switch_deadline {
+        // 持续产生业务数据面流量（每次循环发 8 个 420B 包），让数据面丢包计分实时生效
+        for _ in 0..8 {
+            let _ = app.send(&payload);
+        }
+        while app.recv(&mut rbuf).is_ok() {}
+        if let Some(j) = read_json_file(&status_file) {
+            let sp = j["sessions"]["up_sport"].as_u64().unwrap_or(0) as u16;
+            let switches = j["events"]["lane_switches_total"].as_u64().unwrap_or(0);
+            let mbb = j["events"]["mbb_rotations_total"].as_u64().unwrap_or(0);
+            if sp != 0 && sp != initial_port && switches >= 1 && mbb >= 1 {
+                new_port = sp;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(60));
+    }
+    assert_ne!(
+        new_port, 0,
+        "25% data-plane SRTP packet loss (even with 0ms STUN RTT!) MUST trigger 0ms MBB escape from port {}",
+        initial_port
+    );
+
+    // 切换到新干净信道后继续发流，验证 0ms 后端端口无变且新信道通过试用确认（lane_confirmed=true, data_loss<2%）
+    let confirm_deadline = Instant::now() + Duration::from_secs(6);
+    let mut confirmed = false;
+    let mut final_loss = 100.0;
+    let mut final_score = 0.0;
+    while Instant::now() < confirm_deadline {
+        for _ in 0..8 {
+            let _ = app.send(&payload);
+        }
+        while app.recv(&mut rbuf).is_ok() {}
+        if let Some(j) = read_json_file(&status_file) {
+            let sp = j["sessions"]["up_sport"].as_u64().unwrap_or(0) as u16;
+            let c = j["link"]["lane_confirmed"].as_bool().unwrap_or(false);
+            let dl = j["link"]["data_loss_pct"].as_f64().unwrap_or(100.0);
+            let sc = j["link"]["lane_score"].as_f64().unwrap_or(0.0);
+            if sp == new_port && c && dl < 2.0 && sc >= 70.0 {
+                confirmed = true;
+                final_loss = dl;
+                final_score = sc;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    assert!(
+        confirmed,
+        "new clean lane {} must pass canary confirmation (loss={:.1}%, score={:.1})",
+        new_port, final_loss, final_score
+    );
+    assert_eq!(
+        last_backend_port.load(Ordering::Relaxed),
+        backend_sport_before,
+        "data-loss MBB escape must preserve server backend_lport (0ms QUIC continuity)"
     );
 
     stop.store(true, Ordering::SeqCst);

@@ -824,3 +824,167 @@ fn ipv6_and_ipv4_stun_xor_mapped_roundtrip() {
     assert_eq!(parsed_v6.txid, txid);
     assert_eq!(parsed_v6.xor_mapped, Some(peer_v6));
 }
+
+#[test]
+fn srtp_settled_loss_accuracy_and_reorder_immunity() {
+    let key = [0x4Au8; 32];
+    let payload = [0x6Bu8; 400]; // >=400B -> Video SSRC
+    let mut wbuf = [0u8; 2048];
+    let mut rbuf = [0u8; 2048];
+
+    // 1. 200 sequential packets with 0% loss -> exact 0% settled loss
+    {
+        let mut tx =
+            SrtpCloakCipher::new(&key, 0x1111_2222, 0x3333_4444, true, CipherSuite::Aes128Gcm);
+        let mut rx = SrtpCloakCipher::new(
+            &key,
+            0x3333_4444,
+            0x1111_2222,
+            false,
+            CipherSuite::Aes128Gcm,
+        );
+        for _ in 0..200 {
+            let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+            assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+        }
+        let (exp, got) = rx.rx_settled_stats();
+        assert_eq!(exp, 200 - 24);
+        assert_eq!(got, exp, "0% sequential stream must report exact 0% loss");
+    }
+
+    // 2. Heavy ECMP reordering (blocks of 16 shuffled reverse-order) with 0% true loss -> exact 0% settled loss!
+    {
+        let mut tx =
+            SrtpCloakCipher::new(&key, 0x1111_2222, 0x3333_4444, true, CipherSuite::Aes128Gcm);
+        let mut rx = SrtpCloakCipher::new(
+            &key,
+            0x3333_4444,
+            0x1111_2222,
+            false,
+            CipherSuite::Aes128Gcm,
+        );
+        let mut packets: Vec<Vec<u8>> = (0..220)
+            .map(|_| {
+                let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+                wbuf[..wn].to_vec()
+            })
+            .collect();
+        // Reverse every 16-packet chunk (100% reordered up to depth 15, plus replay duplicates)
+        for chunk in packets.chunks_mut(16) {
+            chunk.reverse();
+        }
+        for (idx, pkt) in packets.iter().enumerate() {
+            assert_eq!(rx.unwrap_into(pkt, &mut rbuf), Some(payload.len()));
+            // Inject duplicate replays to verify they never inflate received count
+            if idx.is_multiple_of(7) {
+                assert_eq!(rx.unwrap_into(pkt, &mut rbuf), None);
+            }
+        }
+        let (exp, got) = rx.rx_settled_stats();
+        assert!(exp >= 180);
+        assert_eq!(
+            got, exp,
+            "heavy ECMP reordering (depth <= 16) with 0% loss MUST report 0% false loss (exp={}, got={})",
+            exp, got
+        );
+    }
+
+    // 3. Deterministic 20% packet loss (drop every 5th packet) -> measured loss ~20%
+    {
+        let mut tx =
+            SrtpCloakCipher::new(&key, 0x1111_2222, 0x3333_4444, true, CipherSuite::Aes128Gcm);
+        let mut rx = SrtpCloakCipher::new(
+            &key,
+            0x3333_4444,
+            0x1111_2222,
+            false,
+            CipherSuite::Aes128Gcm,
+        );
+        for i in 0..250u32 {
+            let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+            if i % 5 != 2 {
+                assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+            }
+        }
+        let (exp, got) = rx.rx_settled_stats();
+        assert!(exp >= 200);
+        let loss_pct = (exp - got) as f64 * 100.0 / (exp as f64);
+        assert!(
+            (18.0..=22.0).contains(&loss_pct),
+            "20% true loss should measure ~20% (got {:.2}%, exp={}, got={})",
+            loss_pct,
+            exp,
+            got
+        );
+    }
+
+    // 4. 16-bit sequence wraparound (0xFFFC -> 0x0080, ROC 0 -> 1) with 0% loss -> exact 0% loss!
+    {
+        let mut tx =
+            SrtpCloakCipher::new(&key, 0x1111_2222, 0x3333_4444, true, CipherSuite::Aes128Gcm);
+        let mut rx = SrtpCloakCipher::new(
+            &key,
+            0x3333_4444,
+            0x1111_2222,
+            false,
+            CipherSuite::Aes128Gcm,
+        );
+        tx.tx_ext_seq = 0xFFFC;
+        for _ in 0..150 {
+            let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+            assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+        }
+        assert_eq!(rx.rx_roc, 1);
+        let (exp, got) = rx.rx_settled_stats();
+        assert_eq!(exp, 150 - 24);
+        assert_eq!(got, exp, "ROC wraparound must preserve exact 0% loss");
+    }
+
+    // 5. 1-RTT migration epoch reset isolates old blackhole gap AND late old-path drain packets!
+    {
+        let mut tx =
+            SrtpCloakCipher::new(&key, 0x1111_2222, 0x3333_4444, true, CipherSuite::Aes128Gcm);
+        let mut rx = SrtpCloakCipher::new(
+            &key,
+            0x3333_4444,
+            0x1111_2222,
+            false,
+            CipherSuite::Aes128Gcm,
+        );
+        let mut old_delayed: Vec<Vec<u8>> = Vec::new();
+        for i in 0..60 {
+            let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+            if i == 55 || i == 56 {
+                // Hold 2 old-path packets to arrive via old_path_drains AFTER migration!
+                old_delayed.push(wbuf[..wn].to_vec());
+            } else {
+                assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+            }
+        }
+        // Simulate 40 packets completely lost during blackhole on old socket
+        for _ in 0..40 {
+            let _ = tx.wrap_into(&payload, &mut wbuf).unwrap();
+        }
+        // 1-RTT migration completes -> reset loss epoch
+        rx.reset_rx_loss_epoch();
+        assert_eq!(rx.rx_settled_stats(), (0, 0));
+
+        // 80 clean packets arrive on the new migrated socket, interleaved with the 2 late old-path packets
+        for i in 0..80 {
+            let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+            assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+            if i == 10 {
+                for late in &old_delayed {
+                    assert_eq!(rx.unwrap_into(late, &mut rbuf), Some(payload.len()));
+                }
+            }
+        }
+        let (exp, got) = rx.rx_settled_stats();
+        assert_eq!(exp, 80 - 24);
+        assert_eq!(
+            got, exp,
+            "new migrated lane must report exact 0% loss despite 40-pkt old blackhole + late drain packets (exp={}, got={})",
+            exp, got
+        );
+    }
+}

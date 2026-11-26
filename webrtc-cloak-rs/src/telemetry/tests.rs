@@ -36,6 +36,10 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
             tx_pkts_total: 100,
             rx_pkts_total: 400,
             active_up_sport: 45678,
+            data_loss_pct: 0.0,
+            lane_score: Some(96.5),
+            lane_best_rtt_ms: Some(159.5),
+            lane_confirmed: true,
             dtls_version: "1.3",
             cipher: "aes-128-gcm",
             dual_ssrc: true,
@@ -57,6 +61,10 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
     let v1: serde_json::Value = serde_json::from_str(&j1).expect("valid serde JSON");
     assert_eq!(v1["health"], "good");
     assert_eq!(v1["link"]["stun_loss_pct"], 0.0);
+    assert_eq!(v1["link"]["data_loss_pct"], 0.0);
+    assert_eq!(v1["link"]["lane_score"], 96.5);
+    assert_eq!(v1["link"]["lane_best_rtt_ms"], 159.5);
+    assert_eq!(v1["link"]["lane_confirmed"], true);
     assert_eq!(v1["events"]["mbb_rotations_total"], 1);
     assert_eq!(v1["sessions"]["mapped_nat"], "198.51.100.10:4444");
 
@@ -79,6 +87,9 @@ fn telemetry_health_state_machine_atomic_file_and_http_endpoints() {
     assert!(r_metrics.starts_with("HTTP/1.1 200 OK"));
     assert!(r_metrics.contains("webrtc_cloak_health_code{role=\"client\",health=\"good\"} 3"));
     assert!(r_metrics.contains("webrtc_cloak_mbb_rotations_total{role=\"client\"} 1"));
+    assert!(r_metrics.contains("webrtc_cloak_data_loss_percent{role=\"client\"} 0.00"));
+    assert!(r_metrics.contains("webrtc_cloak_lane_score{role=\"client\"} 96.50"));
+    assert!(r_metrics.contains("webrtc_cloak_lane_confirmed{role=\"client\"} 1"));
 
     let r_404 = http_get("GET /nope HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n");
     assert!(r_404.starts_with("HTTP/1.1 404 Not Found"));
