@@ -473,9 +473,10 @@ pub(super) fn print_pretty_report(
             .wan_loss_pct
             .map(|v| format!("{:.1}%", v))
             .unwrap_or_else(|| "N/A".into());
+        let ip_ver = if hi.is_ipv6 { "IPv6" } else { "IPv4" };
         let mtu_s = hi
             .wan_mtu_pass
-            .map(|v| format!("IPv4 {}B verified", v))
+            .map(|v| format!("{} {}B verified", ip_ver, v))
             .unwrap_or_else(|| "N/A (server < v0.3.5)".into());
         let ov_s = match (hi.overhead_bytes, hi.overhead_pct) {
             (Some(b), Some(pct)) => format!("+{:.1}B (+{:.2}%)", b, pct),

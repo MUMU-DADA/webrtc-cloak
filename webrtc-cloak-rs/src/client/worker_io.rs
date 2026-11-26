@@ -1,6 +1,7 @@
 //! 客户端本地应用收发、旧路径静默引流、远端解封装与 MBB 切换提交。
 
 use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_session};
+use super::lane_hunt::{client_outer_hdr_len, HuntPurpose};
 use super::worker::ClientWorker;
 use super::{
     cancel_standby_for_client, is_client_in_trickle, log, record_client_media_bytes,
@@ -89,6 +90,19 @@ impl ClientWorker {
 
             let tok = if let Some(&existing) = self.token_by_client.get(&client_addr) {
                 existing
+            } else if let Some(hid) = self.find_new_primary_hunt_id(client_addr) {
+                if let Some(hunt) = self.lane_hunts.get_mut(&hid) {
+                    if n <= self.max_inner_pending
+                        && hunt.pending.len() < MAX_PENDING_PKTS
+                        && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                    {
+                        hunt.pending.push_back(self.rbuf[..n].to_vec());
+                        hunt.pending_bytes += n;
+                    }
+                }
+                continue;
+            } else if let Some(adopted) = self.try_adopt_prewarm(client_addr, now) {
+                adopted
             } else {
                 let recently_rotated = self
                     .last_rotation_by_client
@@ -102,6 +116,42 @@ impl ClientWorker {
                 } else {
                     KA_MAX_RETRIES
                 };
+                if self.cfg.lane_hunt.enabled {
+                    // 若启动预热抽卡正在进行中，直接将其就地升级为当前客户端的主抽卡并缓存首包（零浪费套接字）
+                    if let Some(pw_id) = self.find_prewarm_hunt_id() {
+                        if let Some(hunt) = self.lane_hunts.get_mut(&pw_id) {
+                            hunt.purpose = HuntPurpose::NewPrimary {
+                                client_addr,
+                                ka_max_retries: ka_retries,
+                            };
+                            if n <= self.max_inner_pending
+                                && hunt.pending.len() < MAX_PENDING_PKTS
+                                && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                            {
+                                hunt.pending.push_back(self.rbuf[..n].to_vec());
+                                hunt.pending_bytes += n;
+                            }
+                            continue;
+                        }
+                    }
+                    let mut init_pending = VecDeque::with_capacity(16);
+                    let mut init_bytes = 0usize;
+                    if n <= self.max_inner_pending {
+                        init_pending.push_back(self.rbuf[..n].to_vec());
+                        init_bytes = n;
+                    }
+                    if self.start_lane_hunt(
+                        HuntPurpose::NewPrimary {
+                            client_addr,
+                            ka_max_retries: ka_retries,
+                        },
+                        now,
+                        init_pending,
+                        init_bytes,
+                    ) {
+                        continue;
+                    }
+                }
                 match spawn_client_session(
                     self.worker_id,
                     client_addr,
@@ -226,6 +276,7 @@ impl ClientWorker {
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
     ) {
+        let mut ka_rtt_sample: Option<f64> = None;
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             loop {
                 let n = match sess.upstream.recv(&mut self.rbuf) {
@@ -304,7 +355,7 @@ impl ClientWorker {
                                         th.record_stun_ok(
                                             rtt_ms,
                                             sess.retries.min(255) as u8,
-                                            parsed.xor_mapped.map(SocketAddr::V4),
+                                            parsed.xor_mapped,
                                         );
                                     }
                                     let uname = sess.ice.username();
@@ -365,7 +416,10 @@ impl ClientWorker {
                                         let mut c = SrtpCloakCipher::new(
                                             &final_key, s_c2s, s_s2c, true, chosen,
                                         );
-                                        c.set_wan_mtu(self.cfg.wan_mtu);
+                                        c.set_wan_mtu_for(
+                                            self.cfg.wan_mtu,
+                                            client_outer_hdr_len(self.cfg.server_addr),
+                                        );
                                         sess.cipher = Some(c);
                                         sess.state = HandshakeState::Ready;
                                         sess.ready_at = Some(now);
@@ -436,18 +490,20 @@ impl ClientWorker {
                                 } else if sess.state == HandshakeState::Ready
                                     && sess.ka_txid == Some(parsed.txid)
                                 {
+                                    let ka_rtt = sess
+                                        .ka_sent_at
+                                        .map(|t| {
+                                            now.saturating_duration_since(t).as_secs_f64() * 1000.0
+                                        })
+                                        .unwrap_or(0.0);
+                                    if ka_rtt > 0.0 {
+                                        ka_rtt_sample = Some(ka_rtt);
+                                    }
                                     if let Some(ref th) = self.telemetry {
-                                        let ka_rtt = sess
-                                            .ka_sent_at
-                                            .map(|t| {
-                                                now.saturating_duration_since(t).as_secs_f64()
-                                                    * 1000.0
-                                            })
-                                            .unwrap_or(0.0);
                                         th.record_stun_ok(
                                             ka_rtt,
                                             sess.ka_retries,
-                                            parsed.xor_mapped.map(SocketAddr::V4),
+                                            parsed.xor_mapped,
                                         );
                                     }
                                     sess.keepalives_ok += 1;
@@ -576,7 +632,8 @@ impl ClientWorker {
                             sess.state = HandshakeState::Closing(
                                 now + Duration::from_millis(CLOSING_DRAIN_MS),
                             );
-                            if was_ready && !sess.is_standby && active_recently {
+                            if was_ready && !sess.is_standby && !sess.is_prewarm && active_recently
+                            {
                                 graceful_reconnects.push((tok, sess.client_addr));
                             }
                         } else if !was_ready
@@ -604,7 +661,7 @@ impl ClientWorker {
                                         sess.state = HandshakeState::Closing(
                                             now + Duration::from_millis(CLOSING_DRAIN_MS),
                                         );
-                                        if !sess.is_standby && active_recently {
+                                        if !sess.is_standby && !sess.is_prewarm && active_recently {
                                             graceful_reconnects.push((tok, sess.client_addr));
                                         }
                                     }
@@ -784,7 +841,10 @@ impl ClientWorker {
                                         standby_promoted.push((tok, sess.client_addr));
                                     }
                                 }
-                                Some(SrtpFrame::Probe(_)) => {}
+                                Some(SrtpFrame::Probe(_)) => {
+                                    sess.rx_pkts += 1;
+                                    sess.last_data_active = now;
+                                }
                                 None => {
                                     sess.auth_drops += 1;
                                 }
@@ -807,6 +867,9 @@ impl ClientWorker {
                     }
                 }
             }
+        }
+        if let Some(ka_rtt) = ka_rtt_sample {
+            self.evaluate_lane_quality_on_ka(tok, ka_rtt, now);
         }
     }
 
@@ -966,6 +1029,7 @@ impl ClientWorker {
         for (old_tok, client_addr) in graceful_reconnects {
             if self.token_by_client.get(&client_addr) == Some(&old_tok) {
                 self.token_by_client.remove(&client_addr);
+                self.cancel_hunts_for_client(client_addr);
                 cancel_standby_for_client(
                     client_addr,
                     &mut self.standby_by_client,

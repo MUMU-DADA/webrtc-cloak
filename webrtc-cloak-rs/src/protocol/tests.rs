@@ -798,3 +798,29 @@ fn v40_hkdf_stun_per_session_mig_and_control_frames() {
         assert_eq!(srv.unwrap_into_ex(&wbuf[..wn2], &mut rbuf), None); // replay blocked!
     }
 }
+
+#[test]
+fn ipv6_and_ipv4_stun_xor_mapped_roundtrip() {
+    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+    let psk = b"stun-dual-stack-xor-mapped-test-psk";
+    let txid = make_fresh_stun_txid(psk);
+
+    let peer_v4 = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(203, 0, 113, 42)), 40001);
+    let resp_v4 = build_stun_success_response(&txid, peer_v4, psk);
+    assert_eq!(resp_v4.len(), 64, "IPv4 STUN Success must remain 64B");
+    let parsed_v4 = parse_stun(&resp_v4, psk).expect("parse IPv4 STUN Success");
+    assert!(parsed_v4.authenticated);
+    assert_eq!(parsed_v4.xor_mapped, Some(peer_v4));
+
+    let peer_v6 = SocketAddr::new(
+        IpAddr::V6("2001:db8:85a3::8a2e:370:7334".parse::<Ipv6Addr>().unwrap()),
+        51234,
+    );
+    let resp_v6 = build_stun_success_response(&txid, peer_v6, psk);
+    assert_eq!(resp_v6.len(), 76, "IPv6 STUN Success must be 76B");
+    let parsed_v6 = parse_stun(&resp_v6, psk).expect("parse IPv6 STUN Success");
+    assert!(parsed_v6.authenticated);
+    assert_eq!(parsed_v6.txid, txid);
+    assert_eq!(parsed_v6.xor_mapped, Some(peer_v6));
+}

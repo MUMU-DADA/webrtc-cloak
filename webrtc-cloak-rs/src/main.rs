@@ -9,7 +9,10 @@ mod server;
 mod telemetry;
 
 use crate::bench_tools::{print_cpu_info, run_bench, run_loadgen, run_sink};
-use crate::client::{run_client, ClientConfig};
+use crate::client::{
+    run_client, ClientConfig, LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS,
+    DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
+};
 use crate::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_WAN_MTU};
 use crate::protocol::{
     detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,
@@ -19,7 +22,7 @@ use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use pico_args::Arguments;
 use std::env;
-use std::net::{SocketAddr, ToSocketAddrs};
+use std::net::{IpAddr, SocketAddr, ToSocketAddrs};
 use std::process;
 
 /// 1 MiB 字节数，用于将 `--rotate-bytes` 参数换算为字节。
@@ -122,17 +125,29 @@ fn parse_status_http(s: &str) -> Result<SocketAddr, String> {
 }
 
 fn parse_socket_addr(host: &str, port: u16, label: &str) -> SocketAddr {
-    format!("{}:{}", host, port).parse().unwrap_or_else(|e| {
-        eprintln!("Invalid {} address {}:{}: {}", label, host, port, e);
-        process::exit(2);
-    })
+    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+    if let Ok(ip) = trimmed.parse::<IpAddr>() {
+        return SocketAddr::new(ip, port);
+    }
+    let spec = if trimmed.contains(':') {
+        format!("[{}]:{}", trimmed, port)
+    } else {
+        format!("{}:{}", trimmed, port)
+    };
+    spec.to_socket_addrs()
+        .ok()
+        .and_then(|mut it| it.next())
+        .unwrap_or_else(|| {
+            eprintln!("Invalid {} address {}:{}", label, host, port);
+            process::exit(2);
+        })
 }
 
 fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IP> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
@@ -268,18 +283,27 @@ fn run() -> Result<(), pico_args::Error> {
 
             if !force_local {
                 if let Some(host) = server_host.filter(|s| !s.is_empty()) {
-                    let target_str = format!("{}:{}", host, server_port);
-                    let resolved = match target_str.to_socket_addrs() {
-                        Ok(mut it) => match it.find(|a| a.is_ipv4()) {
-                            Some(a) => a,
-                            None => {
-                                eprintln!("Failed to resolve IPv4 address for {}", target_str);
+                    let trimmed = host.trim().trim_start_matches('[').trim_end_matches(']');
+                    let target_str = if trimmed.contains(':') {
+                        format!("[{}]:{}", trimmed, server_port)
+                    } else {
+                        format!("{}:{}", trimmed, server_port)
+                    };
+                    let resolved = if let Ok(ip) = trimmed.parse::<IpAddr>() {
+                        SocketAddr::new(ip, server_port)
+                    } else {
+                        match target_str.to_socket_addrs() {
+                            Ok(mut it) => match it.next() {
+                                Some(a) => a,
+                                None => {
+                                    eprintln!("Failed to resolve address for {}", target_str);
+                                    process::exit(2);
+                                }
+                            },
+                            Err(e) => {
+                                eprintln!("Failed to resolve {}: {}", target_str, e);
                                 process::exit(2);
                             }
-                        },
-                        Err(e) => {
-                            eprintln!("Failed to resolve {}: {}", target_str, e);
-                            process::exit(2);
                         }
                     };
                     opts.server_addr = Some(resolved);
@@ -364,6 +388,23 @@ fn run() -> Result<(), pico_args::Error> {
             let keepalive_secs: u64 = args
                 .opt_value_from_str("--keepalive")?
                 .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+            let lane_hunt_flag = args.contains("--lane-hunt");
+            let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+            let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+            let lane_target_rtt_opt: Option<u64> = args.opt_value_from_str("--lane-target-rtt")?;
+            let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+            let lane_enabled = lane_hunt_flag
+                || lane_probes_opt.is_some_and(|p| p > 1)
+                || lane_target_rtt_opt.is_some_and(|t| t > 0);
+            let lane_hunt = LaneHuntConfig {
+                enabled: lane_enabled,
+                probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                degrade_cooldown_secs: lane_cooldown_opt
+                    .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+            }
+            .normalized();
             if server_host.is_empty() {
                 usage();
             }
@@ -394,6 +435,7 @@ fn run() -> Result<(), pico_args::Error> {
                 keepalive_secs,
                 idle_timeout_secs: common.idle_timeout_secs,
                 stats_interval_secs: common.stats_interval_secs,
+                lane_hunt,
                 telemetry: common.telemetry,
                 quiet: false,
                 stop: Some(install_shutdown_handler()),

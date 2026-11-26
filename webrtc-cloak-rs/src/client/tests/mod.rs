@@ -1,5 +1,6 @@
 //! 客户端与服务端端到端集成测试公共辅助模块。
 
+mod lane_hunt;
 mod lifecycle;
 mod mbb;
 mod v4_audit;

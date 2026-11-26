@@ -8,8 +8,8 @@ use super::{
     SERVER_SRTCP_INIT_MAX_MS, SERVER_SRTCP_INIT_MIN_MS,
 };
 use crate::constants::{
-    CTRL_FRAME_BUF_LEN, HANDOVER_MIN_REQ_LEN, HANDOVER_OP_ACK, HANDOVER_OP_REQ, HANDOVER_PROOF_LEN,
-    PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
+    outer_udp_hdr_len, CTRL_FRAME_BUF_LEN, HANDOVER_MIN_REQ_LEN, HANDOVER_OP_ACK, HANDOVER_OP_REQ,
+    HANDOVER_PROOF_LEN, PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
     PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, PROBE_IO_BUF_LEN, SRTP_HANDOVER_MAGIC,
     SRTP_PATH_CHALLENGE_MAGIC, STUN_MAX_USERNAME_LEN, TRICKLE_WINDOW_15S_SECS,
 };
@@ -293,7 +293,7 @@ pub(super) fn drain_server_dtls(
         sess.mi_key_mig = Some(mi_key_mig);
         sess.negotiated_cipher = Some(chosen);
         let mut c = SrtpCloakCipher::new(&final_key, sess.ssrc_s2c, sess.ssrc_c2s, false, chosen);
-        c.set_wan_mtu(cfg.wan_mtu);
+        c.set_wan_mtu_for(cfg.wan_mtu, outer_udp_hdr_len(cfg.listen_addr));
         c.set_dual_ssrc(is_dtls13);
         sess.cipher = Some(c);
         sess.state = ServerState::Ready;

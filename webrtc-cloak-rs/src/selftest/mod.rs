@@ -162,6 +162,7 @@ pub(super) struct ScenarioResult {
 #[derive(Default)]
 pub(super) struct Highlights {
     pub(super) is_remote: bool,
+    pub(super) is_ipv6: bool,
     pub(super) target_label: Option<String>,
     pub(super) nat_mapped: Option<String>,
     pub(super) negotiated_cipher: Option<String>,

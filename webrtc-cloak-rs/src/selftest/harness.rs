@@ -592,6 +592,7 @@ impl ManagedClient {
                 keepalive_secs,
                 idle_timeout_secs: DEFAULT_IDLE_TIMEOUT_SECS,
                 stats_interval_secs: 3600,
+                lane_hunt: Default::default(),
                 telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(stop_c),

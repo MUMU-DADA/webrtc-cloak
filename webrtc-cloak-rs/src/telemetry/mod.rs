@@ -28,8 +28,11 @@ const TELEMETRY_RECENT_EVENT_CAP: usize = 8;
 const TELEMETRY_SLIDING_WINDOW: Duration = Duration::from_secs(600);
 /// 非强制触发时状态 JSON 文件最小原子写入间隔（毫秒），防止突发事件频繁落盘。
 const TELEMETRY_MIN_FILE_FLUSH_GAP: Duration = Duration::from_millis(250);
-/// 遥测只读 HTTP 监听线程栈大小（64 KiB，单线程无线程池、零空转唤醒）。
-const TELEMETRY_HTTP_THREAD_STACK_BYTES: usize = 64 * 1024;
+/// 遥测只读 HTTP 监听线程栈大小（128 KiB 虚拟栈按需分页，兼顾调试构建与轻量常驻内存）。
+#[cfg(debug_assertions)]
+const TELEMETRY_HTTP_THREAD_STACK_BYTES: usize = 256 * 1024;
+#[cfg(not(debug_assertions))]
+const TELEMETRY_HTTP_THREAD_STACK_BYTES: usize = 128 * 1024;
 /// `mio::Poll` 监听本地 HTTP 端口的事件令牌。
 const TELEMETRY_HTTP_ACCEPT_TOKEN: Token = Token(0);
 /// `mio::Poll` 唤醒关闭 HTTP 线程的事件令牌。
@@ -136,6 +139,8 @@ pub(super) struct TelemetryInner {
     pub(super) migration_times: VecDeque<Instant>,
     pub(super) mbb_rotations_total: u64,
     pub(super) graceful_reconnects_total: u64,
+    pub(super) lane_hunts_total: u64,
+    pub(super) lane_switches_total: u64,
     pub(super) unauth_prev_total: u64,
     pub(super) unauth_deltas_10m: VecDeque<(Instant, u64)>,
     pub(super) last_event: &'static str,
@@ -364,6 +369,8 @@ impl TelemetryHub {
             migration_times: VecDeque::new(),
             mbb_rotations_total: 0,
             graceful_reconnects_total: 0,
+            lane_hunts_total: 0,
+            lane_switches_total: 0,
             unauth_prev_total: 0,
             unauth_deltas_10m: VecDeque::new(),
             last_event: "started",
@@ -435,15 +442,19 @@ impl TelemetryHub {
                     let hub_c = Arc::clone(&hub);
                     let h_stop = Arc::clone(&hub.http_stop);
                     let ext_stop = external_stop;
+                    // Keep an Arc<Waker> clone inside the polling thread so Linux epoll's
+                    // underlying eventfd can NEVER be closed before poll() observes wake().
+                    let _keep_waker = waker;
                     let handle = thread::Builder::new()
                         .name("wc-status-http".to_string())
                         .stack_size(TELEMETRY_HTTP_THREAD_STACK_BYTES)
                         .spawn(move || {
                             let _keep_listener = _mio_listener;
+                            let _waker_guard = _keep_waker;
                             let mut events = Events::with_capacity(8);
                             loop {
-                                if h_stop.load(Ordering::Relaxed)
-                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
+                                if h_stop.load(Ordering::Acquire)
+                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire))
                                 {
                                     break;
                                 }
@@ -452,8 +463,8 @@ impl TelemetryHub {
                                     Err(e) if e.kind() == ErrorKind::Interrupted => continue,
                                     Err(_) => break,
                                 }
-                                if h_stop.load(Ordering::Relaxed)
-                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
+                                if h_stop.load(Ordering::Acquire)
+                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Acquire))
                                 {
                                     break;
                                 }
@@ -500,8 +511,8 @@ impl TelemetryHub {
 
     pub fn shutdown(&self) {
         self.http_stop.store(true, Ordering::SeqCst);
-        if let Ok(mut g) = self.http_waker.lock() {
-            if let Some(w) = g.take() {
+        if let Ok(g) = self.http_waker.lock() {
+            if let Some(ref w) = *g {
                 let _ = w.wake();
             }
         }
@@ -509,6 +520,9 @@ impl TelemetryHub {
             if let Some(h) = g.take() {
                 let _ = h.join();
             }
+        }
+        if let Ok(mut g) = self.http_waker.lock() {
+            let _ = g.take();
         }
     }
 
@@ -672,6 +686,19 @@ impl TelemetryHub {
         if let Ok(mut g) = self.inner.lock() {
             g.graceful_reconnects_total += 1;
             Self::push_event_locked(&mut g, "graceful_reconnect", detail);
+        }
+        self.flush_file_if_needed(false);
+    }
+
+    pub fn record_lane_hunt(&self, switched: bool, detail: String) {
+        if let Ok(mut g) = self.inner.lock() {
+            g.lane_hunts_total += 1;
+            if switched {
+                g.lane_switches_total += 1;
+                Self::push_event_locked(&mut g, "lane_switch", detail);
+            } else {
+                Self::push_event_locked(&mut g, "lane_hunt", detail);
+            }
         }
         self.flush_file_if_needed(false);
     }

@@ -7,8 +7,10 @@ mod stun;
 #[cfg(test)]
 mod tests;
 
+#[allow(unused_imports)]
+pub use dtls::build_dimpl_config_pool;
 pub use dtls::{
-    build_dimpl_config_pool, extract_dtls_server_hello_suite, generate_ephemeral_webrtc_cert,
+    build_dimpl_config_pool_for, extract_dtls_server_hello_suite, generate_ephemeral_webrtc_cert,
     new_dtls_instance, resolve_srtp_suite, validate_dtls_datagram, CertCache, DtlsConfigPool,
 };
 pub use srtp::{combine_session_key, derive_stun_material, SrtpCloakCipher};

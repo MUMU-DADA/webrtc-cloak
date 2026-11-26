@@ -12,8 +12,8 @@ use super::{
     SERVER_SRTCP_INIT_MIN_MS,
 };
 use crate::constants::{
-    CLOSING_DRAIN_MS, DTLS_READY_ALERT_ONLY_GRACE_SECS, MAX_DTLS_RESETS, MAX_INNER_UDP_LEN,
-    SRTP_DATA_MIN_WIRE_LEN, STUN_BINDING_REQUEST, TRICKLE_WINDOW_15S_SECS,
+    outer_udp_hdr_len, CLOSING_DRAIN_MS, DTLS_READY_ALERT_ONLY_GRACE_SECS, MAX_DTLS_RESETS,
+    MAX_INNER_UDP_LEN, SRTP_DATA_MIN_WIRE_LEN, STUN_BINDING_REQUEST, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     build_stun_success_response, build_stun_success_response_with_key, combine_session_key,
@@ -24,7 +24,6 @@ use crate::protocol::{
 use mio::Token;
 use std::collections::VecDeque;
 use std::io::ErrorKind;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::time::{Duration, Instant};
 
 /// 服务端在 DTLS Flight 5 完成前每会话最多缓存的 0-RTT 早到 SRTP 包数。
@@ -42,11 +41,6 @@ impl ServerWorker {
             };
             let pkt = &self.rbuf[..n];
             self.audit.record(0, pkt);
-
-            let peer_v4 = match peer_addr {
-                SocketAddr::V4(v4) => v4,
-                SocketAddr::V6(_) => SocketAddrV4::new(Ipv4Addr::LOCALHOST, peer_addr.port()),
-            };
 
             match demux_rfc7983(pkt) {
                 PacketKind::Stun => {
@@ -139,7 +133,7 @@ impl ServerWorker {
 
                                 let resp = build_stun_success_response_with_key(
                                     &parsed.txid,
-                                    peer_v4,
+                                    peer_addr,
                                     &meta.mi_key_mig,
                                 );
                                 {
@@ -272,7 +266,7 @@ impl ServerWorker {
                     if same_active {
                         if let Some(&tok) = self.token_by_peer.get(&peer_addr) {
                             let resp =
-                                build_stun_success_response(&parsed.txid, peer_v4, &self.cfg.psk);
+                                build_stun_success_response(&parsed.txid, peer_addr, &self.cfg.psk);
                             {
                                 let mut cache = self.seen_txids.lock().unwrap();
                                 cache.record(parsed.txid, peer_addr, now, &resp);
@@ -438,7 +432,10 @@ impl ServerWorker {
                             let mk = derive_ice_migration_key(&final_key);
                             let mut c =
                                 SrtpCloakCipher::new(&final_key, s_s2c, s_c2s, false, chosen);
-                            c.set_wan_mtu(self.cfg.wan_mtu);
+                            c.set_wan_mtu_for(
+                                self.cfg.wan_mtu,
+                                outer_udp_hdr_len(self.cfg.listen_addr),
+                            );
                             self.registry
                                 .register_session(&uname, self.worker_id, mk, tie_breaker);
                             (
@@ -452,7 +449,7 @@ impl ServerWorker {
                             )
                         };
 
-                    let resp = build_stun_success_response(&parsed.txid, peer_v4, &self.cfg.psk);
+                    let resp = build_stun_success_response(&parsed.txid, peer_addr, &self.cfg.psk);
                     {
                         let mut cache = self.seen_txids.lock().unwrap();
                         cache.record(parsed.txid, peer_addr, now, &resp);

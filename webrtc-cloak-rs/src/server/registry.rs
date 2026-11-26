@@ -8,8 +8,8 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-/// 服务端缓存的单条 STUN 应答报文最大字节数（标准 IPv4 Binding Success 固定 64B）。
-const STUN_CACHED_REPLY_MAX_LEN: usize = 64;
+/// 服务端缓存的单条 STUN 应答报文最大字节数（IPv4 固定 64B / IPv6 固定 76B）。
+const STUN_CACHED_REPLY_MAX_LEN: usize = 80;
 /// 跨 worker 共享 STUN 事务 ID 防重放缓存条目存活时间（秒）。
 const SEEN_TXID_TTL: Duration = Duration::from_secs(90);
 /// 合法同端同 txid UDP 丢包重传的缓存应答有效窗口（秒）。

@@ -1,6 +1,7 @@
 //! 跨模块共享的协议契约、网络缓冲规格与双端耦合时序常量。
 
 use mio::Token;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 // ============================================================================
@@ -9,6 +10,26 @@ use std::time::Duration;
 
 /// IPv4 (20B) + UDP (8B) 固定外层包头总长度（字节）。
 pub const IPV4_UDP_HDR_LEN: usize = 28;
+/// IPv6 (40B) + UDP (8B) 固定外层包头总长度（字节）。
+pub const IPV6_UDP_HDR_LEN: usize = 48;
+
+/// 按对端/监听地址族返回对应外层 IP+UDP 包头长度（IPv4=28B，IPv6=48B）。
+#[inline]
+pub const fn outer_udp_hdr_len(addr: SocketAddr) -> usize {
+    match addr {
+        SocketAddr::V4(_) => IPV4_UDP_HDR_LEN,
+        SocketAddr::V6(_) => IPV6_UDP_HDR_LEN,
+    }
+}
+
+/// 返回与目标地址族匹配的通配本地临时端口绑定地址（`0.0.0.0:0` 或 `[::]:0`）。
+#[inline]
+pub const fn unspecified_addr_for(target: SocketAddr) -> SocketAddr {
+    match target {
+        SocketAddr::V4(_) => SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+        SocketAddr::V6(_) => SocketAddr::new(IpAddr::V6(Ipv6Addr::UNSPECIFIED), 0),
+    }
+}
 /// 默认外层 IPv4 WAN MTU 上限（< 1492B PPPoE，避免公网分片并引导内层 QUIC DPLPMTUD 收敛）。
 pub const DEFAULT_WAN_MTU: usize = 1488;
 /// 启用 WAN MTU 限制时外层 UDP 负载的最小安全下限（RFC 791 IPv4 最小重组 MTU）。

@@ -7,7 +7,7 @@ use crate::constants::{
 use hmac::{Hmac, KeyInit, Mac as _};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
@@ -216,27 +216,60 @@ fn finalize_stun(msg_type: u16, txid: &[u8; 12], body_in: &[u8], psk: &[u8]) -> 
     finalize_stun_with_key(msg_type, txid, body_in, &mi_key)
 }
 
-pub fn encode_xor_mapped_v4(addr: SocketAddrV4) -> [u8; 8] {
+/// Encode RFC 5389 §15.2 `XOR-MAPPED-ADDRESS` for both IPv4 (8B, family 0x01) and IPv6 (20B, family 0x02).
+pub fn encode_xor_mapped(addr: SocketAddr, txid: &[u8; 12]) -> ([u8; 20], usize) {
     let x_port = addr.port() ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-    let ip_u32 = u32::from(*addr.ip());
-    let x_ip = ip_u32 ^ STUN_MAGIC_COOKIE;
-    let mut out = [0u8; 8];
+    let mut out = [0u8; 20];
     out[0] = 0x00;
-    out[1] = 0x01;
     out[2..4].copy_from_slice(&x_port.to_be_bytes());
-    out[4..8].copy_from_slice(&x_ip.to_be_bytes());
-    out
+    match addr {
+        SocketAddr::V4(v4) => {
+            out[1] = 0x01;
+            let x_ip = u32::from(*v4.ip()) ^ STUN_MAGIC_COOKIE;
+            out[4..8].copy_from_slice(&x_ip.to_be_bytes());
+            (out, 8)
+        }
+        SocketAddr::V6(v6) => {
+            out[1] = 0x02;
+            let octets = v6.ip().octets();
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            for i in 0..4 {
+                out[4 + i] = octets[i] ^ cookie[i];
+            }
+            for i in 0..12 {
+                out[8 + i] = octets[4 + i] ^ txid[i];
+            }
+            (out, 20)
+        }
+    }
 }
 
-pub fn decode_xor_mapped_v4(val: &[u8]) -> Option<SocketAddrV4> {
-    if val.len() < 8 || val[1] != 0x01 {
+/// Decode RFC 5389 §15.2 `XOR-MAPPED-ADDRESS` supporting both IPv4 and IPv6.
+pub fn decode_xor_mapped(val: &[u8], txid: &[u8; 12]) -> Option<SocketAddr> {
+    if val.len() < 8 {
         return None;
     }
     let x_port = u16::from_be_bytes([val[2], val[3]]);
-    let x_ip = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
     let port = x_port ^ ((STUN_MAGIC_COOKIE >> 16) as u16);
-    let ip = Ipv4Addr::from(x_ip ^ STUN_MAGIC_COOKIE);
-    Some(SocketAddrV4::new(ip, port))
+    match val[1] {
+        0x01 => {
+            let x_ip = u32::from_be_bytes([val[4], val[5], val[6], val[7]]);
+            let ip = Ipv4Addr::from(x_ip ^ STUN_MAGIC_COOKIE);
+            Some(SocketAddr::new(IpAddr::V4(ip), port))
+        }
+        0x02 if val.len() >= 20 => {
+            let cookie = STUN_MAGIC_COOKIE.to_be_bytes();
+            let mut octets = [0u8; 16];
+            for i in 0..4 {
+                octets[i] = val[4 + i] ^ cookie[i];
+            }
+            for i in 0..12 {
+                octets[4 + i] = val[8 + i] ^ txid[i];
+            }
+            Some(SocketAddr::new(IpAddr::V6(Ipv6Addr::from(octets)), port))
+        }
+        _ => None,
+    }
 }
 
 /// Build an RFC 8445 ICE STUN Binding Request matching libwebrtc attribute ordering:
@@ -274,23 +307,23 @@ pub fn build_ice_stun_request_with_key(
     (pkt, txid)
 }
 
-/// Build an authenticated RFC 8445 ICE STUN Binding Success Response (always 64 bytes).
-pub fn build_stun_success_response(txid: &[u8; 12], peer: SocketAddrV4, psk: &[u8]) -> Vec<u8> {
-    let mut body = Vec::with_capacity(48);
-    let xma = encode_xor_mapped_v4(peer);
-    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma);
+/// Build an authenticated RFC 8445 ICE STUN Binding Success Response (64B IPv4 / 76B IPv6).
+pub fn build_stun_success_response(txid: &[u8; 12], peer: SocketAddr, psk: &[u8]) -> Vec<u8> {
+    let mut body = Vec::with_capacity(56);
+    let (xma, xlen) = encode_xor_mapped(peer, txid);
+    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma[..xlen]);
     finalize_stun(STUN_BINDING_SUCCESS, txid, &body, psk)
 }
 
-/// Build an authenticated RFC 8445 ICE STUN Binding Success Response (64 bytes) with explicit `mi_key`.
+/// Build an authenticated RFC 8445 ICE STUN Binding Success Response (64B IPv4 / 76B IPv6) with explicit `mi_key`.
 pub fn build_stun_success_response_with_key(
     txid: &[u8; 12],
-    peer: SocketAddrV4,
+    peer: SocketAddr,
     mi_key: &[u8; 32],
 ) -> Vec<u8> {
-    let mut body = Vec::with_capacity(48);
-    let xma = encode_xor_mapped_v4(peer);
-    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma);
+    let mut body = Vec::with_capacity(56);
+    let (xma, xlen) = encode_xor_mapped(peer, txid);
+    push_stun_attr(&mut body, STUN_ATTR_XOR_MAPPED_ADDRESS, &xma[..xlen]);
     finalize_stun_with_key(STUN_BINDING_SUCCESS, txid, &body, mi_key)
 }
 
@@ -344,7 +377,7 @@ pub struct ParsedStun {
     pub username: Option<String>,
     pub tie_breaker: Option<[u8; 8]>,
     pub use_candidate: bool,
-    pub xor_mapped: Option<SocketAddrV4>,
+    pub xor_mapped: Option<SocketAddr>,
     pub fingerprint_ok: bool,
     pub authenticated: bool,
 }
@@ -420,7 +453,7 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
                 tie_breaker = Some(tb);
             }
             STUN_ATTR_XOR_MAPPED_ADDRESS => {
-                xor_mapped = decode_xor_mapped_v4(val);
+                xor_mapped = decode_xor_mapped(val, &txid);
             }
             STUN_ATTR_USE_CANDIDATE if attr_len == 0 => {
                 use_candidate = true;

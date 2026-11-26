@@ -1,16 +1,17 @@
 //! 客户端超时驱动、黑洞 1-RTT 迁移、MBB 备选拉起与会话清理。
 
 use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_session};
+use super::lane_hunt::HuntPurpose;
 use super::worker::ClientWorker;
 use super::{
-    cancel_standby_for_client, is_client_in_trickle, log, make_udp_socket, HandshakeState,
-    OldPathDrain, ACTIVE_ROTATE_WINDOW_SECS, CLIENT_HANDOVER_MIN_RETRY_MS,
+    alloc_token, cancel_standby_for_client, is_client_in_trickle, log, make_udp_socket,
+    HandshakeState, OldPathDrain, ACTIVE_ROTATE_WINDOW_SECS, CLIENT_HANDOVER_MIN_RETRY_MS,
     CLIENT_MIG_ECHO_INTERVAL_MS, CLIENT_SRTCP_ACTIVE_MAX_MS, CLIENT_SRTCP_ACTIVE_MIN_MS,
     KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS, RECENT_ROTATION_DAMP_SECS,
     SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
-    BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS,
+    unspecified_addr_for, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS,
     POST_BYE_CLOSING_DRAIN_MS, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
     SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, SRTP_HANDOVER_MAGIC,
     SRTP_PATH_CHALLENGE_MAGIC, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
@@ -21,7 +22,7 @@ use crate::protocol::{
 };
 use mio::{Interest, Token};
 use std::collections::VecDeque;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// 客户端轮换历史记录表最大容量，超过后清理过期条目。
@@ -59,9 +60,15 @@ const CLIENT_MBB_FAIL_BACKOFF_MAX_MS: u64 = 90_000;
 /// MBB 定时轮换检查的最小 poll 步进下限（毫秒）。
 const WORKER_MIN_ROTATE_WAIT_MS: u64 = 20;
 
+/// 定时器单轮处理结果：`(下次 poll 等待时长, 待提交的 MBB 晋升列表, 待发起 0xFFFC 交接的备选就绪列表)`。
+pub(super) type TimerOutcome = (Duration, Vec<(Token, SocketAddr)>, Vec<(Token, SocketAddr)>);
+
 impl ClientWorker {
-    pub(super) fn process_timers(&mut self, now: Instant) -> (Duration, Vec<(Token, SocketAddr)>) {
-        let mut wait = if self.sessions_by_token.is_empty() && self.pending_reconnects.is_empty() {
+    pub(super) fn process_timers(&mut self, now: Instant) -> TimerOutcome {
+        let mut wait = if self.sessions_by_token.is_empty()
+            && self.pending_reconnects.is_empty()
+            && self.lane_hunts.is_empty()
+        {
             Duration::from_secs(WORKER_IDLE_POLL_SECS)
         } else {
             Duration::from_secs(WORKER_ACTIVE_POLL_SECS)
@@ -71,6 +78,22 @@ impl ClientWorker {
         let mut to_migrate: Vec<Token> = Vec::new();
         let mut to_spawn_standby: Vec<(Token, SocketAddr)> = Vec::new();
         let mut standby_promoted_timers: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut standby_ready_timers: Vec<(Token, SocketAddr)> = Vec::new();
+
+        // 若预热槽会话已进入 Closing（如服务端优雅关闭/黑洞），立刻解绑以便立即重热
+        if let Some(pwt) = self.prewarm_tok {
+            let dead = self
+                .sessions_by_token
+                .get(&pwt)
+                .map(|s| matches!(s.state, HandshakeState::Closing(_)))
+                .unwrap_or(true);
+            if dead {
+                self.prewarm_tok = None;
+                self.next_prewarm_at = Some(now + Duration::from_millis(500));
+            }
+        }
+
+        self.process_hunt_timers(now, &mut wait, &mut standby_ready_timers);
 
         // Expire old migrated receive-only drain sockets
         if !self.old_path_drains.is_empty() {
@@ -102,6 +125,39 @@ impl ClientWorker {
         for caddr in due_reconnects {
             if let Some(pr) = self.pending_reconnects.remove(&caddr) {
                 if !self.token_by_client.contains_key(&caddr) {
+                    if let Some(adopted) = self.try_adopt_prewarm(caddr, now) {
+                        if let Some(new_sess) = self.sessions_by_token.get_mut(&adopted) {
+                            if new_sess.state == HandshakeState::Ready {
+                                if let Some(ref mut cipher) = new_sess.cipher {
+                                    for raw in pr.pending {
+                                        if let Some(wn) = cipher.wrap_into(&raw, &mut self.wbuf) {
+                                            if new_sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                                                new_sess.tx_pkts += 1;
+                                                new_sess.tx_bytes += raw.len() as u64;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                new_sess.pending = pr.pending;
+                                new_sess.pending_bytes = pr.pending_bytes;
+                            }
+                        }
+                        continue;
+                    }
+                    if self.cfg.lane_hunt.enabled
+                        && self.start_lane_hunt(
+                            HuntPurpose::NewPrimary {
+                                client_addr: caddr,
+                                ka_max_retries: KA_MAX_RETRIES,
+                            },
+                            now,
+                            pr.pending.clone(),
+                            pr.pending_bytes,
+                        )
+                    {
+                        continue;
+                    }
                     if let Some(new_tok) = spawn_client_session(
                         self.worker_id,
                         caddr,
@@ -127,6 +183,8 @@ impl ClientWorker {
                 }
             }
         }
+
+        let keepwarm_dur = self.prewarm_keepwarm_interval();
 
         for (&tok, sess) in self.sessions_by_token.iter_mut() {
             match sess.state {
@@ -492,7 +550,30 @@ impl ClientWorker {
                         }
                     }
 
-                    if now.duration_since(sess.last_data_active) > self.idle_dur {
+                    if sess.is_prewarm {
+                        if let Some(kw_at) = sess.next_keepwarm_at {
+                            if now >= kw_at {
+                                if let Some(ref mut cipher) = sess.cipher {
+                                    if let Some(wn) =
+                                        cipher.wrap_probe_into(b"WC_LANE_KEEPWARM", &mut self.wbuf)
+                                    {
+                                        if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                                            sess.tx_pkts += 1;
+                                        }
+                                    }
+                                }
+                                sess.next_keepwarm_at = Some(now + keepwarm_dur);
+                            } else {
+                                let rem = kw_at.saturating_duration_since(now);
+                                if rem < wait {
+                                    wait =
+                                        rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
+                                }
+                            }
+                        } else {
+                            sess.next_keepwarm_at = Some(now + keepwarm_dur);
+                        }
+                    } else if now.duration_since(sess.last_data_active) > self.idle_dur {
                         graceful_teardown_client(sess, &mut self.dtls_buf);
                         sess.state = HandshakeState::Closing(
                             now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
@@ -530,6 +611,24 @@ impl ClientWorker {
                                                 sess.ka_max_retries + 1,
                                                 format!("up_sport={}", sess.local_port),
                                             );
+                                        }
+                                        if sess.is_prewarm {
+                                            log(
+                                                self.worker_id,
+                                                &format!(
+                                                    "RFC 7675 consent lost on pre-warmed up_sport={} -> draining & re-hunting",
+                                                    sess.local_port
+                                                ),
+                                            );
+                                            graceful_teardown_client(sess, &mut self.dtls_buf);
+                                            sess.ka_txid = None;
+                                            sess.ka_pkt.clear();
+                                            sess.ka_retries = 0;
+                                            sess.ka_rto_at = None;
+                                            sess.state = HandshakeState::Closing(
+                                                now + Duration::from_secs(BLACKHOLE_DRAIN_SECS),
+                                            );
+                                            continue;
                                         }
                                         let active_recently = now
                                             .duration_since(sess.last_data_active)
@@ -680,6 +779,7 @@ impl ClientWorker {
             let Some(client_addr) = client_addr_opt else {
                 continue;
             };
+            self.cancel_hunts_for_client(client_addr);
             cancel_standby_for_client(
                 client_addr,
                 &mut self.standby_by_client,
@@ -693,7 +793,27 @@ impl ClientWorker {
                 .map(|&t| now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS))
                 .unwrap_or(false);
             self.last_rotation_by_client.insert(client_addr, now);
-            let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+            if self.cfg.lane_hunt.enabled {
+                if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                    sess.state = HandshakeState::Migrating;
+                    sess.mig_txid = None;
+                    sess.mig_retries = 0;
+                    sess.mig_retry_at = None;
+                }
+                if self.start_lane_hunt(
+                    HuntPurpose::Migrate1Rtt {
+                        session_tok: tok,
+                        client_addr,
+                        recently_rotated,
+                    },
+                    now,
+                    VecDeque::new(),
+                    0,
+                ) {
+                    continue;
+                }
+            }
+            let bind_any = unspecified_addr_for(self.cfg.server_addr);
             let new_up =
                 match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_2MIB) {
                     Ok(s) => s,
@@ -727,11 +847,7 @@ impl ClientWorker {
                         }
                     }
                 }
-                let drain_tok = Token(self.next_token_id);
-                self.next_token_id = self.next_token_id.wrapping_add(1);
-                if self.next_token_id == 0 || self.next_token_id == usize::MAX {
-                    self.next_token_id = 1;
-                }
+                let drain_tok = alloc_token(&mut self.next_token_id);
                 if self
                     .poll
                     .registry()
@@ -776,6 +892,19 @@ impl ClientWorker {
 
         for (prim_tok, client_addr) in to_spawn_standby {
             if !self.standby_by_client.contains_key(&client_addr) {
+                if self.cfg.lane_hunt.enabled {
+                    let _ = self.start_lane_hunt(
+                        HuntPurpose::MbbStandby {
+                            primary_tok: prim_tok,
+                            client_addr,
+                            degrade_baseline_ms: None,
+                        },
+                        now,
+                        VecDeque::new(),
+                        0,
+                    );
+                    continue;
+                }
                 // P1-2 fix: Only set `standby_spawned = true` when spawn actually succeeds!
                 if spawn_client_session(
                     self.worker_id,
@@ -808,6 +937,7 @@ impl ClientWorker {
                 self.token_by_client.remove(&client_addr);
             }
             self.pending_reconnects.remove(&client_addr);
+            self.cancel_hunts_for_client(client_addr);
             cancel_standby_for_client(
                 client_addr,
                 &mut self.standby_by_client,
@@ -843,6 +973,41 @@ impl ClientWorker {
                         (p, b)
                     })
                     .unwrap_or_else(|| (VecDeque::new(), 0));
+                if let Some(adopted) = self.try_adopt_prewarm(client_addr, now) {
+                    if !carried_pending.is_empty() {
+                        if let Some(ns) = self.sessions_by_token.get_mut(&adopted) {
+                            if ns.state == HandshakeState::Ready {
+                                if let Some(ref mut cipher) = ns.cipher {
+                                    for raw in carried_pending {
+                                        if let Some(wn) = cipher.wrap_into(&raw, &mut self.wbuf) {
+                                            if ns.upstream.send(&self.wbuf[..wn]).is_ok() {
+                                                ns.tx_pkts += 1;
+                                                ns.tx_bytes += raw.len() as u64;
+                                            }
+                                        }
+                                    }
+                                }
+                            } else {
+                                ns.pending = carried_pending;
+                                ns.pending_bytes = carried_bytes;
+                            }
+                        }
+                    }
+                    continue;
+                }
+                if self.cfg.lane_hunt.enabled
+                    && self.start_lane_hunt(
+                        HuntPurpose::NewPrimary {
+                            client_addr,
+                            ka_max_retries: next_ka_retries,
+                        },
+                        now,
+                        carried_pending.clone(),
+                        carried_bytes,
+                    )
+                {
+                    continue;
+                }
                 if let Some(new_tok) = spawn_client_session(
                     self.worker_id,
                     client_addr,
@@ -885,8 +1050,15 @@ impl ClientWorker {
                         d.deadline = drain_cap;
                     }
                 }
+                if self.prewarm_tok == Some(tok) {
+                    self.prewarm_tok = None;
+                    if self.cfg.lane_hunt.enabled {
+                        self.next_prewarm_at = Some(now + Duration::from_millis(500));
+                    }
+                }
                 if self.token_by_client.get(&sess.client_addr) == Some(&tok) {
                     self.token_by_client.remove(&sess.client_addr);
+                    self.cancel_hunts_for_client(sess.client_addr);
                     // Primary closed -> cancel any orphan standby belonging to it!
                     cancel_standby_for_client(
                         sess.client_addr,
@@ -925,6 +1097,6 @@ impl ClientWorker {
             );
             }
         }
-        (wait, standby_promoted_timers)
+        (wait, standby_promoted_timers, standby_ready_timers)
     }
 }

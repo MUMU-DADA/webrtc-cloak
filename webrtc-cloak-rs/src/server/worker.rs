@@ -9,8 +9,8 @@ use super::{
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    worker_udp_recv_buf_len, worker_udp_write_buf_len, CLOSING_DRAIN_MS, DTLS_IO_BUF_LEN,
-    IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT,
+    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, CLOSING_DRAIN_MS,
+    DTLS_IO_BUF_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT,
     PROBE_IO_BUF_LEN, SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
     SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS,
     TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS, WAKE_TOKEN, WORKER_ACTIVE_POLL_SECS,
@@ -100,7 +100,7 @@ pub(super) fn run_server_worker(
     let stun_mi_key = stun_hmac_key(&cfg.psk);
     let max_early_srtp_len = if cfg.wan_mtu > 0 {
         cfg.wan_mtu
-            .saturating_sub(IPV4_UDP_HDR_LEN)
+            .saturating_sub(outer_udp_hdr_len(cfg.listen_addr))
             .clamp(MIN_WIRE_UDP_MTU, PROBE_IO_BUF_LEN)
     } else {
         PROBE_IO_BUF_LEN

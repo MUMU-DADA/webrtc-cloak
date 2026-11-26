@@ -1,6 +1,7 @@
 //! 客户端配置、会话状态定义、定时器辅助与多线程启动入口。
 
 mod dtls;
+mod lane_hunt;
 mod worker;
 mod worker_io;
 mod worker_timers;
@@ -8,13 +9,18 @@ mod worker_timers;
 #[cfg(test)]
 mod tests;
 
+pub use self::lane_hunt::{
+    LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS, DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
+};
+
 use self::dtls::graceful_teardown_client;
 use self::worker::run_client_worker;
 use crate::constants::{
-    CLOSING_DRAIN_MS, POST_BYE_CLOSING_DRAIN_MS, TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS,
+    outer_udp_hdr_len, CLOSING_DRAIN_MS, POST_BYE_CLOSING_DRAIN_MS, TRICKLE_RATE_15S_BYTES,
+    TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
-    build_dimpl_config_pool, detect_cpu_accel, jitter_duration_ms, lognormal_duration_ms,
+    build_dimpl_config_pool_for, detect_cpu_accel, jitter_duration_ms, lognormal_duration_ms,
     rand_byte_budget, rand_duration_range_ms, CipherPref, CipherSuite, DtlsMinVersion,
     RollingByteWindow, SessionIceParams, SrtpCloakCipher,
 };
@@ -87,9 +93,21 @@ pub struct ClientConfig {
     pub keepalive_secs: u64,
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
+    pub lane_hunt: LaneHuntConfig,
     pub telemetry: TelemetryConfig,
     pub quiet: bool,
     pub stop: Option<Arc<AtomicBool>>,
+}
+
+#[inline]
+pub(super) fn alloc_token(next_id: &mut usize) -> Token {
+    loop {
+        let id = *next_id;
+        *next_id = next_id.wrapping_add(1);
+        if id != 0 && id != usize::MAX && id != usize::MAX - 1 {
+            return Token(id);
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -140,6 +158,11 @@ pub(super) struct ClientSession {
     pub(super) next_srtcp_at: Instant,
     pub(super) dtls_next_timeout: Option<Instant>,
     pub(super) is_standby: bool,
+    pub(super) is_prewarm: bool,
+    pub(super) next_keepwarm_at: Option<Instant>,
+    pub(super) lane_rtt_ewma_ms: Option<f64>,
+    pub(super) lane_degrade_streak: u8,
+    pub(super) next_lane_hunt_at: Instant,
     pub(super) standby_for_primary: Option<Token>,
     pub(super) standby_spawned: bool,
     pub(super) rotate_at: Option<Instant>,
@@ -193,7 +216,7 @@ pub(super) struct ClientSession {
 }
 
 pub(super) fn schedule_mbb_timers(sess: &mut ClientSession, cfg: &ClientConfig, now: Instant) {
-    if sess.is_standby {
+    if sess.is_standby || sess.is_prewarm {
         sess.rotate_at = None;
         sess.hard_rotate_at = None;
         sess.rotate_byte_budget = None;
@@ -297,7 +320,11 @@ pub(super) fn make_udp_socket(
     reuse_port: bool,
     buf_bytes: usize,
 ) -> std::io::Result<MioUdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let sock = Socket::new(
+        Domain::for_address(bind_addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
     let _ = sock.set_reuse_address(true);
     #[cfg(unix)]
     if reuse_port {
@@ -325,7 +352,13 @@ pub(super) fn log(worker_id: usize, msg: &str) {
 pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
-    let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, true, cfg.wan_mtu);
+    let dtls_pool = build_dimpl_config_pool_for(
+        cfg.cipher_pref,
+        &cpu,
+        true,
+        cfg.wan_mtu,
+        outer_udp_hdr_len(cfg.server_addr),
+    );
     let telemetry = TelemetryHub::start(
         "client",
         &cfg.telemetry,
@@ -335,13 +368,30 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
         cfg.stop.clone(),
     );
     if !cfg.quiet {
+        let lh = cfg.lane_hunt.normalized();
+        let lane_info = if lh.enabled {
+            format!(
+                " lane_hunt=on(probes={},rounds={},target={},cooldown={}s)",
+                lh.probes,
+                lh.max_rounds,
+                if lh.target_rtt_ms > 0 {
+                    format!("{}ms", lh.target_rtt_ms)
+                } else {
+                    "auto".into()
+                },
+                lh.degrade_cooldown_secs
+            )
+        } else {
+            String::new()
+        };
         println!(
-            "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs)",
+            "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs){}",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
             workers,
-            cfg.dtls_min_version.as_str()
+            cfg.dtls_min_version.as_str(),
+            lane_info
         );
     }
     #[cfg(not(target_os = "linux"))]

@@ -5,14 +5,14 @@ use super::remote_session::{
 };
 use super::{percentile, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
 use crate::constants::{
-    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_VER_MAJOR, DTLS_VER_MINOR_12, IPV4_UDP_HDR_LEN,
+    outer_udp_hdr_len, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_VER_MAJOR, DTLS_VER_MINOR_12,
     PROBE_IO_BUF_LEN, SRTP_DATA_MIN_WIRE_LEN, STUN_HDR_LEN,
 };
 use crate::protocol::{
     build_ice_stun_request, demux_rfc7983, fill_random, PacketKind, SessionIceParams, SrtpFrame,
 };
 use std::collections::{HashMap, HashSet};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -24,7 +24,7 @@ pub(super) fn run_remote_steps_06_to_09(
     dyn_timeout_ms: u64,
     stun_rtt_ms: f64,
     captured_stun: Vec<u8>,
-    mapped1: Option<SocketAddrV4>,
+    mapped1: Option<SocketAddr>,
     sess_opt: &mut Option<LiveReadySession>,
     hi: &mut Highlights,
     results: &mut Vec<ScenarioResult>,
@@ -240,8 +240,9 @@ pub(super) fn run_remote_steps_06_to_09(
             report_step(7, r.name, &r);
             results.push(r);
         } else {
-            let max_wire_allowed = opts.wan_mtu.saturating_sub(IPV4_UDP_HDR_LEN);
-            let exact_edge = max_wire_allowed.saturating_sub(SRTP_DATA_MIN_WIRE_LEN); // 1422B for WAN MTU 1488
+            let outer_hdr = outer_udp_hdr_len(server_addr);
+            let max_wire_allowed = opts.wan_mtu.saturating_sub(outer_hdr);
+            let exact_edge = max_wire_allowed.saturating_sub(SRTP_DATA_MIN_WIRE_LEN); // 1422B (IPv4) / 1402B (IPv6) for WAN MTU 1488
             let candidates = [1000usize, 1200, 1350, 1400, exact_edge];
             let mut max_udp_pass = 0usize;
             let mut max_wire_seen = 0usize;
@@ -280,18 +281,23 @@ pub(super) fn run_remote_steps_06_to_09(
                 .wrap_probe_into(&oversize_payload, &mut tmp_buf)
                 .is_none();
 
-            let ipv4_mtu_verified = if max_udp_pass > 0 {
-                max_udp_pass + SRTP_DATA_MIN_WIRE_LEN + IPV4_UDP_HDR_LEN
+            let ip_mtu_verified = if max_udp_pass > 0 {
+                max_udp_pass + SRTP_DATA_MIN_WIRE_LEN + outer_hdr
             } else {
                 0
             };
-            hi.wan_mtu_pass = if ipv4_mtu_verified > 0 {
-                Some(ipv4_mtu_verified)
+            hi.wan_mtu_pass = if ip_mtu_verified > 0 {
+                Some(ip_mtu_verified)
             } else {
                 None
             };
 
             let ok = max_udp_pass >= 1200 && guard_dropped && max_wire_seen <= max_wire_allowed;
+            let ip_label = if server_addr.is_ipv6() {
+                "IPv6"
+            } else {
+                "IPv4"
+            };
             let r = ScenarioResult {
                 id: 7,
                 code: "wan_path_mtu",
@@ -299,9 +305,10 @@ pub(super) fn run_remote_steps_06_to_09(
                 condition: "1000..1452B real WAN",
                 status: ScenarioStatus::from_bool(ok),
                 metrics: format!(
-                    "pass<={}B (IPv4 {}B) | {}B guard {}",
+                    "pass<={}B ({} {}B) | {}B guard {}",
                     max_udp_pass,
-                    ipv4_mtu_verified,
+                    ip_label,
+                    ip_mtu_verified,
                     oversize_udp,
                     if guard_dropped { "DROP" } else { "LEAK" }
                 ),

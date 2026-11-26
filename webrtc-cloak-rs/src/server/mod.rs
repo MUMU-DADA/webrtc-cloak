@@ -8,9 +8,9 @@ mod worker_io;
 
 use self::registry::{SeenTxidCache, SharedV4Registry};
 use self::worker::run_server_worker;
-use crate::constants::TRICKLE_RATE_15S_BYTES;
+use crate::constants::{outer_udp_hdr_len, unspecified_addr_for, TRICKLE_RATE_15S_BYTES};
 use crate::protocol::{
-    build_dimpl_config_pool, detect_cpu_accel, rand_duration_range_ms, CipherPref, CipherSuite,
+    build_dimpl_config_pool_for, detect_cpu_accel, rand_duration_range_ms, CipherPref, CipherSuite,
     DtlsMinVersion, RollingByteWindow, SrtpCloakCipher,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryHub};
@@ -22,7 +22,7 @@ use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -209,7 +209,11 @@ pub(super) fn make_udp_socket(
     reuse_port: bool,
     buf_bytes: usize,
 ) -> std::io::Result<MioUdpSocket> {
-    let sock = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP))?;
+    let sock = Socket::new(
+        Domain::for_address(bind_addr),
+        Type::DGRAM,
+        Some(Protocol::UDP),
+    )?;
     let _ = sock.set_reuse_address(true);
     #[cfg(unix)]
     if reuse_port {
@@ -242,7 +246,7 @@ pub(super) fn ensure_owned_backend(
     poll: &Poll,
 ) -> bool {
     if matches!(sess.backend, BackendPipe::Unbound) {
-        let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+        let bind_any = unspecified_addr_for(backend_addr);
         let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, SOCK_BUF_512KIB) {
             Ok(s) => s,
             Err(e) => {
@@ -305,7 +309,13 @@ fn cleanup_session_routes(
 pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     let workers = cfg.workers.max(1);
     let cpu = detect_cpu_accel();
-    let dtls_pool = build_dimpl_config_pool(cfg.cipher_pref, &cpu, false, cfg.wan_mtu);
+    let dtls_pool = build_dimpl_config_pool_for(
+        cfg.cipher_pref,
+        &cpu,
+        false,
+        cfg.wan_mtu,
+        outer_udp_hdr_len(cfg.listen_addr),
+    );
     let seen_txids = Arc::new(Mutex::new(SeenTxidCache::new()));
     let registry = Arc::new(SharedV4Registry::new(workers));
     let telemetry = TelemetryHub::start(

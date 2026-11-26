@@ -21,6 +21,7 @@ pub(super) fn run_remote_selftest(
     let suite_t0 = Instant::now();
     let mut hi = Highlights {
         is_remote: true,
+        is_ipv6: server_addr.is_ipv6(),
         target_label: Some(
             opts.server_label
                 .clone()

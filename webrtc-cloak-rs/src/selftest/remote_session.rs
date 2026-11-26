@@ -2,11 +2,12 @@
 
 use super::tune_socket;
 use crate::constants::{
-    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS, DTLS_IO_BUF_LEN,
-    DTLS_PLAINTEXT_HDR_LEN, PROBE_IO_BUF_LEN, STUN_BINDING_SUCCESS,
+    outer_udp_hdr_len, unspecified_addr_for, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO,
+    DTLS_IDLE_TIMEOUT_THRESHOLD_SECS, DTLS_IO_BUF_LEN, DTLS_PLAINTEXT_HDR_LEN, PROBE_IO_BUF_LEN,
+    STUN_BINDING_SUCCESS,
 };
 use crate::protocol::{
-    build_dimpl_config_pool, build_ice_stun_request, combine_session_key, demux_rfc7983,
+    build_dimpl_config_pool_for, build_ice_stun_request, combine_session_key, demux_rfc7983,
     derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite,
     generate_ephemeral_webrtc_cert, make_fresh_stun_txid, new_dtls_instance, parse_stun,
     resolve_srtp_suite, validate_dtls_datagram, CipherPref, CipherSuite, DtlsMinVersion,
@@ -14,16 +15,17 @@ use crate::protocol::{
 };
 use dimpl::{Dtls, Output as DtlsOutput, ProtocolVersion};
 use std::io::ErrorKind;
-use std::net::{SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
 
 pub(super) struct LiveStunOk {
     pub(super) sock: UdpSocket,
+    pub(super) server_addr: SocketAddr,
     pub(super) ice: SessionIceParams,
     pub(super) txid: [u8; 12],
     pub(super) raw_stun: Vec<u8>,
     pub(super) rtt_ms: f64,
-    pub(super) mapped_addr: Option<SocketAddrV4>,
+    pub(super) mapped_addr: Option<SocketAddr>,
 }
 
 pub(super) struct LiveReadySession {
@@ -43,7 +45,8 @@ pub(super) fn remote_stun_handshake(
     server_addr: SocketAddr,
     psk: &[u8],
 ) -> Result<LiveStunOk, String> {
-    let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind udp: {}", e))?;
+    let sock = UdpSocket::bind(unspecified_addr_for(server_addr))
+        .map_err(|e| format!("bind udp: {}", e))?;
     tune_socket(&sock);
     sock.set_read_timeout(Some(Duration::from_millis(750)))
         .map_err(|e| format!("set timeout: {}", e))?;
@@ -70,6 +73,7 @@ pub(super) fn remote_stun_handshake(
                             {
                                 return Ok(LiveStunOk {
                                     sock,
+                                    server_addr,
                                     ice,
                                     txid,
                                     raw_stun: req,
@@ -98,8 +102,9 @@ pub(super) fn remote_dtls_handshake(
     dtls_min_version: DtlsMinVersion,
     wan_mtu: usize,
 ) -> Result<(LiveReadySession, f64), String> {
+    let outer_hdr = outer_udp_hdr_len(stun.server_addr);
     let cpu = detect_cpu_accel();
-    let dtls_cfg = build_dimpl_config_pool(cipher_pref, &cpu, true, wan_mtu).pick();
+    let dtls_cfg = build_dimpl_config_pool_for(cipher_pref, &cpu, true, wan_mtu, outer_hdr).pick();
     let cert = generate_ephemeral_webrtc_cert();
     let now = Instant::now();
     let mut dtls = new_dtls_instance(dtls_min_version, dtls_cfg, cert, now);
@@ -190,7 +195,7 @@ pub(super) fn remote_dtls_handshake(
     let suite = resolve_srtp_suite(cipher_pref, dtls_suite_id, &cpu, false);
     let final_key = combine_session_key(&stun_key, Some(km));
     let mut cipher = SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, suite);
-    cipher.set_wan_mtu(wan_mtu);
+    cipher.set_wan_mtu_for(wan_mtu, outer_hdr);
     cipher.set_dual_ssrc(is_dtls13);
 
     Ok((
@@ -431,7 +436,7 @@ pub(super) fn send_probe_expect_silence_ms(
     payload: &[u8],
     wait_ms: u64,
 ) -> usize {
-    let atk = match UdpSocket::bind("0.0.0.0:0") {
+    let atk = match UdpSocket::bind(unspecified_addr_for(server_addr)) {
         Ok(s) => s,
         Err(_) => return 0,
     };

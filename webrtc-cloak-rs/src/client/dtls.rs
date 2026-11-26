@@ -1,22 +1,26 @@
 //! 客户端 DTLS 握手驱动、优雅关闭与上游会话创建。
 
+use super::lane_hunt::client_outer_hdr_len;
 use super::{
-    log, make_udp_socket, record_client_media_bytes, schedule_mbb_timers, ClientConfig,
-    ClientSession, HandshakeState, CLIENT_SRTCP_INIT_MAX_MS, CLIENT_SRTCP_INIT_MIN_MS,
-    MAX_DRAINING_SESSIONS, SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
+    alloc_token, log, make_udp_socket, record_client_media_bytes, schedule_mbb_timers,
+    ClientConfig, ClientSession, HandshakeState, CLIENT_SRTCP_INIT_MAX_MS,
+    CLIENT_SRTCP_INIT_MIN_MS, MAX_DRAINING_SESSIONS, SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
-    DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_PLAINTEXT_HDR_LEN, TRICKLE_WINDOW_15S_SECS,
+    unspecified_addr_for, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_PLAINTEXT_HDR_LEN,
+    TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
-    build_ice_stun_request, combine_session_key, derive_ice_migration_key, jitter_duration_ms,
-    make_fresh_stun_txid, rand_duration_range_ms, resolve_srtp_suite, RollingByteWindow,
+    build_ice_stun_request, combine_session_key, derive_ice_migration_key, derive_stun_material,
+    jitter_duration_ms, make_fresh_stun_txid, new_dtls_instance, rand_duration_range_ms,
+    resolve_srtp_suite, CertCache, CpuAccelInfo, DtlsConfigPool, RollingByteWindow,
     SessionIceParams, SrtpCloakCipher,
 };
 use dimpl::{Output as DtlsOutput, ProtocolVersion};
+use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Interest, Poll, Token};
 use std::collections::{HashMap, VecDeque};
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 #[allow(clippy::too_many_arguments)]
@@ -109,7 +113,7 @@ pub(super) fn drain_client_dtls(
             sess.active_cipher = Some(chosen);
             let mut c =
                 SrtpCloakCipher::new(&final_key, sess.ssrc_c2s, sess.ssrc_s2c, true, chosen);
-            c.set_wan_mtu(cfg.wan_mtu);
+            c.set_wan_mtu_for(cfg.wan_mtu, client_outer_hdr_len(cfg.server_addr));
             c.set_dual_ssrc(is_dtls13);
             sess.cipher = Some(c);
             sess.state = HandshakeState::Ready;
@@ -153,8 +157,9 @@ pub(super) fn drain_client_dtls(
             log(
                 worker_id,
                 &format!(
-                    "DTLS {} (dimpl mutual-cert PFS) OK -> READY up_sport={} cipher={} dual_ssrc={} total_hs={:.2}ms flushed={}",
+                    "DTLS {} (dimpl mutual-cert PFS) OK -> READY{} up_sport={} cipher={} dual_ssrc={} total_hs={:.2}ms flushed={}",
                     if is_dtls13 { "1.3" } else { "1.2" },
+                    if sess.is_prewarm { " (pre-warmed)" } else { "" },
                     sess.local_port,
                     chosen.name(),
                     is_dtls13,
@@ -284,7 +289,7 @@ pub(super) fn spawn_client_session(
         }
     }
 
-    let bind_any = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
+    let bind_any = unspecified_addr_for(cfg.server_addr);
     let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, SOCK_BUF_2MIB) {
         Ok(s) => s,
         Err(e) => {
@@ -293,11 +298,7 @@ pub(super) fn spawn_client_session(
         }
     };
     let local_port = up.local_addr().map(|a| a.port()).unwrap_or(0);
-    let tok = Token(*next_token_id);
-    *next_token_id = next_token_id.wrapping_add(1);
-    if *next_token_id == 0 || *next_token_id == usize::MAX {
-        *next_token_id = 1;
-    }
+    let tok = alloc_token(next_token_id);
     if poll
         .registry()
         .register(&mut up, tok, Interest::READABLE)
@@ -340,6 +341,11 @@ pub(super) fn spawn_client_session(
             + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS),
         dtls_next_timeout: None,
         is_standby,
+        is_prewarm: false,
+        next_keepwarm_at: None,
+        lane_rtt_ewma_ms: None,
+        lane_degrade_streak: 0,
+        next_lane_hunt_at: now,
         standby_for_primary,
         standby_spawned: false,
         rotate_at: None,
@@ -395,4 +401,175 @@ pub(super) fn spawn_client_session(
     }
     sessions_by_token.insert(tok, sess);
     Some(tok)
+}
+
+/// 基于已完成 STUN 抽卡测速的优胜候选套接字直接推进至 DTLS 握手（或无 DTLS 时直达 Ready），零额外 STUN RTT。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn build_session_after_stun(
+    worker_id: usize,
+    client_addr: SocketAddr,
+    upstream: MioUdpSocket,
+    local_port: u16,
+    ice: SessionIceParams,
+    stun_txid: [u8; 12],
+    rtt_ms: f64,
+    mapped_addr: Option<SocketAddr>,
+    cfg: &ClientConfig,
+    cert_cache: &mut CertCache,
+    dtls_pool: &DtlsConfigPool,
+    cpu: &CpuAccelInfo,
+    now: Instant,
+    retry_dur: Duration,
+    ka_base_ms: u64,
+    ka_max_retries: u8,
+    standby_for_primary: Option<Token>,
+    is_prewarm: bool,
+    next_keepwarm_at: Option<Instant>,
+    pending: VecDeque<Vec<u8>>,
+    pending_bytes: usize,
+    dtls_buf: &mut Vec<u8>,
+    wbuf: &mut [u8],
+) -> ClientSession {
+    let uname = ice.username();
+    let (stun_key, s_c2s, s_s2c) = derive_stun_material(&cfg.psk, &stun_txid, &uname);
+    let mapped_s = mapped_addr
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "unknown".into());
+    log(
+        worker_id,
+        &format!(
+            "ICE STUN OK (hunted) up_sport={} rtt={:.2}ms mapped={} ssrc_tx=0x{:08x} ssrc_rx=0x{:08x}",
+            local_port, rtt_ms, mapped_s, s_c2s, s_s2c
+        ),
+    );
+    let is_standby = standby_for_primary.is_some();
+    let cooldown = Duration::from_secs(cfg.lane_hunt.normalized().degrade_cooldown_secs);
+
+    let mut sess = ClientSession {
+        client_addr,
+        upstream,
+        local_port,
+        ice,
+        stun_txid,
+        cached_initial_stun: Vec::new(),
+        state: HandshakeState::StunWait,
+        created_at: now,
+        ready_at: None,
+        last_data_active: now,
+        last_active_burst: now,
+        next_retry_at: now + retry_dur,
+        next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
+        next_srtcp_at: now
+            + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS),
+        dtls_next_timeout: None,
+        is_standby,
+        is_prewarm,
+        next_keepwarm_at,
+        lane_rtt_ewma_ms: Some(rtt_ms),
+        lane_degrade_streak: 0,
+        next_lane_hunt_at: now + cooldown,
+        standby_for_primary,
+        standby_spawned: false,
+        rotate_at: None,
+        hard_rotate_at: None,
+        rotate_byte_budget: None,
+        rate_15s: RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_15S_SECS)),
+        rate_5min: RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS)),
+        retries: 0,
+        ka_txid: None,
+        ka_pkt: Vec::new(),
+        ka_retries: 0,
+        ka_max_retries,
+        ka_rto_at: None,
+        ka_sent_at: None,
+        mig_txid: None,
+        mig_retries: 0,
+        mig_retry_at: None,
+        mig_echo_payload: None,
+        mig_echo_next_at: None,
+        mig_echo_left: 0,
+        handover_payload: None,
+        handover_retries: 0,
+        handover_retry_at: None,
+        stun_key: Some(stun_key),
+        session_key: None,
+        mi_key_mig: None,
+        ssrc_c2s: s_c2s,
+        ssrc_s2c: s_s2c,
+        dtls: None,
+        dtls_resets: 0,
+        pending_sh_suite: None,
+        dtls_suite_id: None,
+        dtls_km: None,
+        active_cipher: None,
+        cipher: None,
+        pending,
+        pending_bytes,
+        tx_pkts: 0,
+        tx_pkts_at_last_rtcp: 0,
+        tx_bytes: 0,
+        rx_pkts: 0,
+        rx_pkts_at_last_rtcp: 0,
+        rx_bytes: 0,
+        keepalives_ok: 0,
+        srtcp_tx: 0,
+        srtcp_rx: 0,
+        auth_drops: 0,
+    };
+
+    if cfg.dtls_decoy {
+        let cert = cert_cache.get(now);
+        let mut dtls = Box::new(new_dtls_instance(
+            cfg.dtls_min_version,
+            dtls_pool.pick(),
+            cert,
+            now,
+        ));
+        dtls.set_active(true);
+        let _ = dtls.handle_timeout(now);
+        sess.dtls = Some(dtls);
+        sess.state = HandshakeState::DtlsHandshake;
+        let _ = drain_client_dtls(worker_id, &mut sess, dtls_buf, wbuf, cfg, cpu, now, None);
+    } else {
+        let chosen = resolve_srtp_suite(cfg.cipher_pref, None, cpu, true);
+        let final_key = combine_session_key(&stun_key, None);
+        sess.session_key = Some(final_key);
+        sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
+        sess.active_cipher = Some(chosen);
+        let mut c = SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, chosen);
+        c.set_wan_mtu_for(cfg.wan_mtu, client_outer_hdr_len(cfg.server_addr));
+        sess.cipher = Some(c);
+        sess.state = HandshakeState::Ready;
+        sess.ready_at = Some(now);
+        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
+        let mut flushed = 0usize;
+        let mut flushed_bytes = 0u64;
+        sess.pending_bytes = 0;
+        if let Some(ref mut cipher) = sess.cipher {
+            while let Some(raw) = sess.pending.pop_front() {
+                if let Some(wn) = cipher.wrap_into(&raw, wbuf) {
+                    if sess.upstream.send(&wbuf[..wn]).is_ok() {
+                        sess.tx_pkts += 1;
+                        sess.tx_bytes += raw.len() as u64;
+                        flushed_bytes = flushed_bytes.saturating_add(raw.len() as u64);
+                        flushed += 1;
+                    }
+                }
+            }
+        }
+        if flushed_bytes > 0 {
+            record_client_media_bytes(&mut sess, cfg, ka_base_ms, now, flushed_bytes);
+        }
+        log(
+            worker_id,
+            &format!(
+                "session READY{} (hunted, no-dtls) up_sport={} cipher={} flushed={}",
+                if is_prewarm { " (pre-warmed)" } else { "" },
+                local_port,
+                chosen.name(),
+                flushed
+            ),
+        );
+    }
+    sess
 }

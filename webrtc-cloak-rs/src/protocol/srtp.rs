@@ -316,13 +316,17 @@ impl SrtpCloakCipher {
     }
 
     /// Configure outer IPv4 WAN MTU ceiling (`0` disables cap for jumbo/loopback testing).
+    #[allow(dead_code)]
     pub fn set_wan_mtu(&mut self, wan_mtu: usize) {
+        self.set_wan_mtu_for(wan_mtu, IPV4_UDP_HDR_LEN);
+    }
+
+    /// Configure outer WAN MTU ceiling with explicit IP+UDP header size (28B IPv4 / 48B IPv6).
+    pub fn set_wan_mtu_for(&mut self, wan_mtu: usize, outer_hdr_len: usize) {
         self.max_wire_udp = if wan_mtu == 0 {
             0
         } else {
-            wan_mtu
-                .saturating_sub(IPV4_UDP_HDR_LEN)
-                .max(MIN_WIRE_UDP_MTU)
+            wan_mtu.saturating_sub(outer_hdr_len).max(MIN_WIRE_UDP_MTU)
         };
     }
 

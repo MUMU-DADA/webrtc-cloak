@@ -487,16 +487,28 @@ fn build_single_dimpl_config(
     Arc::new(builder.build().expect("dimpl Config build"))
 }
 
-/// Build a pre-validated pool of `dimpl` DTLS 1.3 / 1.2 Configs clamped to `wan_mtu`.
+/// Build a pre-validated pool of `dimpl` DTLS 1.3 / 1.2 Configs clamped to IPv4 `wan_mtu`.
+#[allow(dead_code)]
 pub fn build_dimpl_config_pool(
     pref: CipherPref,
     cpu: &CpuAccelInfo,
     is_client: bool,
     wan_mtu: usize,
 ) -> DtlsConfigPool {
+    build_dimpl_config_pool_for(pref, cpu, is_client, wan_mtu, IPV4_UDP_HDR_LEN)
+}
+
+/// Build a pre-validated pool of `dimpl` DTLS 1.3 / 1.2 Configs clamped to `wan_mtu` for IPv4 or IPv6.
+pub fn build_dimpl_config_pool_for(
+    pref: CipherPref,
+    cpu: &CpuAccelInfo,
+    is_client: bool,
+    wan_mtu: usize,
+    outer_hdr_len: usize,
+) -> DtlsConfigPool {
     let max_dtls_mtu = if wan_mtu > 0 {
         wan_mtu
-            .saturating_sub(IPV4_UDP_HDR_LEN)
+            .saturating_sub(outer_hdr_len)
             .clamp(DTLS_MIN_MTU, DTLS_MAX_MTU)
     } else {
         DTLS_MAX_MTU

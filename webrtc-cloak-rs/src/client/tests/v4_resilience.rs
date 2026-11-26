@@ -175,6 +175,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 keepalive_secs: 1,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                lane_hunt: Default::default(),
                 telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(c_stop),
@@ -359,6 +360,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 keepalive_secs: 1,
                 idle_timeout_secs: 60,
                 stats_interval_secs: 3600,
+                lane_hunt: Default::default(),
                 telemetry: TelemetryConfig::default(),
                 quiet: true,
                 stop: Some(c_stop),
@@ -552,6 +554,7 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
             keepalive_secs: 1,
             idle_timeout_secs: 60,
             stats_interval_secs: 3600,
+            lane_hunt: Default::default(),
             telemetry: TelemetryConfig {
                 status_file: Some(c_file),
                 status_http: Some(cli_http_addr),

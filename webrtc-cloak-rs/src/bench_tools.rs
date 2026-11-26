@@ -80,7 +80,7 @@ pub(crate) fn run_sink(listen: &str, workers: usize) {
         let stats = Arc::clone(&stats);
         move || {
             let s = socket2::Socket::new(
-                socket2::Domain::IPV4,
+                socket2::Domain::for_address(addr),
                 socket2::Type::DGRAM,
                 Some(socket2::Protocol::UDP),
             )

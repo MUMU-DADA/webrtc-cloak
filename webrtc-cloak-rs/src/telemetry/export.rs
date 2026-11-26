@@ -115,6 +115,12 @@ impl TelemetryInner {
             "    \"graceful_reconnects_total\": {},",
             self.graceful_reconnects_total
         );
+        let _ = writeln!(s, "    \"lane_hunts_total\": {},", self.lane_hunts_total);
+        let _ = writeln!(
+            s,
+            "    \"lane_switches_total\": {},",
+            self.lane_switches_total
+        );
         let _ = writeln!(
             s,
             "    \"stun_probes_ok_total\": {},",
@@ -282,6 +288,16 @@ impl TelemetryInner {
             s,
             "webrtc_cloak_graceful_reconnects_total{{role=\"{}\"}} {}",
             r, self.graceful_reconnects_total
+        );
+        let _ = writeln!(
+            s,
+            "webrtc_cloak_lane_hunts_total{{role=\"{}\"}} {}",
+            r, self.lane_hunts_total
+        );
+        let _ = writeln!(
+            s,
+            "webrtc_cloak_lane_switches_total{{role=\"{}\"}} {}",
+            r, self.lane_switches_total
         );
         let _ = writeln!(
             s,

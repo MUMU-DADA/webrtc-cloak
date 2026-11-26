@@ -1,6 +1,7 @@
 //! 客户端 mio 工作线程状态容器、主事件循环与遥测上报。
 
 use super::dtls::graceful_teardown_client;
+use super::lane_hunt::{HuntPurpose, LaneHunt};
 use super::{
     log, make_udp_socket, ClientConfig, ClientSession, HandshakeState, OldPathDrain,
     PendingReconnect,
@@ -8,7 +9,7 @@ use super::{
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    worker_udp_recv_buf_len, worker_udp_write_buf_len, DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN,
+    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, DTLS_IO_BUF_LEN,
     LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP, SOCK_BUF_8MIB, SRTP_DATA_MIN_WIRE_LEN,
     TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
@@ -20,7 +21,7 @@ use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use dimpl::ProtocolVersion;
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -37,6 +38,12 @@ pub(super) struct ClientWorker {
     pub(super) old_path_drains: HashMap<Token, OldPathDrain>,
     pub(super) pending_reconnects: HashMap<SocketAddr, PendingReconnect>,
     pub(super) last_rotation_by_client: HashMap<SocketAddr, Instant>,
+    pub(super) lane_hunts: HashMap<usize, LaneHunt>,
+    pub(super) hunt_tok_to_id: HashMap<Token, usize>,
+    pub(super) next_hunt_id: usize,
+    pub(super) prewarm_tok: Option<Token>,
+    pub(super) next_prewarm_at: Option<Instant>,
+    pub(super) best_observed_rtt_ms: Option<f64>,
     pub(super) next_token_id: usize,
     pub(super) cert_cache: CertCache,
     pub(super) dtls_pool: DtlsConfigPool,
@@ -79,7 +86,7 @@ pub(super) fn run_client_worker(
     let stun_mi_key = stun_hmac_key(&cfg.psk);
     let max_inner_pending = if cfg.wan_mtu > 0 {
         cfg.wan_mtu
-            .saturating_sub(IPV4_UDP_HDR_LEN + SRTP_DATA_MIN_WIRE_LEN)
+            .saturating_sub(outer_udp_hdr_len(cfg.server_addr) + SRTP_DATA_MIN_WIRE_LEN)
             .min(MAX_INNER_UDP_LEN)
     } else {
         MAX_INNER_UDP_LEN
@@ -116,6 +123,12 @@ pub(super) fn run_client_worker(
         old_path_drains: HashMap::new(),
         pending_reconnects: HashMap::new(),
         last_rotation_by_client: HashMap::new(),
+        lane_hunts: HashMap::new(),
+        hunt_tok_to_id: HashMap::new(),
+        next_hunt_id: 1,
+        prewarm_tok: None,
+        next_prewarm_at: None,
+        best_observed_rtt_ms: None,
         next_token_id: 1,
         cert_cache: CertCache::new(),
         dtls_pool,
@@ -139,6 +152,9 @@ pub(super) fn run_client_worker(
         closed_rx_pkts: 0,
         closed_auth_drops: 0,
     };
+    if worker.cfg.lane_hunt.enabled {
+        let _ = worker.start_lane_hunt(HuntPurpose::PreWarm, now, VecDeque::new(), 0);
+    }
     worker.run()
 }
 
@@ -152,7 +168,7 @@ impl ClientWorker {
             }
 
             let now = Instant::now();
-            let (mut wait, standby_promoted_timers) = self.process_timers(now);
+            let (mut wait, standby_promoted_timers, mut standby_ready) = self.process_timers(now);
 
             if self.telemetry.is_some() && wait > self.telemetry_dur {
                 wait = self.telemetry_dur;
@@ -169,7 +185,6 @@ impl ClientWorker {
             }
 
             let now = Instant::now();
-            let mut standby_ready: Vec<(Token, SocketAddr)> = Vec::new();
             let mut standby_promoted: Vec<(Token, SocketAddr)> = standby_promoted_timers;
             let mut graceful_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
             for ev in events.iter() {
@@ -184,6 +199,10 @@ impl ClientWorker {
                     self.handle_listen_readable(now);
                 } else if self.old_path_drains.contains_key(&ev.token()) {
                     self.handle_old_path_drain(ev.token(), now, &mut graceful_reconnects);
+                } else if !self.hunt_tok_to_id.is_empty()
+                    && self.hunt_tok_to_id.contains_key(&ev.token())
+                {
+                    self.handle_hunt_readable(ev.token(), now, &mut standby_ready);
                 } else {
                     self.handle_upstream_readable(
                         ev.token(),
@@ -202,6 +221,15 @@ impl ClientWorker {
     }
 
     fn graceful_shutdown_all(&mut self) {
+        for (_, mut hunt) in self.lane_hunts.drain() {
+            for mut c in hunt.candidates.drain(..) {
+                let _ = self.poll.registry().deregister(&mut c.sock);
+            }
+            if let Some(mut fb) = hunt.best_fallback.take() {
+                let _ = self.poll.registry().deregister(&mut fb.sock);
+            }
+        }
+        self.hunt_tok_to_id.clear();
         let mut torn = 0usize;
         for sess in self.sessions_by_token.values_mut() {
             if matches!(
