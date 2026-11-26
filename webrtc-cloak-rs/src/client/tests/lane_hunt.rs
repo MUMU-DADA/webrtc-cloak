@@ -201,6 +201,15 @@ fn ipv6_end_to_end_dtls13_tunnel() {
     let psk = b"ipv6-e2e-dtls13-test-psk".to_vec();
     let stop = Arc::new(AtomicBool::new(false));
     let last_backend_port = Arc::new(AtomicU16::new(0));
+    let status_file = std::env::temp_dir()
+        .join(format!(
+            "wc_ipv6_e2e_{}_{}.json",
+            std::process::id(),
+            client_port
+        ))
+        .to_string_lossy()
+        .to_string();
+    let _ = std::fs::remove_file(&status_file);
 
     let _b = spawn_backend_echo_recording_port(
         backend_port,
@@ -234,6 +243,7 @@ fn ipv6_end_to_end_dtls13_tunnel() {
     thread::sleep(Duration::from_millis(250));
 
     let c_stop = Arc::clone(&stop);
+    let c_status = status_file.clone();
     let _c = thread::spawn(move || {
         if let Err(e) = run_client(ClientConfig {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
@@ -260,14 +270,33 @@ fn ipv6_end_to_end_dtls13_tunnel() {
                 target_rtt_ms: 100,
                 degrade_cooldown_secs: 10,
             },
-            telemetry: TelemetryConfig::default(),
+            telemetry: TelemetryConfig {
+                status_file: Some(c_status),
+                status_http: None,
+                status_interval_secs: 1,
+            },
             quiet: true,
             stop: Some(c_stop),
         }) {
             eprintln!("ipv6 test client error: {}", e);
         }
     });
-    thread::sleep(Duration::from_millis(400));
+
+    // Wait for pre-warmed IPv6 DTLS 1.3 session to finish binding & handshaking (avoids slow-CI sleep race).
+    let ready_deadline = Instant::now() + Duration::from_secs(10);
+    let mut ready_sport = 0u16;
+    while Instant::now() < ready_deadline {
+        if let Some(j) = read_json_file(&status_file) {
+            let sp = j["sessions"]["up_sport"].as_u64().unwrap_or(0) as u16;
+            let active = j["sessions"]["active"].as_u64().unwrap_or(0);
+            if sp != 0 && active >= 1 {
+                ready_sport = sp;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    assert_ne!(ready_sport, 0, "IPv6 client must bind & pre-warm READY");
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
     app.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
@@ -293,6 +322,7 @@ fn ipv6_end_to_end_dtls13_tunnel() {
 
     stop.store(true, Ordering::SeqCst);
     thread::sleep(Duration::from_millis(80));
+    let _ = std::fs::remove_file(&status_file);
 }
 
 #[test]
