@@ -165,7 +165,7 @@ pub(super) struct ServerSession {
     pub(super) mig_challenge_cnt: u8,
     pub(super) ssrc_c2s: u32,
     pub(super) ssrc_s2c: u32,
-    pub(super) dtls: Option<Dtls>,
+    pub(super) dtls: Option<Box<Dtls>>,
     pub(super) dtls_resets: u8,
     pub(super) dtls_next_timeout: Option<Instant>,
     pub(super) dtls_suite_id: Option<u16>,

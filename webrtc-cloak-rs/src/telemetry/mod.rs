@@ -4,16 +4,17 @@ mod export;
 #[cfg(test)]
 mod tests;
 
-use self::export::{handle_http_request, write_atomic_file};
+use self::export::{handle_http_connection, write_atomic_file};
 use crate::constants::TELEMETRY_DEFAULT_INTERVAL_SECS;
-use serde::Serialize;
+use mio::net::TcpListener as MioTcpListener;
+use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::VecDeque;
-use std::net::SocketAddr;
+use std::io::ErrorKind;
+use std::net::{SocketAddr, TcpListener as StdTcpListener};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
-use tiny_http::Server as HttpServer;
 
 /// `--status-interval` 允许的最小刷新间隔（秒）。
 const TELEMETRY_INTERVAL_MIN_SECS: u64 = 1;
@@ -27,8 +28,12 @@ const TELEMETRY_RECENT_EVENT_CAP: usize = 8;
 const TELEMETRY_SLIDING_WINDOW: Duration = Duration::from_secs(600);
 /// 非强制触发时状态 JSON 文件最小原子写入间隔（毫秒），防止突发事件频繁落盘。
 const TELEMETRY_MIN_FILE_FLUSH_GAP: Duration = Duration::from_millis(250);
-/// 遥测只读 HTTP 服务接收请求的轮询超时（毫秒），确保退出信号快速响应。
-const TELEMETRY_HTTP_RECV_TIMEOUT: Duration = Duration::from_millis(100);
+/// 遥测只读 HTTP 监听线程栈大小（64 KiB，单线程无线程池、零空转唤醒）。
+const TELEMETRY_HTTP_THREAD_STACK_BYTES: usize = 64 * 1024;
+/// `mio::Poll` 监听本地 HTTP 端口的事件令牌。
+const TELEMETRY_HTTP_ACCEPT_TOKEN: Token = Token(0);
+/// `mio::Poll` 唤醒关闭 HTTP 线程的事件令牌。
+const TELEMETRY_HTTP_WAKE_TOKEN: Token = Token(1);
 /// 计算实时吞吐 Mbps 所需的最小采样时间差（秒）。
 const TELEMETRY_MIN_RATE_DT_SECS: f64 = 0.5;
 /// 计入 STUN RTT 统计的单样本合法上限（毫秒），过滤异常尖刺。
@@ -97,71 +102,11 @@ pub struct WorkerSnapshot {
     pub dual_ssrc: bool,
 }
 
-#[derive(Clone, Serialize)]
+#[derive(Clone)]
 pub(super) struct TelemetryEvent {
-    #[serde(rename = "ts")]
     pub(super) ts_unix: u64,
     pub(super) event: &'static str,
     pub(super) detail: String,
-}
-
-#[derive(Serialize)]
-pub(super) struct LinkPayload {
-    pub(super) stun_rtt_ms: Option<f64>,
-    pub(super) stun_rtt_ewma_ms: Option<f64>,
-    pub(super) stun_jitter_ms: f64,
-    pub(super) stun_loss_pct: f64,
-    pub(super) tx_mbps: f64,
-    pub(super) rx_mbps: f64,
-    pub(super) tx_bytes_total: u64,
-    pub(super) rx_bytes_total: u64,
-    pub(super) tx_pkts_total: u64,
-    pub(super) rx_pkts_total: u64,
-}
-
-#[derive(Serialize)]
-pub(super) struct EventsPayload {
-    pub(super) blackholes_total: u64,
-    pub(super) blackholes_last_10m: usize,
-    pub(super) migrations_1rtt_total: u64,
-    pub(super) migrations_1rtt_last_10m: usize,
-    pub(super) mbb_rotations_total: u64,
-    pub(super) graceful_reconnects_total: u64,
-    pub(super) stun_probes_ok_total: u64,
-    pub(super) stun_probes_lost_total: u64,
-    pub(super) last_event: &'static str,
-    pub(super) last_event_unix: u64,
-    pub(super) recent: Vec<TelemetryEvent>,
-}
-
-#[derive(Serialize)]
-pub(super) struct SessionsPayload {
-    pub(super) active: usize,
-    pub(super) handshaking: usize,
-    pub(super) migrating: usize,
-    pub(super) up_sport: u16,
-    pub(super) backend_sport: u16,
-    pub(super) mapped_nat: Option<String>,
-    pub(super) auth_drops_total: u64,
-    pub(super) unauth_silent_drops_total: u64,
-    pub(super) unauth_silent_drops_last_10m: u64,
-}
-
-#[derive(Serialize)]
-pub(super) struct StatusPayload {
-    pub(super) version: &'static str,
-    pub(super) role: &'static str,
-    pub(super) updated_at_unix: u64,
-    pub(super) uptime_secs: u64,
-    pub(super) health: &'static str,
-    pub(super) dtls_version: &'static str,
-    pub(super) cipher: &'static str,
-    pub(super) dual_ssrc: bool,
-    pub(super) mtu: usize,
-    pub(super) workers: usize,
-    pub(super) link: LinkPayload,
-    pub(super) events: EventsPayload,
-    pub(super) sessions: SessionsPayload,
 }
 
 pub(super) struct TelemetryInner {
@@ -206,7 +151,7 @@ pub struct TelemetryHub {
     inner: Mutex<TelemetryInner>,
     file_write_lock: Mutex<()>,
     http_stop: Arc<AtomicBool>,
-    http_server: Mutex<Option<Arc<HttpServer>>>,
+    http_waker: Mutex<Option<Arc<Waker>>>,
     http_handle: Mutex<Option<JoinHandle<()>>>,
 }
 
@@ -432,7 +377,7 @@ impl TelemetryHub {
             inner: Mutex::new(inner),
             file_write_lock: Mutex::new(()),
             http_stop: Arc::new(AtomicBool::new(false)),
-            http_server: Mutex::new(None),
+            http_waker: Mutex::new(None),
             http_handle: Mutex::new(None),
         });
 
@@ -461,15 +406,29 @@ impl TelemetryHub {
                     addr
                 );
             }
-            match HttpServer::http(addr) {
-                Ok(server) => {
-                    let server = Arc::new(server);
-                    if let Ok(mut g) = hub.http_server.lock() {
-                        *g = Some(Arc::clone(&server));
+            let bind_res =
+                (|| -> std::io::Result<(Poll, MioTcpListener, StdTcpListener, Arc<Waker>)> {
+                    let std_listener = StdTcpListener::bind(addr)?;
+                    std_listener.set_nonblocking(true)?;
+                    let accept_listener = std_listener.try_clone()?;
+                    let mut mio_listener = MioTcpListener::from_std(std_listener);
+                    let poll = Poll::new()?;
+                    poll.registry().register(
+                        &mut mio_listener,
+                        TELEMETRY_HTTP_ACCEPT_TOKEN,
+                        Interest::READABLE,
+                    )?;
+                    let waker = Arc::new(Waker::new(poll.registry(), TELEMETRY_HTTP_WAKE_TOKEN)?);
+                    Ok((poll, mio_listener, accept_listener, waker))
+                })();
+            match bind_res {
+                Ok((mut poll, _mio_listener, accept_listener, waker)) => {
+                    if let Ok(mut g) = hub.http_waker.lock() {
+                        *g = Some(Arc::clone(&waker));
                     }
                     if !quiet {
                         println!(
-                            "[telemetry] status-http (tiny_http) listening on http://{} (/status, /healthz, /metrics)",
+                            "[telemetry] status-http listening on http://{} (/status, /healthz, /metrics)",
                             addr
                         );
                     }
@@ -478,16 +437,41 @@ impl TelemetryHub {
                     let ext_stop = external_stop;
                     let handle = thread::Builder::new()
                         .name("wc-status-http".to_string())
-                        .spawn(move || loop {
-                            if h_stop.load(Ordering::Relaxed)
-                                || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
-                            {
-                                break;
-                            }
-                            match server.recv_timeout(TELEMETRY_HTTP_RECV_TIMEOUT) {
-                                Ok(Some(req)) => handle_http_request(req, &hub_c),
-                                Ok(None) => {}
-                                Err(_) => break,
+                        .stack_size(TELEMETRY_HTTP_THREAD_STACK_BYTES)
+                        .spawn(move || {
+                            let _keep_listener = _mio_listener;
+                            let mut events = Events::with_capacity(8);
+                            loop {
+                                if h_stop.load(Ordering::Relaxed)
+                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
+                                {
+                                    break;
+                                }
+                                match poll.poll(&mut events, None) {
+                                    Ok(()) => {}
+                                    Err(e) if e.kind() == ErrorKind::Interrupted => continue,
+                                    Err(_) => break,
+                                }
+                                if h_stop.load(Ordering::Relaxed)
+                                    || ext_stop.as_ref().is_some_and(|s| s.load(Ordering::Relaxed))
+                                {
+                                    break;
+                                }
+                                for ev in events.iter() {
+                                    if ev.token() == TELEMETRY_HTTP_ACCEPT_TOKEN {
+                                        loop {
+                                            match accept_listener.accept() {
+                                                Ok((stream, _)) => {
+                                                    handle_http_connection(stream, &hub_c);
+                                                }
+                                                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                                                    break;
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         });
                     if let Ok(h) = handle {
@@ -516,9 +500,9 @@ impl TelemetryHub {
 
     pub fn shutdown(&self) {
         self.http_stop.store(true, Ordering::SeqCst);
-        if let Ok(mut g) = self.http_server.lock() {
-            if let Some(srv) = g.take() {
-                srv.unblock();
+        if let Ok(mut g) = self.http_waker.lock() {
+            if let Some(w) = g.take() {
+                let _ = w.wake();
             }
         }
         if let Ok(mut g) = self.http_handle.lock() {
@@ -704,5 +688,11 @@ impl TelemetryHub {
             event,
             detail,
         });
+    }
+}
+
+impl Drop for TelemetryHub {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

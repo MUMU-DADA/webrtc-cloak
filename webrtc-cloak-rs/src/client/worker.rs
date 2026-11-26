@@ -5,23 +5,24 @@ use super::{
     log, make_udp_socket, ClientConfig, ClientSession, HandshakeState, OldPathDrain,
     PendingReconnect,
 };
+#[cfg(unix)]
+use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP,
-    SOCK_BUF_8MIB, SRTP_DATA_MIN_WIRE_LEN, TELEMETRY_DEFAULT_INTERVAL_SECS, UDP_RECV_BUF_LEN,
-    UDP_WRITE_BUF_LEN, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
+    worker_udp_recv_buf_len, worker_udp_write_buf_len, DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN,
+    LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP, SOCK_BUF_8MIB, SRTP_DATA_MIN_WIRE_LEN,
+    TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    detect_cpu_accel, register_shutdown_waker, stun_hmac_key, CertCache, CpuAccelInfo,
-    DtlsConfigPool,
+    detect_cpu_accel, is_shutdown_requested, register_shutdown_poll, stun_hmac_key, CertCache,
+    CpuAccelInfo, DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use dimpl::ProtocolVersion;
 use mio::net::UdpSocket as MioUdpSocket;
-use mio::{Events, Interest, Poll, Token, Waker};
+use mio::{Events, Interest, Poll, Token};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -69,11 +70,7 @@ pub(super) fn run_client_worker(
 ) -> std::io::Result<()> {
     super::CLIENT_QUIET.with(|q| q.set(cfg.quiet));
     let poll = Poll::new()?;
-    if !cfg.quiet && cfg.stop.is_some() {
-        if let Ok(waker) = Waker::new(poll.registry(), WAKE_TOKEN) {
-            register_shutdown_waker(Arc::new(waker));
-        }
-    }
+    register_shutdown_poll(&poll, cfg.quiet, cfg.stop.is_some());
 
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
     poll.registry()
@@ -106,6 +103,8 @@ pub(super) fn run_client_worker(
         .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
 
+    let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
+    let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
     let mut worker = ClientWorker {
         worker_id,
         cfg,
@@ -123,8 +122,8 @@ pub(super) fn run_client_worker(
         stun_mi_key,
         max_inner_pending,
         telemetry,
-        rbuf: vec![0u8; UDP_RECV_BUF_LEN],
-        wbuf: vec![0u8; UDP_WRITE_BUF_LEN],
+        rbuf: vec![0u8; rbuf_len],
+        wbuf: vec![0u8; wbuf_len],
         dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
         cpu,
         retry_dur,
@@ -147,12 +146,7 @@ impl ClientWorker {
     fn run(&mut self) -> std::io::Result<()> {
         let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
-            if self
-                .cfg
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.load(Ordering::Relaxed))
-            {
+            if is_shutdown_requested(self.cfg.stop.as_ref(), self.cfg.quiet) {
                 self.graceful_shutdown_all();
                 return Ok(());
             }
@@ -179,6 +173,10 @@ impl ClientWorker {
             let mut standby_promoted: Vec<(Token, SocketAddr)> = standby_promoted_timers;
             let mut graceful_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
             for ev in events.iter() {
+                #[cfg(unix)]
+                if ev.token() == SHUTDOWN_PIPE_TOKEN {
+                    continue;
+                }
                 if ev.token() == WAKE_TOKEN {
                     continue;
                 }

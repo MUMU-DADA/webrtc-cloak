@@ -6,18 +6,20 @@ use super::{
     cleanup_session_routes, log, make_udp_socket, ServerConfig, ServerSession, ServerState,
     WireAudit, SERVER_SRTCP_ACTIVE_MAX_MS, SERVER_SRTCP_ACTIVE_MIN_MS,
 };
+#[cfg(unix)]
+use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    CLOSING_DRAIN_MS, DTLS_IO_BUF_LEN, IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU,
-    MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT, PROBE_IO_BUF_LEN, SOCK_BUF_8MIB,
-    SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS, SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS,
-    SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS, TRICKLE_RATE_15S_BYTES,
-    TRICKLE_WINDOW_15S_SECS, UDP_RECV_BUF_LEN, UDP_WRITE_BUF_LEN, WAKE_TOKEN,
-    WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS,
-    WORKER_MIN_NORMAL_WAIT_MS, WORKER_QUIET_STOP_POLL_MS,
+    worker_udp_recv_buf_len, worker_udp_write_buf_len, CLOSING_DRAIN_MS, DTLS_IO_BUF_LEN,
+    IPV4_UDP_HDR_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT,
+    PROBE_IO_BUF_LEN, SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
+    SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS,
+    TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS, WAKE_TOKEN, WORKER_ACTIVE_POLL_SECS,
+    WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
+    WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    detect_cpu_accel, rand_duration_range_ms, register_shutdown_waker, stun_hmac_key, CertCache,
-    CpuAccelInfo, DtlsConfigPool,
+    detect_cpu_accel, is_shutdown_requested, rand_duration_range_ms, register_shutdown_poll,
+    stun_hmac_key, CertCache, CpuAccelInfo, DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use dimpl::ProtocolVersion;
@@ -26,7 +28,6 @@ use mio::{Events, Interest, Poll, Token, Waker};
 use std::collections::HashMap;
 use std::io::ErrorKind;
 use std::net::SocketAddr;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,13 +86,12 @@ pub(super) fn run_server_worker(
 ) -> std::io::Result<()> {
     super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
     let poll = Poll::new()?;
-    if let Ok(waker) = Waker::new(poll.registry(), WAKE_TOKEN) {
-        let arc_w = Arc::new(waker);
-        registry.set_waker(worker_id, Arc::clone(&arc_w));
-        if !cfg.quiet && cfg.stop.is_some() {
-            register_shutdown_waker(arc_w);
+    if cfg.workers > 1 {
+        if let Ok(waker) = Waker::new(poll.registry(), WAKE_TOKEN) {
+            registry.set_waker(worker_id, Arc::new(waker));
         }
     }
+    register_shutdown_poll(&poll, cfg.quiet, cfg.stop.is_some());
 
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
     poll.registry()
@@ -123,6 +123,8 @@ pub(super) fn run_server_worker(
         .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
 
+    let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
+    let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
     let mut worker = ServerWorker {
         worker_id,
         cfg,
@@ -149,8 +151,8 @@ pub(super) fn run_server_worker(
         closed_tx_pkts: 0,
         closed_rx_pkts: 0,
         closed_auth_drops: 0,
-        rbuf: vec![0u8; UDP_RECV_BUF_LEN],
-        wbuf: vec![0u8; UDP_WRITE_BUF_LEN],
+        rbuf: vec![0u8; rbuf_len],
+        wbuf: vec![0u8; wbuf_len],
         dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
         cpu,
         idle_dur,
@@ -166,12 +168,7 @@ impl ServerWorker {
     fn run(&mut self) -> std::io::Result<()> {
         let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
-            if self
-                .cfg
-                .stop
-                .as_ref()
-                .is_some_and(|s| s.load(Ordering::Relaxed))
-            {
+            if is_shutdown_requested(self.cfg.stop.as_ref(), self.cfg.quiet) {
                 self.graceful_shutdown_all();
                 return Ok(());
             }
@@ -196,6 +193,10 @@ impl ServerWorker {
 
             let now = Instant::now();
             for ev in events.iter() {
+                #[cfg(unix)]
+                if ev.token() == SHUTDOWN_PIPE_TOKEN {
+                    continue;
+                }
                 if ev.token() == WAKE_TOKEN {
                     continue;
                 }
@@ -403,7 +404,11 @@ impl ServerWorker {
         for tok in newly_ready_early {
             let (peer_addr, early_pkts): (SocketAddr, Vec<Vec<u8>>) =
                 match self.sessions_by_token.get_mut(&tok) {
-                    Some(s) => (s.peer_addr, s.early_srtp.drain(..).collect()),
+                    Some(s) => {
+                        let pkts: Vec<Vec<u8>> = s.early_srtp.drain(..).collect();
+                        s.early_srtp.shrink_to_fit();
+                        (s.peer_addr, pkts)
+                    }
                     None => continue,
                 };
             for raw in early_pkts {

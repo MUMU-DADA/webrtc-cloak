@@ -59,8 +59,8 @@ flowchart LR
   - **单向上行黑洞 1-RTT 迁移**：经 RFC 7675 同 `txid` 重传确认黑洞后，客户端用每会话 HKDF 派生密钥在新端口 1-RTT 原地迁移（防反射挑战验真、0 DTLS 重握、保留后端源端口，旧口静默排空避免 ICMP 弹包）。
   - **优雅重启与微流静音**：服务端 `SIGTERM` 广播加密 `SRTCP BYE + close_notify`，客户端 `80–350ms` 抖动快切；空闲/微流态自动退避控制面报文，来包秒恢复。
 - **PPPoE MTU 1488 防分片与零指纹响应**：默认 `--mtu 1488`（`< 1492B` PPPoE）自动引导内层 QUIC/Hysteria 2 收敛至零 IPv4 分片；主动探测与孤儿保活严格 0 字节静默丢弃。
-- **解耦外层健康遥测（`v0.4.1+`）**：严格旁路于 SRTP 热路径，支持原子落盘 JSON（`--status-file`）与本地只读 HTTP / Prometheus 指标（`--status-http`）。
-- **轻量极致性能**：默认 `--workers 1` 单线程无锁 `mio` 事件循环即可承载千级并发会话（静态 musl 二进制 `2.9 MB`、运行 RSS `2.1–2.8 MB`），Linux 多核按需支持 `--workers <N|auto>`。
+- **解耦外层健康遥测（`v0.4.1+`）**：严格旁路于 SRTP 热路径，采用零外部依赖手写 RFC 8259 JSON 原子落盘（`--status-file`）与单线程事件驱动 `mio::Poll` 本地只读 HTTP / Prometheus 端点（`--status-http`，64 KiB 栈、空闲 0 唤醒）。
+- **轻量极致性能**：默认 `--workers 1` 单线程无锁 `mio` 事件循环即可承载千级并发会话（静态 musl 二进制 `x86_64` 仅 **`1.95 MiB`**、`aarch64` **`1.62 MiB`**、`macos-arm64` **`1.49 MiB`**；Unix 采用无锁 `sigaction` 自管道优雅退出，纯隧道常驻 **1 线程**、开启 HTTP 遥测 **2 线程**，macOS 实测 RSS **`2.7–3.4 MiB`**），Linux 多核按需支持 `--workers <N|auto>`。
 
 > 📘 完整线格式字节布局、密钥派生公式、正交 Nonce 定义与状态机安全边界，请参阅 **[`SPEC.md`](./SPEC.md)**。
 
@@ -95,12 +95,12 @@ flowchart LR
 
 | 测试平台 | 单核加解密微基准 (`AES-128-GCM`) | 端到端全隧道环回吞吐 | 真双向 DTLS 1.3 / 1.2 握手 | 运行内存 (RSS) |
 | :--- | :---: | :---: | :---: | :---: |
-| **Apple Silicon (ARM64, 12C)** | `10,573 Mbps` (1C) / `77.1–81.1 Gbps` (12C) | `1,655–2,109 Mbps` (`172–188 kpps`, `1200–1350B`) | `11.8 ms` (`selftest`) | — |
+| **Apple Silicon (ARM64, 12C)** | `18,720 Mbps` (1C) / `127.4 Gbps` (12C) | `1,581–2,109 Mbps` (`165–188 kpps`, `1200–1350B`) | `1.6–11.8 ms` | `2.7–3.4 MiB` (`1–2` 线程) |
 | **x86_64 云服务器（单核 `1W`）** | `3,228.6 Mbps` (`320.3 kpps`) | `1,124.2 Mbps` (`111.5 kpps`) | `3.01 ms` | `2.1–2.8 MB` |
 | **x86_64 低功耗软路由（单核 `1W`）** | `2,139.8 Mbps` (`212.3 kpps`) | `900.0 Mbps` (`0.00%` 丢包，p50 `50 µs`) | `6.85–9.02 ms` | `2.1–2.8 MB` |
 | **x86_64 低功耗软路由（多核 `4W / 8S`）** | — | `1,448.7 Mbps` (`0.00%` 丢包，`143.7 kpps`) | `6.85–9.12 ms` | `2.5–2.8 MB` |
 
-> 微基准测试 `1200–1260B` 载荷单次 `wrap + unwrap` 往返吞吐；Apple Silicon 同机实测 `ChaCha20-Poly1305` 为 `2,696 Mbps`、`BLAKE2b-128` 为 `1,282 Mbps`，纯 Rust ECDSA P-256 临时证书签发速率为 `4,968 certs/s`。
+> 微基准测试 `1200–1260B` 载荷单次 `wrap + unwrap` 往返吞吐；依赖统一至 RustCrypto `0.11`/`0.14` 代际并启用 `fat LTO` + 混合 `-O3/-Os` 优化后，Apple Silicon 同机实测 `AES-128-GCM` 升至 `18,720 Mbps`（12 核 `127.4 Gbps`）、`ChaCha20-Poly1305` `3,097–3,276 Mbps`、`BLAKE2b-128` `1,121–1,243 Mbps`，纯 Rust ECDSA P-256 临时证书签发速率 `13,005 certs/s`（上方历史基准 SVG 图表基于早期 `v0.4.2` 采样）；同时静态二进制体积缩减约 `30%`（`linux-x86_64-musl` `2.78 → 1.95 MiB`、`linux-aarch64-musl` `2.31 → 1.62 MiB`、`macos-arm64` `2.08 → 1.49 MiB`），macOS 实测 RSS 下降约 `60%`（`7.2–8.0 → 2.7–3.4 MiB`，线程数 `8 → 1–2`）。
 
 ### 综合对抗与工程边界总览
 
@@ -228,7 +228,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 ├── SPEC.md                                # V4.0 / v0.4.2 线格式、密码学与状态机协议规范
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示页（离线 / GitHub Pages）
 ├── LICENSE                                # MIT 开源许可证
-└── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 unsafe / 零 OpenSSL）
+└── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 C 外部库依赖 / 零 OpenSSL）
     ├── Cargo.toml
     └── src/
         ├── main.rs                        # CLI 参数解析 (pico-args) 与子命令分发

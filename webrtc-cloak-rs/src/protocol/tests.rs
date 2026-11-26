@@ -3,8 +3,8 @@
 use super::dtls::build_dimpl_config;
 use super::srtp::derive_audio_ssrc;
 use super::stun::{
-    push_stun_attr, STUN_ATTR_FINGERPRINT as ATTR_FINGERPRINT, STUN_ATTR_USERNAME as ATTR_USERNAME,
-    STUN_FINGERPRINT_XOR,
+    push_stun_attr, stun_crc32, STUN_ATTR_FINGERPRINT as ATTR_FINGERPRINT,
+    STUN_ATTR_USERNAME as ATTR_USERNAME, STUN_FINGERPRINT_XOR,
 };
 use super::*;
 use crate::constants::*;
@@ -18,12 +18,15 @@ fn v31_full_security_and_protocol_invariants() {
     let parsed = parse_stun(&req, psk).unwrap();
     assert!(parsed.authenticated);
 
+    // IEEE 802.3 CRC32 standard check vector ("123456789" -> 0xCBF43926)
+    assert_eq!(stun_crc32(b"123456789"), 0xCBF4_3926);
+
     // V3-H-02 regression test: trailing ATTR_USERNAME injected AFTER MESSAGE-INTEGRITY MUST be rejected!
     let mut injected = req[..req.len() - 8].to_vec(); // strip old FINGERPRINT
     push_stun_attr(&mut injected, ATTR_USERNAME, b"evil:user");
     let new_len = (injected.len() - 20 + 8) as u16;
     injected[2..4].copy_from_slice(&new_len.to_be_bytes());
-    let crc = crc32fast::hash(&injected) ^ STUN_FINGERPRINT_XOR;
+    let crc = stun_crc32(&injected) ^ STUN_FINGERPRINT_XOR;
     push_stun_attr(&mut injected, ATTR_FINGERPRINT, &crc.to_be_bytes());
     assert!(
         parse_stun(&injected, psk).is_none(),

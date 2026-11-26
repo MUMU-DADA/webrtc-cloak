@@ -4,13 +4,46 @@ use super::{fill_random, rand_u32, rand_ufrag_chrome, unix_secs};
 use crate::constants::{
     STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS, STUN_HDR_LEN, STUN_MAX_USERNAME_LEN,
 };
-use hmac::{Hmac, Mac as _};
+use hmac::{Hmac, KeyInit, Mac as _};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 use std::net::{Ipv4Addr, SocketAddrV4};
 use subtle::ConstantTimeEq;
 
 type HmacSha1 = Hmac<Sha1>;
+
+/// Build a compact 16-entry half-byte IEEE 802.3 CRC32 lookup table (64 B vs 16 KiB in `crc32fast`).
+const fn make_crc32_nibble_lut() -> [u32; 16] {
+    let mut lut = [0u32; 16];
+    let mut i = 0usize;
+    while i < 16 {
+        let mut c = i as u32;
+        let mut bit = 0;
+        while bit < 4 {
+            c = if (c & 1) != 0 {
+                (c >> 1) ^ 0xEDB8_8320
+            } else {
+                c >> 1
+            };
+            bit += 1;
+        }
+        lut[i] = c;
+        i += 1;
+    }
+    lut
+}
+
+/// Pure-Rust IEEE 802.3 CRC32 used for low-frequency 64–92 B STUN FINGERPRINT frames.
+pub(super) fn stun_crc32(data: &[u8]) -> u32 {
+    const LUT: [u32; 16] = make_crc32_nibble_lut();
+    let mut crc = 0xFFFF_FFFFu32;
+    for &b in data {
+        crc ^= b as u32;
+        crc = (crc >> 4) ^ LUT[(crc & 0x0F) as usize];
+        crc = (crc >> 4) ^ LUT[(crc & 0x0F) as usize];
+    }
+    !crc
+}
 
 /// RFC 5389 STUN Magic Cookie 固定值。
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
@@ -173,7 +206,7 @@ fn finalize_stun_with_key(
     out.extend_from_slice(txid);
     out.extend_from_slice(&body);
 
-    let crc = crc32fast::hash(&out) ^ STUN_FINGERPRINT_XOR;
+    let crc = stun_crc32(&out) ^ STUN_FINGERPRINT_XOR;
     push_stun_attr(&mut out, STUN_ATTR_FINGERPRINT, &crc.to_be_bytes());
     out
 }
@@ -366,7 +399,7 @@ pub fn parse_stun_with_key(data: &[u8], psk: &[u8], mi_key: &[u8; 32]) -> Option
         if seen_mi {
             // RFC 5389 §15.4: ONLY a single trailing 8-byte FINGERPRINT may follow MESSAGE-INTEGRITY!
             if attr_type == STUN_ATTR_FINGERPRINT && attr_len == 4 && next_pos == end {
-                let expected_crc = crc32fast::hash(&data[..pos]) ^ STUN_FINGERPRINT_XOR;
+                let expected_crc = stun_crc32(&data[..pos]) ^ STUN_FINGERPRINT_XOR;
                 let got_crc = u32::from_be_bytes([val[0], val[1], val[2], val[3]]);
                 fp_ok = got_crc == expected_crc;
                 pos = next_pos;

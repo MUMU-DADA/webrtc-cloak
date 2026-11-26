@@ -821,7 +821,7 @@
         <ul>
           <li>新增严格旁路于热路径的外层健康遥测：支持原子 <code>tmp + rename</code> JSON 落盘（<code>--status-file</code>）及本地只读 HTTP / Prometheus 端点（<code>--status-http</code> <code>/status</code> <code>/healthz</code> <code>/metrics</code>）。</li>
           <li>全仓重构为 36 个职责清晰子模块 + <code>pico-args</code> 零传递依赖 CLI 解析与分层契约常量，<code>cargo clippy</code> 0 告警、16 架构零 C 依赖静态发布。</li>
-          <li>Linux x86_64 静态 musl 体积仅 <strong><code>2.9 MB</code></strong>，含遥测常驻内存仅 <strong><code>2.1–2.8 MB</code></strong>，纯封装 L3 开销恒定 <strong><code>+2.8%</code></strong>。</li>
+          <li>统一 RustCrypto 依赖代际（0 重复 crate）并自研零外部依赖 <code>mio</code> 单线程遥测 HTTP / JSON 与无锁 <code>sigaction</code> 自管道退出，Linux x86_64 静态 musl 体积压降至 <strong><code>1.95 MiB</code></strong>（<code>aarch64</code> <strong><code>1.62 MiB</code></strong>、<code>macos-arm64</code> <strong><code>1.49 MiB</code></strong>），纯隧道真正 <strong>1 线程</strong>（开 HTTP 遥测 <strong>2 线程</strong>），纯封装 L3 开销恒定 <strong><code>+2.8%</code></strong>。</li>
         </ul>
       </div>
     </div>
@@ -844,8 +844,8 @@
       </div>
       <div class="metric-box">
         <div class="m-label">Apple Silicon (ARM64, 12C)</div>
-        <div class="m-val purple">10.6 / 77.1 Gbps</div>
-        <div class="m-note">单核 10,573M / 12核 77.1G · 全隧道 2,109 Mbps</div>
+        <div class="m-val purple">18.7 / 127.4 Gbps</div>
+        <div class="m-note">单核 18,720M / 12核 127.4G · macOS RSS 2.7–3.4 MiB</div>
       </div>
     </div>
 

@@ -415,12 +415,12 @@ impl ServerWorker {
                     let (state, dtls_opt, cipher_opt, chosen_opt, ready_at, skey_opt, mkey_opt) =
                         if self.cfg.dtls_required {
                             let cert = self.cert_cache.get(now);
-                            let mut dtls = new_dtls_instance(
+                            let mut dtls = Box::new(new_dtls_instance(
                                 self.cfg.dtls_min_version,
                                 self.dtls_pool.pick(),
                                 cert,
                                 now,
-                            );
+                            ));
                             let _ = dtls.handle_timeout(now);
                             (
                                 ServerState::DtlsHandshake,
@@ -572,12 +572,12 @@ impl ServerWorker {
                                     sess.dtls_resets += 1;
                                     sess.dtls_km = None;
                                     let cert = self.cert_cache.get(now);
-                                    let mut fresh = new_dtls_instance(
+                                    let mut fresh = Box::new(new_dtls_instance(
                                         self.cfg.dtls_min_version,
                                         self.dtls_pool.pick(),
                                         cert,
                                         now,
-                                    );
+                                    ));
                                     let _ = fresh.handle_timeout(now);
                                     sess.dtls = Some(fresh);
                                     sess.dtls_next_timeout = None;
@@ -610,7 +610,11 @@ impl ServerWorker {
                             let early_pkts: Vec<Vec<u8>> = self
                                 .sessions_by_token
                                 .get_mut(&tok)
-                                .map(|s| s.early_srtp.drain(..).collect())
+                                .map(|s| {
+                                    let pkts: Vec<Vec<u8>> = s.early_srtp.drain(..).collect();
+                                    s.early_srtp.shrink_to_fit();
+                                    pkts
+                                })
                                 .unwrap_or_default();
                             for raw in early_pkts {
                                 process_ready_srtp(

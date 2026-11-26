@@ -46,8 +46,8 @@ pub(super) struct SeenTxidCache {
 impl SeenTxidCache {
     pub(super) fn new() -> Self {
         Self {
-            map: HashMap::with_capacity(1024),
-            order: VecDeque::with_capacity(1024),
+            map: HashMap::with_capacity(16),
+            order: VecDeque::with_capacity(16),
         }
     }
 
@@ -192,7 +192,7 @@ impl SharedV4Registry {
             });
         }
         Self {
-            ufrag_index: Mutex::new(HashMap::with_capacity(256)),
+            ufrag_index: Mutex::new(HashMap::with_capacity(16)),
             inboxes,
         }
     }

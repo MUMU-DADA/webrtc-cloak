@@ -1,7 +1,11 @@
 [target.aarch64-apple-darwin]
 rustflags = [
-  "--cfg", "aes_armv8",
-  "--cfg", "polyval_armv8",
+  "-C", "force-unwind-tables=no",
+]
+
+[target.x86_64-apple-darwin]
+rustflags = [
+  "-C", "force-unwind-tables=no",
 ]
 
 [target.x86_64-unknown-linux-musl]
@@ -9,48 +13,75 @@ linker = "rust-lld"
 rustflags = [
   "-C", "target-feature=+crt-static",
   "-C", "target-cpu=x86-64",
+  "-C", "force-unwind-tables=no",
 ]
 
 [target.aarch64-unknown-linux-musl]
 linker = "rust-lld"
 rustflags = [
   "-C", "target-feature=+crt-static",
-  "--cfg", "aes_armv8",
-  "--cfg", "polyval_armv8",
+  "-C", "force-unwind-tables=no",
 ]
 
 [target.armv7-unknown-linux-musleabihf]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.armv7-unknown-linux-musleabi]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.arm-unknown-linux-musleabi]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.arm-unknown-linux-musleabihf]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.armv5te-unknown-linux-musleabi]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.i686-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.riscv64gc-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.loongarch64-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]
 
 [target.powerpc64le-unknown-linux-musl]
 linker = "rust-lld"
-rustflags = ["-C", "target-feature=+crt-static"]
+rustflags = [
+  "-C", "target-feature=+crt-static",
+  "-C", "force-unwind-tables=no",
+]

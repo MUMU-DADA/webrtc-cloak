@@ -423,7 +423,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
 }
 
 /// v0.4.1 End-to-End Outer Health Telemetry Test:
-/// Verifies BOTH `--status-file` (atomic serde_json) AND `--status-http` (`/status`, `/metrics`)
+/// Verifies BOTH `--status-file` (atomic JSON) AND `--status-http` (`/status`, `/metrics`)
 /// on BOTH `client` and `server` across live SRTP traffic, an active-probe unauth drop on server,
 /// and a live asymmetric uplink blackhole -> 1-RTT ICE path migration!
 #[test]

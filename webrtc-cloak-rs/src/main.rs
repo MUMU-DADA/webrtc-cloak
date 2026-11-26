@@ -12,7 +12,7 @@ use crate::bench_tools::{print_cpu_info, run_bench, run_loadgen, run_sink};
 use crate::client::{run_client, ClientConfig};
 use crate::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_WAN_MTU};
 use crate::protocol::{
-    detect_cpu_accel, trigger_shutdown_wakers, CipherPref, CipherSuite, DtlsMinVersion,
+    detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,
 };
 use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
@@ -21,8 +21,6 @@ use pico_args::Arguments;
 use std::env;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::process;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
 
 /// 1 MiB 字节数，用于将 `--rotate-bytes` 参数换算为字节。
 const MIB: u64 = 1024 * 1024;
@@ -78,16 +76,6 @@ struct CommonTunnelArgs {
     idle_timeout_secs: u64,
     stats_interval_secs: u64,
     telemetry: TelemetryConfig,
-}
-
-fn install_shutdown_handler() -> Arc<AtomicBool> {
-    let stop = Arc::new(AtomicBool::new(false));
-    let flag = Arc::clone(&stop);
-    let _ = ctrlc::set_handler(move || {
-        flag.store(true, Ordering::SeqCst);
-        trigger_shutdown_wakers();
-    });
-    stop
 }
 
 fn parse_workers(s: &str) -> Result<usize, String> {

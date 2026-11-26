@@ -1,8 +1,9 @@
 //! RFC 3550/7714 复合 SRTCP 报文构造、校验与防重放。
 
-use super::{CipherSuite, SrtpCloakCipher, RTCP_CNAME_LEN, RTCP_HDR_LEN, RTP_V2_BITS, RTP_V2_MASK};
+use super::srtp::CipherBackend;
+use super::{SrtpCloakCipher, RTCP_CNAME_LEN, RTCP_HDR_LEN, RTP_V2_BITS, RTP_V2_MASK};
 use crate::constants::SRTP_TAG_LEN;
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Nonce as GcmNonce, Tag as GcmTag};
 use chacha20poly1305::{Nonce as ChaNonce, Tag as ChaTag};
 use subtle::ConstantTimeEq;
@@ -179,26 +180,27 @@ impl SrtpCloakCipher {
         aad[RTCP_HDR_LEN..RTCP_HDR_LEN + SRTCP_INDEX_LEN].copy_from_slice(&e_idx.to_be_bytes());
 
         let srtcp_tx_dir = self.tx_dir | NONCE_DOMAIN_SRTCP_BIT;
-        let tag_bytes: [u8; SRTP_TAG_LEN] = match self.suite {
-            CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64);
-                let tag = self
-                    .aes_gcm
-                    .encrypt_in_place_detached(GcmNonce::from_slice(&iv), &aad, &mut body)
+        let tag_bytes: [u8; SRTP_TAG_LEN] = match self.backend {
+            CipherBackend::Aes128Gcm(ref aes_gcm) => {
+                let iv = GcmNonce::from(self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64));
+                let tag = aes_gcm
+                    .encrypt_inout_detached(&iv, &aad, body.as_mut_slice().into())
                     .expect("SRTCP AES-GCM encrypt");
                 tag.into()
             }
-            CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64);
-                let tag = self
-                    .chacha
-                    .encrypt_in_place_detached(ChaNonce::from_slice(&iv), &aad, &mut body)
+            CipherBackend::ChaCha20Poly1305(ref chacha) => {
+                let iv = ChaNonce::from(self.gcm_nonce(srtcp_tx_dir, report_ssrc, idx as u64));
+                let tag = chacha
+                    .encrypt_inout_detached(&iv, &aad, body.as_mut_slice().into())
                     .expect("SRTCP ChaCha20 encrypt");
                 tag.into()
             }
-            CipherSuite::Blake2b => {
-                self.xor_keystream(srtcp_tx_dir, report_ssrc, idx as u64, &mut body);
-                self.auth_tag(srtcp_tx_dir, &aad, &body, idx)
+            CipherBackend::Blake2b {
+                ref enc_key,
+                ref mac_key,
+            } => {
+                Self::xor_keystream(enc_key, srtcp_tx_dir, report_ssrc, idx as u64, &mut body);
+                Self::auth_tag(mac_key, srtcp_tx_dir, &aad, &body, idx)
             }
         };
 
@@ -255,33 +257,29 @@ impl SrtpCloakCipher {
         let mut plain = packet[RTCP_HDR_LEN..tag_pos].to_vec();
 
         let srtcp_rx_dir = self.rx_dir | NONCE_DOMAIN_SRTCP_BIT;
-        let ok = match self.suite {
-            CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64);
-                self.aes_gcm
-                    .decrypt_in_place_detached(
-                        GcmNonce::from_slice(&iv),
-                        &aad,
-                        &mut plain,
-                        GcmTag::from_slice(&packet[tag_pos..idx_pos]),
-                    )
+        let tag_arr: [u8; SRTP_TAG_LEN] = packet[tag_pos..idx_pos].try_into().unwrap();
+        let ok = match self.backend {
+            CipherBackend::Aes128Gcm(ref aes_gcm) => {
+                let iv = GcmNonce::from(self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64));
+                let tag = GcmTag::from(tag_arr);
+                aes_gcm
+                    .decrypt_inout_detached(&iv, &aad, plain.as_mut_slice().into(), &tag)
                     .is_ok()
             }
-            CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64);
-                self.chacha
-                    .decrypt_in_place_detached(
-                        ChaNonce::from_slice(&iv),
-                        &aad,
-                        &mut plain,
-                        ChaTag::from_slice(&packet[tag_pos..idx_pos]),
-                    )
+            CipherBackend::ChaCha20Poly1305(ref chacha) => {
+                let iv = ChaNonce::from(self.gcm_nonce(srtcp_rx_dir, ssrc, idx as u64));
+                let tag = ChaTag::from(tag_arr);
+                chacha
+                    .decrypt_inout_detached(&iv, &aad, plain.as_mut_slice().into(), &tag)
                     .is_ok()
             }
-            CipherSuite::Blake2b => {
-                let expected = self.auth_tag(srtcp_rx_dir, &aad, &plain, idx);
-                if bool::from(packet[tag_pos..idx_pos].ct_eq(&expected[..])) {
-                    self.xor_keystream(srtcp_rx_dir, ssrc, idx as u64, &mut plain);
+            CipherBackend::Blake2b {
+                ref enc_key,
+                ref mac_key,
+            } => {
+                let expected = Self::auth_tag(mac_key, srtcp_rx_dir, &aad, &plain, idx);
+                if bool::from(tag_arr.ct_eq(&expected[..])) {
+                    Self::xor_keystream(enc_key, srtcp_rx_dir, ssrc, idx as u64, &mut plain);
                     true
                 } else {
                     false

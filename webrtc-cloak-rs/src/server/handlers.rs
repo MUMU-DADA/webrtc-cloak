@@ -272,7 +272,7 @@ pub(super) fn drain_server_dtls(
     }
 
     if connected_now && sess.state == ServerState::DtlsHandshake {
-        let Some(km) = sess.dtls_km.as_deref().filter(|k| !k.is_empty()) else {
+        let Some(mut km) = sess.dtls_km.take().filter(|k| !k.is_empty()) else {
             log(
                 worker_id,
                 &format!(
@@ -285,7 +285,9 @@ pub(super) fn drain_server_dtls(
         let is_dtls13 =
             sess.dtls.as_ref().and_then(|d| d.protocol_version()) == Some(ProtocolVersion::DTLS1_3);
         let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
-        let final_key = combine_session_key(&sess.stun_key, Some(km));
+        let final_key = combine_session_key(&sess.stun_key, Some(&km));
+        km.fill(0);
+        drop(km);
         let mi_key_mig = derive_ice_migration_key(&final_key);
         sess.session_key = Some(final_key);
         sess.mi_key_mig = Some(mi_key_mig);

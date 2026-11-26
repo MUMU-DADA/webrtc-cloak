@@ -15,10 +15,30 @@ pub const DEFAULT_WAN_MTU: usize = 1488;
 pub const MIN_WIRE_UDP_MTU: usize = 576;
 /// 允许封装的内层 UDP 报文硬上限（字节），确保加头、填充和认证标签后不溢出写缓冲。
 pub const MAX_INNER_UDP_LEN: usize = 65_400;
-/// 通用 UDP 接收缓冲区大小（字节）。
+/// 通用 UDP 接收缓冲区大小（字节，用于 `--mtu 0` 大包或压测）。
 pub const UDP_RECV_BUF_LEN: usize = 65_536;
-/// SRTP 封装输出写缓冲区大小（字节，含 RTP 头、随机填充与 AEAD 标签冗余空间）。
-pub const UDP_WRITE_BUF_LEN: usize = UDP_RECV_BUF_LEN + 128;
+/// 按外层 WAN MTU 计算单 worker UDP 收包缓冲长度（`wan_mtu > 0` 时无需预留 64 KiB，省 ~124 KiB/worker）。
+pub const fn worker_udp_recv_buf_len(wan_mtu: usize) -> usize {
+    if wan_mtu == 0 {
+        UDP_RECV_BUF_LEN
+    } else {
+        let base = if wan_mtu > PROBE_IO_BUF_LEN {
+            wan_mtu
+        } else {
+            PROBE_IO_BUF_LEN
+        };
+        let len = base + 256;
+        if len > UDP_RECV_BUF_LEN {
+            UDP_RECV_BUF_LEN
+        } else {
+            len
+        }
+    }
+}
+/// 按外层 WAN MTU 计算单 worker UDP 封装写缓冲长度。
+pub const fn worker_udp_write_buf_len(wan_mtu: usize) -> usize {
+    worker_udp_recv_buf_len(wan_mtu) + 128
+}
 /// DTLS 记录收发临时缓冲区初始大小（字节）。
 pub const DTLS_IO_BUF_LEN: usize = 4096;
 /// 探测报文与早期 SRTP 缓冲的单包缓冲区上限（字节）。
@@ -31,6 +51,9 @@ pub const SOCK_BUF_8MIB: usize = 8 * 1024 * 1024;
 pub const MIO_EVENTS_CAP: usize = 256;
 /// `mio::Poll` 中主监听套接字的保留事件令牌。
 pub const LISTEN_TOKEN: Token = Token(0);
+/// `mio::Poll` 中用于 Unix 信号自管道无锁优雅退出唤醒的保留令牌。
+#[cfg(unix)]
+pub const SHUTDOWN_PIPE_TOKEN: Token = Token(usize::MAX - 1);
 /// `mio::Poll` 中用于跨线程命令和优雅退出唤醒的保留令牌。
 pub const WAKE_TOKEN: Token = Token(usize::MAX);
 

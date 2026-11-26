@@ -327,14 +327,15 @@ impl ClientWorker {
                                         sess.local_port, rtt_ms, mapped_s, s_c2s, s_s2c
                                     ),
                                 );
+                                    sess.cached_initial_stun = Vec::new();
                                     if self.cfg.dtls_decoy {
                                         let cert = self.cert_cache.get(now);
-                                        let mut dtls = new_dtls_instance(
+                                        let mut dtls = Box::new(new_dtls_instance(
                                             self.cfg.dtls_min_version,
                                             self.dtls_pool.pick(),
                                             cert,
                                             now,
-                                        );
+                                        ));
                                         dtls.set_active(true);
                                         let _ = dtls.handle_timeout(now);
                                         sess.dtls = Some(dtls);
@@ -532,12 +533,12 @@ impl ClientWorker {
                                     sess.dtls_suite_id = None;
                                     sess.dtls_km = None;
                                     let cert = self.cert_cache.get(now);
-                                    let mut fresh = new_dtls_instance(
+                                    let mut fresh = Box::new(new_dtls_instance(
                                         self.cfg.dtls_min_version,
                                         self.dtls_pool.pick(),
                                         cert,
                                         now,
-                                    );
+                                    ));
                                     fresh.set_active(true);
                                     let _ = fresh.handle_timeout(now);
                                     sess.dtls = Some(fresh);

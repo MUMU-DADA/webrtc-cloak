@@ -19,7 +19,10 @@ pub use stun::{
     stun_hmac_key, SessionIceParams,
 };
 
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+#[cfg(not(unix))]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 /// RFC 7983 首字节 `0..=3` 归类为 STUN 报文。
@@ -60,17 +63,143 @@ pub(super) const RTCP_HDR_LEN: usize = 8;
 /// SDES CNAME 固定 ASCII 长度（13 字节，使 SDES 子包精确对齐 24B）。
 pub(super) const RTCP_CNAME_LEN: usize = 13;
 
-static SHUTDOWN_WAKERS: OnceLock<Mutex<Vec<Arc<mio::Waker>>>> = OnceLock::new();
+#[cfg(unix)]
+mod unix_signal {
+    use super::*;
+    use std::sync::atomic::AtomicI32;
 
-/// Register a worker `mio::Waker` to be notified immediately upon `SIGTERM`/`SIGINT`.
-pub fn register_shutdown_waker(waker: Arc<mio::Waker>) {
-    let lock = SHUTDOWN_WAKERS.get_or_init(|| Mutex::new(Vec::new()));
-    if let Ok(mut guard) = lock.lock() {
-        guard.push(waker);
+    static SIGNAL_STOP: AtomicBool = AtomicBool::new(false);
+    static PIPE_READ_FD: AtomicI32 = AtomicI32::new(-1);
+    static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
+    extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
+        SIGNAL_STOP.store(true, Ordering::SeqCst);
+        let fd = PIPE_WRITE_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            let b = 1u8;
+            // SAFETY: `libc::write` is async-signal-safe per POSIX.1-2008; non-blocking fd avoids blocking.
+            unsafe {
+                let _ = libc::write(fd, (&b as *const u8).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    fn set_nonblock_cloexec(fd: libc::c_int) {
+        unsafe {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            if fl >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+        }
+    }
+
+    pub(super) fn install() {
+        if PIPE_WRITE_FD.load(Ordering::Acquire) < 0 {
+            let mut fds = [-1 as libc::c_int; 2];
+            // SAFETY: valid 2-element array passed to POSIX `pipe`.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                set_nonblock_cloexec(fds[0]);
+                set_nonblock_cloexec(fds[1]);
+                PIPE_READ_FD.store(fds[0], Ordering::Release);
+                PIPE_WRITE_FD.store(fds[1], Ordering::Release);
+            }
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handle_shutdown_signal as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            let _ = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+            let _ = libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        }
+    }
+
+    #[inline]
+    pub(super) fn read_fd() -> Option<libc::c_int> {
+        let fd = PIPE_READ_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            Some(fd)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(super) fn received() -> bool {
+        SIGNAL_STOP.load(Ordering::Relaxed)
     }
 }
 
-/// Wake all registered production workers immediately so graceful shutdown needs zero poll lag.
+#[cfg(not(unix))]
+static SHUTDOWN_WAKERS: OnceLock<Mutex<Vec<Arc<mio::Waker>>>> = OnceLock::new();
+
+/// Install OS `SIGINT`/`SIGTERM` handler for graceful shutdown.
+/// On Unix, uses async-signal-safe `sigaction` + self-pipe (zero extra signal thread!).
+pub fn install_shutdown_handler() -> Arc<AtomicBool> {
+    let stop = Arc::new(AtomicBool::new(false));
+    #[cfg(unix)]
+    {
+        unix_signal::install();
+    }
+    #[cfg(not(unix))]
+    {
+        let flag = Arc::clone(&stop);
+        let _ = ctrlc::set_handler(move || {
+            flag.store(true, Ordering::SeqCst);
+            trigger_shutdown_wakers();
+        });
+    }
+    stop
+}
+
+/// Register a worker's `mio::Poll` to wake immediately upon `SIGTERM`/`SIGINT`.
+pub fn register_shutdown_poll(poll: &mio::Poll, quiet: bool, has_stop: bool) {
+    if quiet || !has_stop {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(rfd) = unix_signal::read_fd() {
+            let mut src = mio::unix::SourceFd(&rfd);
+            let _ = poll.registry().register(
+                &mut src,
+                crate::constants::SHUTDOWN_PIPE_TOKEN,
+                mio::Interest::READABLE,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        if let Ok(waker) = mio::Waker::new(poll.registry(), crate::constants::WAKE_TOKEN) {
+            let lock = SHUTDOWN_WAKERS.get_or_init(|| Mutex::new(Vec::new()));
+            if let Ok(mut guard) = lock.lock() {
+                guard.push(Arc::new(waker));
+            }
+        }
+    }
+}
+
+/// Check whether graceful shutdown has been requested (either via test `stop` flag or OS signal).
+#[inline]
+pub fn is_shutdown_requested(stop: Option<&Arc<AtomicBool>>, quiet: bool) -> bool {
+    if stop.is_some_and(|s| s.load(Ordering::Relaxed)) {
+        return true;
+    }
+    #[cfg(unix)]
+    if !quiet && stop.is_some() && unix_signal::received() {
+        return true;
+    }
+    #[cfg(not(unix))]
+    let _ = quiet;
+    false
+}
+
+/// Wake all registered production workers immediately (Windows `ctrlc` path).
+#[cfg(not(unix))]
 pub fn trigger_shutdown_wakers() {
     if let Some(lock) = SHUTDOWN_WAKERS.get() {
         if let Ok(guard) = lock.lock() {
@@ -255,7 +384,7 @@ pub fn demux_rfc7983(data: &[u8]) -> PacketKind {
 }
 
 pub fn fill_random(buf: &mut [u8]) {
-    getrandom::getrandom(buf).expect("OS CSPRNG failed");
+    getrandom::fill(buf).expect("OS CSPRNG failed");
 }
 
 pub fn rand_u32() -> u32 {

@@ -276,10 +276,10 @@ pub fn generate_ephemeral_webrtc_cert() -> DtlsCertificate {
     };
     let pub_bytes = signing_key
         .verifying_key()
-        .to_encoded_point(false)
+        .to_sec1_point(false)
         .as_bytes()
         .to_vec();
-    let pkcs8_der = p256::SecretKey::from(&signing_key)
+    let pkcs8_der = signing_key
         .to_pkcs8_der()
         .expect("PKCS#8 DER encode")
         .as_bytes()

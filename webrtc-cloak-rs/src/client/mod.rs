@@ -171,7 +171,7 @@ pub(super) struct ClientSession {
     pub(super) mi_key_mig: Option<[u8; 32]>,
     pub(super) ssrc_c2s: u32,
     pub(super) ssrc_s2c: u32,
-    pub(super) dtls: Option<Dtls>,
+    pub(super) dtls: Option<Box<Dtls>>,
     pub(super) dtls_resets: u8,
     pub(super) pending_sh_suite: Option<u16>,
     pub(super) dtls_suite_id: Option<u16>,

@@ -8,13 +8,13 @@ use crate::constants::{
     RTP_FIXED_HDR_LEN, RTP_FULL_HDR_LEN, RTP_V2_EXT_BYTE, RTP_VIDEO_PT, SRTP_DATA_PREFIX_LEN,
     SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, SRTP_PROBE_MAGIC_LEN, SRTP_TAG_LEN,
 };
-use aes_gcm::aead::AeadInPlace;
+use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag as GcmTag};
 use blake2::digest::consts::{U16, U64};
-use blake2::{Blake2bMac, Digest as _};
+use blake2::Blake2bMac;
 use chacha20poly1305::{ChaCha20Poly1305, Nonce as ChaNonce, Tag as ChaTag};
-use hmac::Mac as _;
-use sha2::Sha256;
+use hmac::{KeyInit as _, Mac as _};
+use sha2::{Digest as _, Sha256};
 use std::time::Instant;
 use subtle::ConstantTimeEq;
 
@@ -152,14 +152,19 @@ pub(super) fn derive_audio_ssrc(session_key: &[u8; 32], video_ssrc: u32) -> u32 
     s
 }
 
+pub(super) enum CipherBackend {
+    Aes128Gcm(Box<Aes128Gcm>),
+    ChaCha20Poly1305(ChaCha20Poly1305),
+    Blake2b {
+        enc_key: [u8; 32],
+        mac_key: [u8; 32],
+    },
+}
+
 pub struct SrtpCloakCipher {
-    pub(super) suite: CipherSuite,
+    pub(super) backend: CipherBackend,
     pub(super) max_wire_udp: usize,
     pub(super) dual_ssrc: bool,
-    pub(super) enc_key: [u8; 32],
-    pub(super) mac_key: [u8; 32],
-    pub(super) aes_gcm: Aes128Gcm,
-    pub(super) chacha: ChaCha20Poly1305,
     pub(super) gcm_salt: [u8; 4],
     pub(super) cname: [u8; RTCP_CNAME_LEN],
     pub ssrc_tx: u32,
@@ -211,17 +216,29 @@ impl SrtpCloakCipher {
         he.update(b"|enc");
         let enc_key: [u8; 32] = he.finalize().into();
 
-        let mut hm = Sha256::new();
-        hm.update(session_key);
-        hm.update(b"|mac");
-        let mac_key: [u8; 32] = hm.finalize().into();
-
-        let aes_gcm = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&enc_key[..16])
-            .expect("16B AES-128 key");
-        let chacha = <ChaCha20Poly1305 as chacha20poly1305::KeyInit>::new_from_slice(&enc_key)
-            .expect("32B ChaCha20 key");
         let mut gcm_salt = [0u8; 4];
         gcm_salt.copy_from_slice(&enc_key[16..20]);
+
+        let backend = match suite {
+            CipherSuite::Aes128Gcm => {
+                let cipher = <Aes128Gcm as aes_gcm::KeyInit>::new_from_slice(&enc_key[..16])
+                    .expect("16B AES-128 key");
+                CipherBackend::Aes128Gcm(Box::new(cipher))
+            }
+            CipherSuite::ChaCha20Poly1305 => {
+                let cipher =
+                    <ChaCha20Poly1305 as chacha20poly1305::KeyInit>::new_from_slice(&enc_key)
+                        .expect("32B ChaCha20 key");
+                CipherBackend::ChaCha20Poly1305(cipher)
+            }
+            CipherSuite::Blake2b => {
+                let mut hm = Sha256::new();
+                hm.update(session_key);
+                hm.update(b"|mac");
+                let mac_key: [u8; 32] = hm.finalize().into();
+                CipherBackend::Blake2b { enc_key, mac_key }
+            }
+        };
 
         let audio_ssrc_tx = derive_audio_ssrc(session_key, ssrc_tx);
         let audio_ssrc_rx = derive_audio_ssrc(session_key, ssrc_rx);
@@ -242,13 +259,9 @@ impl SrtpCloakCipher {
         }
 
         Self {
-            suite,
+            backend,
             max_wire_udp: DEFAULT_WAN_MTU - IPV4_UDP_HDR_LEN,
             dual_ssrc: false,
-            enc_key,
-            mac_key,
-            aes_gcm,
-            chacha,
             gcm_salt,
             cname,
             ssrc_tx,
@@ -363,7 +376,13 @@ impl SrtpCloakCipher {
     }
 
     #[inline]
-    pub(super) fn xor_keystream(&self, direction: u8, ssrc: u32, ext_seq: u64, buf: &mut [u8]) {
+    pub(super) fn xor_keystream(
+        enc_key: &[u8; 32],
+        direction: u8,
+        ssrc: u32,
+        ext_seq: u64,
+        buf: &mut [u8],
+    ) {
         if buf.is_empty() {
             return;
         }
@@ -377,7 +396,7 @@ impl SrtpCloakCipher {
         let total = buf.len();
         while offset < total {
             block_in[13..17].copy_from_slice(&ctr.to_be_bytes());
-            let mut hasher = Blake2bMac::<U64>::new_from_slice(&self.enc_key).expect("key");
+            let mut hasher = Blake2bMac::<U64>::new_from_slice(enc_key).expect("key");
             hasher.update(&block_in);
             let ks = hasher.finalize().into_bytes();
 
@@ -403,13 +422,13 @@ impl SrtpCloakCipher {
 
     #[inline]
     pub(super) fn auth_tag(
-        &self,
+        mac_key: &[u8; 32],
         direction: u8,
         aad_hdr: &[u8],
         ciphertext: &[u8],
         roc: u32,
     ) -> [u8; SRTP_TAG_LEN] {
-        let mut h = Blake2bMac::<U16>::new_from_slice(&self.mac_key).expect("key");
+        let mut h = Blake2bMac::<U16>::new_from_slice(mac_key).expect("key");
         h.update(&[direction]);
         h.update(aad_hdr);
         h.update(ciphertext);
@@ -691,39 +710,34 @@ impl SrtpCloakCipher {
         aad[..RTP_FULL_HDR_LEN].copy_from_slice(&out[..RTP_FULL_HDR_LEN]);
         aad[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 4].copy_from_slice(&roc.to_be_bytes());
 
-        match self.suite {
-            CipherSuite::Aes128Gcm => {
-                let iv = self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq);
-                let tag = self
-                    .aes_gcm
-                    .encrypt_in_place_detached(
-                        GcmNonce::from_slice(&iv),
-                        &aad,
-                        &mut out[RTP_FULL_HDR_LEN..ct_end],
-                    )
+        match self.backend {
+            CipherBackend::Aes128Gcm(ref aes_gcm) => {
+                let iv = GcmNonce::from(self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq));
+                let tag = aes_gcm
+                    .encrypt_inout_detached(&iv, &aad, (&mut out[RTP_FULL_HDR_LEN..ct_end]).into())
                     .expect("AES-GCM encrypt");
                 out[ct_end..total].copy_from_slice(&tag);
             }
-            CipherSuite::ChaCha20Poly1305 => {
-                let iv = self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq);
-                let tag = self
-                    .chacha
-                    .encrypt_in_place_detached(
-                        ChaNonce::from_slice(&iv),
-                        &aad,
-                        &mut out[RTP_FULL_HDR_LEN..ct_end],
-                    )
+            CipherBackend::ChaCha20Poly1305(ref chacha) => {
+                let iv = ChaNonce::from(self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq));
+                let tag = chacha
+                    .encrypt_inout_detached(&iv, &aad, (&mut out[RTP_FULL_HDR_LEN..ct_end]).into())
                     .expect("ChaCha20-Poly1305 encrypt");
                 out[ct_end..total].copy_from_slice(&tag);
             }
-            CipherSuite::Blake2b => {
-                self.xor_keystream(
+            CipherBackend::Blake2b {
+                ref enc_key,
+                ref mac_key,
+            } => {
+                Self::xor_keystream(
+                    enc_key,
                     tx_domain_dir,
                     active_ssrc,
                     ext_seq,
                     &mut out[RTP_FULL_HDR_LEN..ct_end],
                 );
-                let tag = self.auth_tag(
+                let tag = Self::auth_tag(
+                    mac_key,
                     tx_domain_dir,
                     &out[..RTP_FULL_HDR_LEN],
                     &out[RTP_FULL_HDR_LEN..ct_end],
@@ -850,96 +864,92 @@ impl SrtpCloakCipher {
             self.rx_dir
         };
 
-        let decrypted = match self.suite {
-            CipherSuite::Aes128Gcm => {
-                let got_tag = GcmTag::from_slice(&packet[packet.len() - SRTP_TAG_LEN..]);
+        let tag_arr: [u8; SRTP_TAG_LEN] = packet[packet.len() - SRTP_TAG_LEN..].try_into().unwrap();
+        let matched_roc = match self.backend {
+            CipherBackend::Aes128Gcm(ref aes_gcm) => {
+                let got_tag = GcmTag::from(tag_arr);
                 let mut aad = [0u8; RTP_MAX_HDR_LEN + 4];
                 aad[..hdr_len].copy_from_slice(rtp_hdr);
-                let mut ok = false;
+                let mut found = None;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
                     if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let iv = self.gcm_nonce(rx_domain_dir, ssrc, ext_seq);
+                    let iv = GcmNonce::from(self.gcm_nonce(rx_domain_dir, ssrc, ext_seq));
                     aad[hdr_len..hdr_len + 4].copy_from_slice(&cand.to_be_bytes());
                     out[..ct_len].copy_from_slice(ciphertext);
-                    if self
-                        .aes_gcm
-                        .decrypt_in_place_detached(
-                            GcmNonce::from_slice(&iv),
+                    if aes_gcm
+                        .decrypt_inout_detached(
+                            &iv,
                             &aad[..hdr_len + 4],
-                            &mut out[..ct_len],
-                            got_tag,
+                            (&mut out[..ct_len]).into(),
+                            &got_tag,
                         )
                         .is_ok()
                     {
-                        self.update_rx_seq_stream(is_audio, cand, seq16);
-                        ok = true;
+                        found = Some(cand);
                         break;
                     }
                 }
-                ok
+                found
             }
-            CipherSuite::ChaCha20Poly1305 => {
-                let got_tag = ChaTag::from_slice(&packet[packet.len() - SRTP_TAG_LEN..]);
+            CipherBackend::ChaCha20Poly1305(ref chacha) => {
+                let got_tag = ChaTag::from(tag_arr);
                 let mut aad = [0u8; RTP_MAX_HDR_LEN + 4];
                 aad[..hdr_len].copy_from_slice(rtp_hdr);
-                let mut ok = false;
+                let mut found = None;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
                     if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let iv = self.gcm_nonce(rx_domain_dir, ssrc, ext_seq);
+                    let iv = ChaNonce::from(self.gcm_nonce(rx_domain_dir, ssrc, ext_seq));
                     aad[hdr_len..hdr_len + 4].copy_from_slice(&cand.to_be_bytes());
                     out[..ct_len].copy_from_slice(ciphertext);
-                    if self
-                        .chacha
-                        .decrypt_in_place_detached(
-                            ChaNonce::from_slice(&iv),
+                    if chacha
+                        .decrypt_inout_detached(
+                            &iv,
                             &aad[..hdr_len + 4],
-                            &mut out[..ct_len],
-                            got_tag,
+                            (&mut out[..ct_len]).into(),
+                            &got_tag,
                         )
                         .is_ok()
                     {
-                        self.update_rx_seq_stream(is_audio, cand, seq16);
-                        ok = true;
+                        found = Some(cand);
                         break;
                     }
                 }
-                ok
+                found
             }
-            CipherSuite::Blake2b => {
-                let got_tag = &packet[packet.len() - SRTP_TAG_LEN..];
-                let mut matched_roc = None;
+            CipherBackend::Blake2b {
+                ref enc_key,
+                ref mac_key,
+            } => {
+                let mut found = None;
                 for &cand in &candidates[..n_cand] {
                     let ext_seq = ((cand as u64) << 16) | (seq16 as u64);
                     if is_replay_cand(self, ext_seq) {
                         continue;
                     }
-                    let expected = self.auth_tag(rx_domain_dir, rtp_hdr, ciphertext, cand);
-                    if bool::from(got_tag.ct_eq(&expected[..])) {
-                        matched_roc = Some(cand);
+                    let expected =
+                        Self::auth_tag(mac_key, rx_domain_dir, rtp_hdr, ciphertext, cand);
+                    if bool::from(tag_arr.ct_eq(&expected[..])) {
+                        found = Some(cand);
                         break;
                     }
                 }
-                if let Some(roc) = matched_roc {
+                if let Some(roc) = found {
                     let ext_seq = ((roc as u64) << 16) | (seq16 as u64);
-                    self.update_rx_seq_stream(is_audio, roc, seq16);
                     out[..ct_len].copy_from_slice(ciphertext);
-                    self.xor_keystream(rx_domain_dir, ssrc, ext_seq, &mut out[..ct_len]);
-                    true
-                } else {
-                    false
+                    Self::xor_keystream(enc_key, rx_domain_dir, ssrc, ext_seq, &mut out[..ct_len]);
                 }
+                found
             }
         };
 
-        if !decrypted {
-            return None;
-        }
+        let roc = matched_roc?;
+        self.update_rx_seq_stream(is_audio, roc, seq16);
         let raw_len = u16::from_be_bytes([out[0], out[1]]);
         if matches!(
             raw_len,

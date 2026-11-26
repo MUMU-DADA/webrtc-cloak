@@ -87,7 +87,7 @@ pub(super) fn drain_client_dtls(
 
     if connected_now && sess.state == HandshakeState::DtlsHandshake {
         if let Some(stun_key) = sess.stun_key {
-            let Some(km) = sess.dtls_km.as_deref().filter(|k| !k.is_empty()) else {
+            let Some(mut km) = sess.dtls_km.take().filter(|k| !k.is_empty()) else {
                 log(
                     worker_id,
                     &format!(
@@ -100,7 +100,10 @@ pub(super) fn drain_client_dtls(
             let is_dtls13 = sess.dtls.as_ref().and_then(|d| d.protocol_version())
                 == Some(ProtocolVersion::DTLS1_3);
             let chosen = resolve_srtp_suite(cfg.cipher_pref, sess.dtls_suite_id, cpu, false);
-            let final_key = combine_session_key(&stun_key, Some(km));
+            let final_key = combine_session_key(&stun_key, Some(&km));
+            km.fill(0);
+            drop(km);
+            sess.cached_initial_stun = Vec::new();
             sess.session_key = Some(final_key);
             sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
             sess.active_cipher = Some(chosen);
@@ -142,6 +145,7 @@ pub(super) fn drain_client_dtls(
                     }
                 }
             }
+            sess.pending.shrink_to_fit();
             if flushed_bytes > 0 {
                 record_client_media_bytes(sess, cfg, cfg.keepalive_secs * 1000, now, flushed_bytes);
             }
@@ -371,7 +375,7 @@ pub(super) fn spawn_client_session(
         dtls_km: None,
         active_cipher: None,
         cipher: None,
-        pending: VecDeque::with_capacity(64),
+        pending: VecDeque::new(),
         pending_bytes: 0,
         tx_pkts: 0,
         tx_pkts_at_last_rtcp: 0,
