@@ -205,19 +205,16 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
-          - **Graceful Shutdown (`SIGTERM`/`SIGINT`) & Proactive Make-Before-Break Rotation (`v0.3.7`)**:
-            - Server and client broadcast encrypted `SRTCP BYE + DTLS close_notify` on `SIGTERM`/`SIGINT`; active clients immediately reconnect on a fresh 5-tuple, reducing server restart pause from ~5–7s to ~0.5–0.8s
-            - Optional client `--rotate-interval <SECS>` pre-handshakes a standby 5-tuple in the background (`±20%` jitter), atomically cuts over with 0ms stall / 0 packet loss, and drains in-flight downlink SRTP on the old socket for 5s
-          - **RFC 9147 DTLS 1.3 + DTLS 1.2 Auto-Sense (`dimpl 0.9.0`) & Anti-Downgrade Lock**:
-            - Encrypts mutual ECDSA P-256 certificates inside `0x2e` Unified Ciphertext records and cuts 1 full RTT off WAN handshakes while staying 100% rolling-upgrade compatible with `v0.3.5` DTLS 1.2 peers
-            - Optional `--dtls-min-version 1.3` locks `Dtls::new_13` to eliminate downgrade exposure once both ends run `v0.3.6+`; pre-built multi-MTU `DtlsConfig` pool randomizes ClientHello sizes with zero runtime validation cost; Ready-state Flight 5 retransmit driver prevents single-packet handshake blackholes
-          - **Dual-SSRC Audio/Video SRTP (`PT=111` Opus + `PT=96` Video) & Orthogonal Nonce Domains**:
-            - Jittered small-packet routing (`180..307B`) with RFC 7587 `<= 50 pps` Opus rate cap (overflow ACKs spill smoothly to `PT=96`), strict RFC 3550 Video `M=1` end-of-frame timestamp causality, shared global `0xBEDE` TWCC sequence, and independent 2048-packet RFC 6479 replay rings
-            - Fail-Closed Hybrid PFS (`PSK + ECDHE KeyingMaterial`), high-16-bit disjoint Audio/Video SSRCs + `dir | 0x40` / `dir | 0x80` Nonce domain separation, and sequence exhaustion guard
-          - **Hardened State Machines & Compound SRTCP**:
-            - Zero-alloc pre-auth STUN parser, `Ready`-state DTLS liveness isolation, strict `ServerHello` framing checks, Make-Before-Break `Closing` drain (zero ICMP bounce), adaptive blackhole retry damping, 0-based SRTCP index with session-constant CNAME and dual-SSRC reporting
+          - **Binary Size, Memory & Thread Footprint Optimization (`v0.4.3`)**:
+            - Aligned all RustCrypto crates (`aes-gcm`/`chacha20poly1305`/`sha1`/`sha2`/`blake2 0.11`, `p256 0.14`, `hmac 0.13`, `getrandom 0.4`) to the `dimpl 0.9.0` generation (37 duplicate crates → **0**) with `fat LTO`, `-C force-unwind-tables=no`, and hybrid `-O3`/`-Os` compilation (`linux-x86_64-musl` `2.78 → 1.95 MiB`, `linux-aarch64-musl` `2.31 → 1.62 MiB`, `macos-arm64` `2.08 → 1.49 MiB`, while accelerating single-core AEAD throughput)
+            - Replaced `tiny_http`, `serde`/`serde_json`, `crc32fast`, and Unix `ctrlc` with a zero-dependency single-thread `mio::Poll` HTTP telemetry server (64 KiB stack, 0 idle wakeups), hand-written RFC 8259 JSON, 64 B nibble-LUT IEEE CRC32, and async-signal-safe `sigaction` + self-pipe shutdown (`--workers 1` now runs in **1 OS thread** pure tunnel / **2 OS threads** with `--status-http`, down from 8)
+            - MTU-sized per-worker UDP buffers, lazy-growing `SeenTxidCache`/`SharedV4Registry`, single-suite `CipherBackend` enum, boxed `Dtls`, and immediate post-handshake key/buffer cleanup
+          - **V4.0 Seamless L4 UDP Carrier & Decoupled Health Telemetry (`v0.4.0`–`v0.4.2`)**:
+            - 1-RTT ICE path migration (`HKDF-SHA256` per-session `ice-pwd-v4` + unpadded `57B 0xFFFD` challenge `<= 1.32x` anti-reflection bound) and timed/byte-budget MBB rotation (`0xFFFC` encrypted atomic `backend_sock` handover, 0 backend source-port change across single/multi-worker)
+            - Strictly off-hot-path outer link telemetry via atomic `--status-file` JSON and read-only `--status-http` (`/status`, `/health`, `/healthz`, `/metrics`)
+          - **RFC 9147 DTLS 1.3 + DTLS 1.2 Auto-Sense (`dimpl 0.9.0`) & Dual-SSRC SRTP/SRTCP**:
+            - Encrypted mutual ECDSA P-256 certificates (`--dtls-min-version 1.3` anti-downgrade lock), dual-SSRC `PT=111` Opus (`<= 50 pps`) + `PT=96` Video with strict `M=1` causality, orthogonal AEAD nonce domains, 2048-packet RFC 6479 replay rings, and 100% 0-byte Silent Drop against active probes
           - **Dual-mode 12-scenario `webrtc-cloak selftest` suite** (`--server-host` live remote mode with in-band `0xFFFE` SRTP probe echo + `--local` offline fault-injection sandbox + CPU crypto/P-256 benchmarks)
-          - Default single-threaded `mio` reactor (`--workers 1`), optional multi-worker `--workers <N|auto>`, 32-bit safe arithmetic across all 16 build targets
 
           > **Disclaimer**: Strictly for network protocol learning, academic research, and authorized testing under the MIT License.
           """

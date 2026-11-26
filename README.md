@@ -2,7 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-Pure%20Rust%20%7C%20Zero%20C%20Deps-orange.svg)](#从源码构建与目录结构)
-[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.4.2-6366f1.svg)](./SPEC.md)
+[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.4.3-6366f1.svg)](./SPEC.md)
 [![Interactive Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-0ea5e9.svg)](https://mumu-dada.github.io/webrtc-cloak/)
 [![Release](https://img.shields.io/github/v/release/MUMU-DADA/webrtc-cloak?color=10b981)](https://github.com/MUMU-DADA/webrtc-cloak/releases)
 
@@ -12,7 +12,7 @@
 
 > [!TIP]
 > - **在线交互式原理演示**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**（6 种对抗与自愈推演、字节级报文解剖、双 SSRC / PPPoE MTU 1488 模拟，亦可离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）
-> - **协议规范文档（线格式 / 密钥派生 / 状态机）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.4.2`）
+> - **协议规范文档（线格式 / 密钥派生 / 状态机）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.4.3`）
 > - **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
 ---
@@ -104,7 +104,7 @@ flowchart LR
 
 ### 综合对抗与工程边界总览
 
-| 对抗 / 故障场景 | 裸 UDP / 早期版本 | **WebRTC-Cloak V4.0 (`v0.4.2`)** |
+| 对抗 / 故障场景 | 裸 UDP / 早期版本 | **WebRTC-Cloak V4.0 (`v0.4.3`)** |
 | :--- | :--- | :--- |
 | **严苛 NAT 5 包截断 & 主动探测** | 裸 UDP/QUIC 第 6 包起截断 | ICE STUN 握手后 `100%` 放行；双 SSRC 将 7 类固定包长展宽为 `168` 种长度；主动探测 `0 B` 静默丢弃 |
 | **定时 / 定量五元组轮换 (MBB)** | 固定五元组易关联；硬重连断流 | **4 次全新 DTLS 1.3 换口 + `0xFFFC` 密文过户**：`33,280 / 33,280` 实收（`0.00%` 丢包、`0 ms` 卡顿、后端 `0` 换口） |
@@ -225,7 +225,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 │   ├── bandwidth-overhead.svg             # 4. 带宽损耗与外层流量放大折线图
 │   └── benchmark-performance.svg          # 5. 多平台加解密算力与全隧道环回跑分图
 ├── README.md                              # 项目说明、实测图表与快速上手指南
-├── SPEC.md                                # V4.0 / v0.4.2 线格式、密码学与状态机协议规范
+├── SPEC.md                                # V4.0 / v0.4.3 线格式、密码学与状态机协议规范
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示页（离线 / GitHub Pages）
 ├── LICENSE                                # MIT 开源许可证
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 C 外部库依赖 / 零 OpenSSL）

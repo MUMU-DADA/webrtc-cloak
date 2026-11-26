@@ -1,4 +1,4 @@
-# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.4.2`)
+# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.4.3`)
 
 This document specifies the wire format, cryptographic schedule, state machine, and security boundaries of `webrtc-cloak-rs`.
 
