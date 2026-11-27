@@ -206,6 +206,8 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Non-AVX x86/x86_64 Hardware `PCLMULQDQ` Two-Tier Dispatch (`v0.5.1`, 100% wire-compatible with `v0.4.x`/`v0.5.0`)**:
+            - Added a two-tier runtime `PCLMULQDQ` dispatcher (`avx`+`pclmulqdq` VEX Tier 1 and `sse2`+`pclmulqdq` Legacy SSE Tier 2) in `polyval` so x86/x86_64 processors with hardware `AES-NI` + `PCLMULQDQ` but without `AVX` (such as Jasper Lake / Silvermont / Goldmont / Tremont embedded & appliance CPUs) execute full 4-block aggregated hardware `PCLMULQDQ` GHASH instead of falling back to software bit-slicing
           - **First-Class Out-of-Band ECMP Lane-Hunting Bypass Mode (`webrtc-cloak bypass`, `v0.5.0`)**:
             - New top-level `bypass` forwarder mode and `bypass --responder` ultra-lightweight STUN responder mode alongside `client` and `server`
             - Performs multi-candidate authenticated RFC 8445 ICE STUN ECMP lane hunting, continuous RTT/jitter guard, seamless NAT-rebinding port switch with 3s old-port drain overlap, and blackhole auto-escape on the exact same UDP 5-tuple while passing 100% of inner UDP payloads (e.g., QUIC) raw with zero framing overhead, zero double-encryption, and full kernel `UDP_SEGMENT` (UDP GSO) compatibility

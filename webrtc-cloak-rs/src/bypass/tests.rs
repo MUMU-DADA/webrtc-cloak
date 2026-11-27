@@ -34,7 +34,7 @@ fn bypass_selects_fast_lane_forwards_raw_payload_and_heals_blackhole() {
     let psk = b"test-bypass-ecmp-psk-v050".to_vec();
     let stop = Arc::new(AtomicBool::new(false));
 
-    // 1. Start `bypass --responder` (simulating `:27419` STUN responder)
+    // 1. Start `bypass --responder` (out-of-band redirected STUN responder)
     let resp_port = free_udp_port_v4();
     let resp_status_port = free_udp_port_v4();
     let resp_cfg = BypassResponderConfig {
@@ -180,7 +180,9 @@ fn bypass_selects_fast_lane_forwards_raw_payload_and_heals_blackhole() {
     attacker
         .set_read_timeout(Some(Duration::from_millis(80)))
         .unwrap();
-    attacker.send_to(b"\x00\x01garbage-probe-frame-1234", resp_addr).unwrap();
+    attacker
+        .send_to(b"\x00\x01garbage-probe-frame-1234", resp_addr)
+        .unwrap();
     let mut abuf = [0u8; 128];
     assert!(attacker.recv_from(&mut abuf).is_err());
 
@@ -228,11 +230,20 @@ fn bypass_selects_fast_lane_forwards_raw_payload_and_heals_blackhole() {
             }
         }
     }
-    assert!(switched, "bypass failed to escape blackholed source port {}", sport1);
+    assert!(
+        switched,
+        "bypass failed to escape blackholed source port {}",
+        sport1
+    );
 
     let resp_st = http_get_json(SocketAddr::from(([127, 0, 0, 1], resp_status_port)));
     assert_eq!(resp_st["role"], "bypass-responder");
-    assert!(resp_st["sessions"]["unauth_silent_drops_total"].as_u64().unwrap_or(0) >= 1);
+    assert!(
+        resp_st["sessions"]["unauth_silent_drops_total"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+    );
 
     stop.store(true, Ordering::SeqCst);
     bypass_handle.join().unwrap();
@@ -253,7 +264,8 @@ fn bypass_ipv6_loopback_batch_roundtrip() {
 
     let echo = UdpSocket::bind((Ipv6Addr::LOCALHOST, 0)).unwrap();
     let echo_addr = echo.local_addr().unwrap();
-    echo.set_read_timeout(Some(Duration::from_millis(50))).unwrap();
+    echo.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
     let stop_e = Arc::clone(&stop);
     let psk_e = psk.clone();
     let eh = thread::spawn(move || {

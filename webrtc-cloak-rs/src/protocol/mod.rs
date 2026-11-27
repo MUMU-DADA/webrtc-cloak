@@ -301,6 +301,9 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
         if std::arch::is_x86_feature_detected!("sha") {
             features.push("SHA-NI");
         }
+        if std::arch::is_x86_feature_detected!("avx") {
+            features.push("AVX");
+        }
         if std::arch::is_x86_feature_detected!("avx2") {
             features.push("AVX2");
         }

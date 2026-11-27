@@ -637,8 +637,6 @@ dependencies = [
 [[package]]
 name = "polyval"
 version = "0.7.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0fa31d631f2b2cb2a544d0aa321ce847a94764d701ca2becc411138b93d49cd"
 dependencies = [
  "cpubits",
  "cpufeatures",
@@ -950,7 +948,7 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "webrtc-cloak"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "aes-gcm",
  "blake2",
