@@ -5,12 +5,12 @@ use super::worker::ClientWorker;
 use super::{
     alloc_token, cancel_standby_for_client, log, make_udp_socket, record_client_media_bytes,
     schedule_mbb_timers, HandshakeState, OldPathDrain, CLIENT_MIG_ECHO_INTERVAL_MS, KA_MAX_RETRIES,
-    KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS, SOCK_BUF_2MIB,
+    KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS,
 };
 use crate::constants::{
     outer_udp_hdr_len, unspecified_addr_for, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS,
     CTRL_FRAME_BUF_LEN, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP, PATH_CHALLENGE_PAYLOAD_LEN,
-    POST_BYE_CLOSING_DRAIN_MS, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS,
+    POST_BYE_CLOSING_DRAIN_MS, SOCK_BUF_8MIB, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS,
     WORKER_MIN_FAST_WAIT_MS,
 };
 use crate::protocol::{
@@ -538,7 +538,7 @@ impl ClientWorker {
         let mut spawned = Vec::with_capacity(count);
         for i in 0..count {
             let mut sock =
-                match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_2MIB) {
+                match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

@@ -18,7 +18,7 @@ use self::local_resilience::{
 };
 use self::remote::run_remote_selftest;
 use self::report::{pad_right, print_json_report, print_pretty_report, Palette};
-use crate::constants::DEFAULT_WAN_MTU;
+use crate::constants::{DEFAULT_WAN_MTU, SOCK_BUF_4MIB};
 use crate::protocol::{detect_cpu_accel, CipherPref, DtlsMinVersion};
 use std::io::Write;
 use std::net::{SocketAddr, UdpSocket};
@@ -26,8 +26,6 @@ use std::time::Instant;
 
 /// `selftest` 远端 STUN 探测默认发包数。
 const DEFAULT_SELFTEST_PROBE_COUNT: usize = 20;
-/// 自测辅助套接字收发内核缓冲大小（4 MiB）。
-const SOCK_BUF_4MIB: usize = 4 * 1024 * 1024;
 /// XorShift64 传入零种子时的非零兜底初始态。
 const XORSHIFT64_FALLBACK_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
 

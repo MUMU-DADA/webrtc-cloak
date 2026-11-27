@@ -4,11 +4,11 @@ use super::lane_hunt::client_outer_hdr_len;
 use super::{
     alloc_token, log, make_udp_socket, record_client_media_bytes, schedule_mbb_timers,
     ClientConfig, ClientSession, HandshakeState, CLIENT_SRTCP_INIT_MAX_MS,
-    CLIENT_SRTCP_INIT_MIN_MS, MAX_DRAINING_SESSIONS, SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
+    CLIENT_SRTCP_INIT_MIN_MS, MAX_DRAINING_SESSIONS, TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
     unspecified_addr_for, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_PLAINTEXT_HDR_LEN,
-    TRICKLE_WINDOW_15S_SECS,
+    SOCK_BUF_8MIB, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     build_ice_stun_request, combine_session_key, derive_ice_migration_key, derive_stun_material,
@@ -290,7 +290,7 @@ pub(super) fn spawn_client_session(
     }
 
     let bind_any = unspecified_addr_for(cfg.server_addr);
-    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, SOCK_BUF_2MIB) {
+    let mut up = match make_udp_socket(bind_any, Some(cfg.server_addr), false, SOCK_BUF_8MIB) {
         Ok(s) => s,
         Err(e) => {
             log(worker_id, &format!("upstream socket error: {}", e));

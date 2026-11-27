@@ -8,7 +8,9 @@ mod worker_io;
 
 use self::registry::{SeenTxidCache, SharedV4Registry};
 use self::worker::run_server_worker;
-use crate::constants::{outer_udp_hdr_len, unspecified_addr_for, TRICKLE_RATE_15S_BYTES};
+use crate::constants::{
+    outer_udp_hdr_len, unspecified_addr_for, SOCK_BUF_4MIB, TRICKLE_RATE_15S_BYTES,
+};
 use crate::protocol::{
     build_dimpl_config_pool_for, detect_cpu_accel, rand_duration_range_ms, CipherPref, CipherSuite,
     DtlsMinVersion, RollingByteWindow, SrtpCloakCipher,
@@ -48,8 +50,6 @@ pub(super) const SERVER_SRTCP_INIT_MAX_MS: u64 = 750;
 pub(super) const SERVER_SRTCP_ACTIVE_MIN_MS: u64 = 950;
 /// 服务端活跃媒体传输期 SRTCP 最大发送间隔（毫秒）。
 pub(super) const SERVER_SRTCP_ACTIVE_MAX_MS: u64 = 1950;
-/// 服务端单会话后端 UDP 套接字收发内核缓冲大小（512 KiB）。
-const SOCK_BUF_512KIB: usize = 512 * 1024;
 /// `--wire-audit-file` 单次运行最多落盘的外层抓包记录条数。
 const WIRE_AUDIT_MAX_PACKETS: usize = 128;
 
@@ -249,7 +249,7 @@ pub(super) fn ensure_owned_backend(
 ) -> bool {
     if matches!(sess.backend, BackendPipe::Unbound) {
         let bind_any = unspecified_addr_for(backend_addr);
-        let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, SOCK_BUF_512KIB) {
+        let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, SOCK_BUF_4MIB) {
             Ok(s) => s,
             Err(e) => {
                 log(worker_id, &format!("backend socket error: {}", e));

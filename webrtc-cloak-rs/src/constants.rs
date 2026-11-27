@@ -66,7 +66,9 @@ pub const DTLS_IO_BUF_LEN: usize = 4096;
 pub const PROBE_IO_BUF_LEN: usize = 2048;
 /// 带内控制帧封装缓冲区大小（字节）。
 pub const CTRL_FRAME_BUF_LEN: usize = 256;
-/// 主监听套接字及压测套接字收发内核缓冲大小（8 MiB）。
+/// 服务端会话后端套接字及自测套接字收发内核缓冲大小（4 MiB）。
+pub const SOCK_BUF_4MIB: usize = 4 * 1024 * 1024;
+/// 主监听套接字、客户端上游套接字及压测套接字收发内核缓冲大小（8 MiB）。
 pub const SOCK_BUF_8MIB: usize = 8 * 1024 * 1024;
 /// `mio::Events` 单次 poll 事件数组容量。
 pub const MIO_EVENTS_CAP: usize = 256;

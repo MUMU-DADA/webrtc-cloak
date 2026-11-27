@@ -8,11 +8,11 @@ use super::{
     HandshakeState, OldPathDrain, ACTIVE_ROTATE_WINDOW_SECS, CLIENT_HANDOVER_MIN_RETRY_MS,
     CLIENT_MIG_ECHO_INTERVAL_MS, CLIENT_SRTCP_ACTIVE_MAX_MS, CLIENT_SRTCP_ACTIVE_MIN_MS,
     KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS, RECENT_ROTATION_DAMP_SECS,
-    SOCK_BUF_2MIB, TRICKLE_WINDOW_5MIN_SECS,
+    TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
     unspecified_addr_for, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS,
-    POST_BYE_CLOSING_DRAIN_MS, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
+    POST_BYE_CLOSING_DRAIN_MS, SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
     SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, SRTP_HANDOVER_MAGIC,
     SRTP_PATH_CHALLENGE_MAGIC, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
     WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
@@ -815,7 +815,7 @@ impl ClientWorker {
             }
             let bind_any = unspecified_addr_for(self.cfg.server_addr);
             let new_up =
-                match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_2MIB) {
+                match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB) {
                     Ok(s) => s,
                     Err(_) => continue,
                 };

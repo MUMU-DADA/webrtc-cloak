@@ -41,8 +41,6 @@ thread_local! {
     pub(super) static CLIENT_QUIET: Cell<bool> = const { Cell::new(false) };
 }
 
-/// 客户端单会话上游 UDP 套接字收发内核缓冲大小（2 MiB）。
-pub(super) const SOCK_BUF_2MIB: usize = 2 * 1024 * 1024;
 /// 单个工作线程允许保留的静默引流套接字数量上限，防止持续黑洞泄露文件描述符。
 pub(super) const MAX_DRAINING_SESSIONS: usize = 16;
 /// 判定会话近期活跃并允许触发自动轮换/迁移/快连的时间窗口（秒）。

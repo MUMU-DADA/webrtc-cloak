@@ -206,6 +206,8 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Session Socket Burst-Buffer Sizing (`v0.4.7`, 100% wire-compatible with `v0.4.x`)**:
+            - Raised server per-session `backend_sock` kernel buffer ceiling from `512 KiB` to `4 MiB` and client upstream `up_sock` ceiling from `2 MiB` to `8 MiB` (matching `listen_sock`), eliminating `Udp: RcvbufErrors` during sub-vCPU hypervisor scheduling pauses and multi-hop L4 relay micro-bursts with zero idle RSS increase
           - **Opt-In Linux UDP Batch I/O (`--udp-batch <0|2..64>`, `v0.4.6`, 100% wire-compatible with `v0.4.x`)**:
             - Disabled by default (`--udp-batch 0`, zero extra buffer allocation, preserves exact single-packet path and ~2 MiB router footprint)
             - When enabled on Linux (e.g. `--udp-batch 32`), accelerates all four hot loops (server/client uplink & downlink) with pre-allocated zero-copy `recvmmsg` / `sendmmsg` batching across IPv4 and IPv6, slashing syscall and KVM VM-exit/KPTI overhead by an order of magnitude while keeping strict control-frame ordering and exact byte/packet telemetry; non-Linux platforms safely fall back to single-packet I/O
