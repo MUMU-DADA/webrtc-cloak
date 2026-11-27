@@ -17,8 +17,8 @@ use crate::client::{
     DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
 };
 use crate::constants::{
-    normalize_udp_batch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_UDP_BATCH,
-    DEFAULT_WAN_MTU,
+    normalize_udp_batch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS,
+    DEFAULT_UDP_BATCH, DEFAULT_WAN_MTU,
 };
 use crate::protocol::{
     detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,

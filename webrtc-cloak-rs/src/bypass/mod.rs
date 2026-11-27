@@ -7,9 +7,9 @@
 //! - **应答端（`webrtc-cloak bypass --responder`）**：超轻量纯认证 ICE STUN 应答器（无 DTLS/证书池开销），
 //!   配合出口防火墙按 RFC 7983 首字节将 `0x0001` STUN 探测包旁路分流至此应答，使 99.999% 业务包直入后端服务并保留内核 `UDP GSO`。
 
-mod worker;
 #[cfg(test)]
 mod tests;
+mod worker;
 
 use self::worker::run_bypass_worker;
 use crate::client::LaneHuntConfig;

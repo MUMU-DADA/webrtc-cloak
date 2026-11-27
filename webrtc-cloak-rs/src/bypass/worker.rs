@@ -118,7 +118,14 @@ struct BypassHunt {
     round_deadline: Instant,
     early_settle_at: Option<Instant>,
     candidates: Vec<HuntCandidate>,
-    best: Option<(MioUdpSocket, Token, u16, SessionIceParams, f64, Option<SocketAddr>)>,
+    best: Option<(
+        MioUdpSocket,
+        Token,
+        u16,
+        SessionIceParams,
+        f64,
+        Option<SocketAddr>,
+    )>,
     total_probed: usize,
 }
 
@@ -394,7 +401,9 @@ impl BypassWorker {
             1
         } else if is_cold {
             let needed = COLD_MIN_PROBES.div_ceil(probes.max(1));
-            needed.max(COLD_CALIBRATION_ROUNDS).min(lh.max_rounds.max(2))
+            needed
+                .max(COLD_CALIBRATION_ROUNDS)
+                .min(lh.max_rounds.max(2))
         } else {
             1
         };
@@ -499,7 +508,13 @@ impl BypassWorker {
         }
     }
 
-    fn push_old_drain(&mut self, old_tok: Token, old_sock: MioUdpSocket, client_addr: SocketAddr, now: Instant) {
+    fn push_old_drain(
+        &mut self,
+        old_tok: Token,
+        old_sock: MioUdpSocket,
+        client_addr: SocketAddr,
+        now: Instant,
+    ) {
         while self.old_drains.len() >= MAX_OLD_DRAINS {
             if let Some(evict_tok) = self.drain_order.pop_front() {
                 if let Some(mut d) = self.old_drains.remove(&evict_tok) {
@@ -579,7 +594,8 @@ impl BypassWorker {
         // Immediate non-blocking bind so the very first inner packet experiences 0ms wait;
         // if lane-hunting is enabled, upgrade to a hunted fast lane in the background!
         let bind_any = unspecified_addr_for(self.cfg.server_addr);
-        let mut up = make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB).ok()?;
+        let mut up =
+            make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB).ok()?;
         let local_port = up.local_addr().map(|a| a.port()).unwrap_or(0);
         let tok = alloc_token(&mut self.next_token_id);
         if self
@@ -795,7 +811,11 @@ impl BypassWorker {
                 self.process_session_stun(tok, &sf, now);
                 continue;
             }
-            if self.listen_sock.send_to(&self.rbuf[..n], client_addr).is_ok() {
+            if self
+                .listen_sock
+                .send_to(&self.rbuf[..n], client_addr)
+                .is_ok()
+            {
                 if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
                     s.rx_pkts = s.rx_pkts.saturating_add(1);
                     s.rx_bytes = s.rx_bytes.saturating_add(n as u64);
@@ -815,7 +835,11 @@ impl BypassWorker {
             if n == 0 || is_stun_wire_packet(&self.rbuf[..n]) {
                 continue;
             }
-            if self.listen_sock.send_to(&self.rbuf[..n], client_addr).is_ok() {
+            if self
+                .listen_sock
+                .send_to(&self.rbuf[..n], client_addr)
+                .is_ok()
+            {
                 if let Some(&active_tok) = self.tok_by_client.get(&client_addr) {
                     if let Some(s) = self.sessions_by_tok.get_mut(&active_tok) {
                         s.rx_pkts = s.rx_pkts.saturating_add(1);
@@ -926,16 +950,15 @@ impl BypassWorker {
                     TRIAL_DEGRADE_CONSECUTIVE
                 };
                 if s.degrade_streak >= needed && self.cfg.lane_hunt.enabled {
-                    let cd_secs = if !s.lane_confirmed
-                        && self.trial_fail_streak < MAX_FAST_TRIAL_RETRIES
-                    {
-                        self.cfg
-                            .lane_hunt
-                            .degrade_cooldown_secs
-                            .min(TRIAL_FAIL_COOLDOWN_SECS)
-                    } else {
-                        self.cfg.lane_hunt.degrade_cooldown_secs
-                    };
+                    let cd_secs =
+                        if !s.lane_confirmed && self.trial_fail_streak < MAX_FAST_TRIAL_RETRIES {
+                            self.cfg
+                                .lane_hunt
+                                .degrade_cooldown_secs
+                                .min(TRIAL_FAIL_COOLDOWN_SECS)
+                        } else {
+                            self.cfg.lane_hunt.degrade_cooldown_secs
+                        };
                     let cd_ok = s
                         .last_hunt_at
                         .map(|t| now.saturating_duration_since(t) >= Duration::from_secs(cd_secs))
@@ -979,8 +1002,7 @@ impl BypassWorker {
                             pw.rtt_ms =
                                 now.saturating_duration_since(sent_at).as_secs_f64() * 1000.0;
                             pw.pending_txid = None;
-                            pw.next_refresh_at =
-                                now + Duration::from_millis(PREWARM_KEEP_FRESH_MS);
+                            pw.next_refresh_at = now + Duration::from_millis(PREWARM_KEEP_FRESH_MS);
                             if parsed.xor_mapped.is_some() {
                                 pw.mapped_nat = parsed.xor_mapped;
                             }
@@ -1010,9 +1032,8 @@ impl BypassWorker {
                                     && parsed.txid == c.txid
                                 {
                                     if let Some(sent) = c.sent_at {
-                                        let rtt =
-                                            now.saturating_duration_since(sent).as_secs_f64()
-                                                * 1000.0;
+                                        let rtt = now.saturating_duration_since(sent).as_secs_f64()
+                                            * 1000.0;
                                         c.rtt_ms = Some(rtt);
                                         c.mapped_nat = parsed.xor_mapped;
                                         matched = Some((rtt, parsed.xor_mapped));
@@ -1081,11 +1102,7 @@ impl BypassWorker {
 
     fn harvest_round_best(&mut self, hunt: &mut BypassHunt) {
         let mut best_idx: Option<usize> = None;
-        let mut best_rtt = hunt
-            .best
-            .as_ref()
-            .map(|b| b.4)
-            .unwrap_or(f64::INFINITY);
+        let mut best_rtt = hunt.best.as_ref().map(|b| b.4).unwrap_or(f64::INFINITY);
         for (i, c) in hunt.candidates.iter().enumerate() {
             if let Some(r) = c.rtt_ms {
                 if r < best_rtt {
@@ -1190,8 +1207,9 @@ impl BypassWorker {
                 };
                 let should_swap = match self.sessions_by_tok.get(&old_tok) {
                     Some(cur) => match hunt.reason {
-                        HuntReason::BlackholeEscape { .. }
-                        | HuntReason::ScheduledRotate { .. } => true,
+                        HuntReason::BlackholeEscape { .. } | HuntReason::ScheduledRotate { .. } => {
+                            true
+                        }
                         HuntReason::UpgradeInitial { .. } => cur
                             .rtt_ewma_ms
                             .map(|cur_rtt| win_rtt + 5.0 < cur_rtt)
@@ -1424,8 +1442,8 @@ impl BypassWorker {
                     if active_recently && rotate_client.is_none() && !hunt_busy {
                         rotate_client = Some(s.client_addr);
                     }
-                    s.next_rotate_at = (rot_iv_secs > 0)
-                        .then(|| now + jitter_duration_ms(rot_iv_secs * 1000));
+                    s.next_rotate_at =
+                        (rot_iv_secs > 0).then(|| now + jitter_duration_ms(rot_iv_secs * 1000));
                 }
             }
         }
@@ -1440,7 +1458,9 @@ impl BypassWorker {
                 self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(s.rx_pkts);
                 self.closed_auth_drops = self.closed_auth_drops.saturating_add(s.auth_drops);
             }
-            if self.sessions_by_tok.is_empty() && self.cfg.lane_hunt.enabled && self.prewarm.is_none()
+            if self.sessions_by_tok.is_empty()
+                && self.cfg.lane_hunt.enabled
+                && self.prewarm.is_none()
             {
                 self.next_prewarm_at = Some(now + Duration::from_secs(1));
             }
@@ -1489,8 +1509,7 @@ impl BypassWorker {
             }
         }
 
-        if self.telemetry.is_some()
-            && now.duration_since(self.last_telemetry) >= self.telemetry_dur
+        if self.telemetry.is_some() && now.duration_since(self.last_telemetry) >= self.telemetry_dur
         {
             self.last_telemetry = now;
             self.push_telemetry_snapshot();

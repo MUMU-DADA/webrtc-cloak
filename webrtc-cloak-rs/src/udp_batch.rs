@@ -151,7 +151,8 @@ impl UdpRecvBatch {
             for i in 0..count {
                 let flags = self.hdrs[i].msg_hdr.msg_flags;
                 let n = self.hdrs[i].msg_len as usize;
-                let addr = sockaddr_to_socket_addr(&self.addrs[i], self.hdrs[i].msg_hdr.msg_namelen);
+                let addr =
+                    sockaddr_to_socket_addr(&self.addrs[i], self.hdrs[i].msg_hdr.msg_namelen);
                 if (flags & libc::MSG_TRUNC) != 0 || n == 0 || n > self.slot_len || addr.is_none() {
                     self.lens[i] = 0;
                     self.peers[i] = None;
@@ -345,7 +346,10 @@ impl UdpSendBatch {
             for i in 0..n {
                 let start = i * self.slot_len;
                 if let Some(d) = self.dests[i] {
-                    if sock.send_to(&self.bufs[start..start + self.lens[i]], d).is_ok() {
+                    if sock
+                        .send_to(&self.bufs[start..start + self.lens[i]], d)
+                        .is_ok()
+                    {
                         sent += 1;
                         bytes = bytes.saturating_add(self.app_bytes[i]);
                     }
@@ -389,7 +393,8 @@ fn sockaddr_to_socket_addr(
         if (len as usize) < std::mem::size_of::<libc::sockaddr_in>() {
             return None;
         }
-        let sin = unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+        let sin =
+            unsafe { &*(storage as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
         let ip = Ipv4Addr::from(sin.sin_addr.s_addr.to_ne_bytes());
         let port = u16::from_be(sin.sin_port);
         Some(SocketAddr::V4(SocketAddrV4::new(ip, port)))
@@ -420,7 +425,8 @@ fn socket_addr_to_sockaddr(
     *storage = unsafe { std::mem::zeroed() };
     match addr.ip() {
         IpAddr::V4(v4) => {
-            let sin = unsafe { &mut *(storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
+            let sin =
+                unsafe { &mut *(storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in) };
             sin.sin_family = libc::AF_INET as libc::sa_family_t;
             sin.sin_port = addr.port().to_be();
             sin.sin_addr = libc::in_addr {
@@ -432,8 +438,9 @@ fn socket_addr_to_sockaddr(
             let SocketAddr::V6(sa6) = addr else {
                 unreachable!()
             };
-            let sin6 =
-                unsafe { &mut *(storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6) };
+            let sin6 = unsafe {
+                &mut *(storage as *mut libc::sockaddr_storage as *mut libc::sockaddr_in6)
+            };
             sin6.sin6_family = libc::AF_INET6 as libc::sa_family_t;
             sin6.sin6_port = sa6.port().to_be();
             sin6.sin6_flowinfo = sa6.flowinfo();

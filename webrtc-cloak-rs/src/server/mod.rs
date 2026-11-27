@@ -6,8 +6,8 @@ mod worker;
 mod worker_cmds;
 mod worker_io;
 
-pub(crate) use self::registry::{SeenTxidCache, TxidCheck};
 use self::registry::SharedV4Registry;
+pub(crate) use self::registry::{SeenTxidCache, TxidCheck};
 use self::worker::run_server_worker;
 use crate::constants::{
     outer_udp_hdr_len, unspecified_addr_for, SOCK_BUF_4MIB, TRICKLE_RATE_15S_BYTES,

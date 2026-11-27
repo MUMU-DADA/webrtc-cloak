@@ -142,10 +142,8 @@ impl ClientWorker {
                             if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
                                 sess.last_data_active = now;
                                 if let Some(slot) = tx_batch.next_slot_mut() {
-                                    if let Some(wn) = sess
-                                        .cipher
-                                        .as_mut()
-                                        .and_then(|c| c.wrap_into(pkt, slot))
+                                    if let Some(wn) =
+                                        sess.cipher.as_mut().and_then(|c| c.wrap_into(pkt, slot))
                                     {
                                         tx_batch.commit_slot(wn, pkt.len() as u64, None);
                                     }
@@ -184,146 +182,144 @@ impl ClientWorker {
     }
 
     fn dispatch_listen_packet(&mut self, n: usize, client_addr: SocketAddr, now: Instant) {
-            if n > MAX_INNER_UDP_LEN {
-                return;
-            }
+        if n > MAX_INNER_UDP_LEN {
+            return;
+        }
 
-            // If this client is inside the 80..350ms post-server-BYE reconnect jitter window,
-            // buffer arriving app packets so we never bypass the backoff and trigger ICMP bounce!
-            if let Some(pr) = self.pending_reconnects.get_mut(&client_addr) {
+        // If this client is inside the 80..350ms post-server-BYE reconnect jitter window,
+        // buffer arriving app packets so we never bypass the backoff and trigger ICMP bounce!
+        if let Some(pr) = self.pending_reconnects.get_mut(&client_addr) {
+            if n <= self.max_inner_pending
+                && pr.pending.len() < MAX_PENDING_PKTS
+                && pr.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+            {
+                pr.pending.push_back(self.rbuf[..n].to_vec());
+                pr.pending_bytes += n;
+            }
+            return;
+        }
+
+        // If existing session is in Closing/DrainingBeforeBye, detach it from self.token_by_client while
+        // letting its socket finish silent receive-only drain (zero ICMP Port Unreachable).
+        if let Some(&existing_tok) = self.token_by_client.get(&client_addr) {
+            if matches!(
+                self.sessions_by_token.get(&existing_tok).map(|s| s.state),
+                Some(HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_))
+            ) {
+                self.token_by_client.remove(&client_addr);
+            }
+        }
+
+        let tok = if let Some(&existing) = self.token_by_client.get(&client_addr) {
+            existing
+        } else if let Some(hid) = self.find_new_primary_hunt_id(client_addr) {
+            if let Some(hunt) = self.lane_hunts.get_mut(&hid) {
                 if n <= self.max_inner_pending
-                    && pr.pending.len() < MAX_PENDING_PKTS
-                    && pr.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                    && hunt.pending.len() < MAX_PENDING_PKTS
+                    && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
                 {
-                    pr.pending.push_back(self.rbuf[..n].to_vec());
-                    pr.pending_bytes += n;
-                }
-                return;
-            }
-
-            // If existing session is in Closing/DrainingBeforeBye, detach it from self.token_by_client while
-            // letting its socket finish silent receive-only drain (zero ICMP Port Unreachable).
-            if let Some(&existing_tok) = self.token_by_client.get(&client_addr) {
-                if matches!(
-                    self.sessions_by_token.get(&existing_tok).map(|s| s.state),
-                    Some(HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_))
-                ) {
-                    self.token_by_client.remove(&client_addr);
+                    hunt.pending.push_back(self.rbuf[..n].to_vec());
+                    hunt.pending_bytes += n;
                 }
             }
-
-            let tok = if let Some(&existing) = self.token_by_client.get(&client_addr) {
-                existing
-            } else if let Some(hid) = self.find_new_primary_hunt_id(client_addr) {
-                if let Some(hunt) = self.lane_hunts.get_mut(&hid) {
-                    if n <= self.max_inner_pending
-                        && hunt.pending.len() < MAX_PENDING_PKTS
-                        && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
-                    {
-                        hunt.pending.push_back(self.rbuf[..n].to_vec());
-                        hunt.pending_bytes += n;
-                    }
-                }
-                return;
-            } else if let Some(adopted) = self.try_adopt_prewarm(client_addr, now) {
-                adopted
+            return;
+        } else if let Some(adopted) = self.try_adopt_prewarm(client_addr, now) {
+            adopted
+        } else {
+            let recently_rotated = self
+                .last_rotation_by_client
+                .get(&client_addr)
+                .map(|&t| now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS))
+                .unwrap_or(false);
+            let ka_retries = if recently_rotated {
+                KA_MAX_RETRIES_DAMPED
             } else {
-                let recently_rotated = self
-                    .last_rotation_by_client
-                    .get(&client_addr)
-                    .map(|&t| {
-                        now.duration_since(t) < Duration::from_secs(RECENT_ROTATION_DAMP_SECS)
-                    })
-                    .unwrap_or(false);
-                let ka_retries = if recently_rotated {
-                    KA_MAX_RETRIES_DAMPED
-                } else {
-                    KA_MAX_RETRIES
-                };
-                if self.cfg.lane_hunt.enabled {
-                    // 若启动预热抽卡正在进行中，直接将其就地升级为当前客户端的主抽卡并缓存首包（零浪费套接字）
-                    if let Some(pw_id) = self.find_prewarm_hunt_id() {
-                        if let Some(hunt) = self.lane_hunts.get_mut(&pw_id) {
-                            hunt.purpose = HuntPurpose::NewPrimary {
-                                client_addr,
-                                ka_max_retries: ka_retries,
-                            };
-                            if n <= self.max_inner_pending
-                                && hunt.pending.len() < MAX_PENDING_PKTS
-                                && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
-                            {
-                                hunt.pending.push_back(self.rbuf[..n].to_vec());
-                                hunt.pending_bytes += n;
-                            }
-                            return;
-                        }
-                    }
-                    let mut init_pending = VecDeque::with_capacity(16);
-                    let mut init_bytes = 0usize;
-                    if n <= self.max_inner_pending {
-                        init_pending.push_back(self.rbuf[..n].to_vec());
-                        init_bytes = n;
-                    }
-                    if self.start_lane_hunt(
-                        HuntPurpose::NewPrimary {
+                KA_MAX_RETRIES
+            };
+            if self.cfg.lane_hunt.enabled {
+                // 若启动预热抽卡正在进行中，直接将其就地升级为当前客户端的主抽卡并缓存首包（零浪费套接字）
+                if let Some(pw_id) = self.find_prewarm_hunt_id() {
+                    if let Some(hunt) = self.lane_hunts.get_mut(&pw_id) {
+                        hunt.purpose = HuntPurpose::NewPrimary {
                             client_addr,
                             ka_max_retries: ka_retries,
-                        },
-                        now,
-                        init_pending,
-                        init_bytes,
-                    ) {
+                        };
+                        if n <= self.max_inner_pending
+                            && hunt.pending.len() < MAX_PENDING_PKTS
+                            && hunt.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                        {
+                            hunt.pending.push_back(self.rbuf[..n].to_vec());
+                            hunt.pending_bytes += n;
+                        }
                         return;
                     }
                 }
-                match spawn_client_session(
-                    self.worker_id,
-                    client_addr,
-                    &self.cfg,
-                    &mut self.poll,
-                    &mut self.sessions_by_token,
-                    &mut self.token_by_client,
-                    &mut self.standby_by_client,
-                    &mut self.next_token_id,
-                    &mut self.dtls_buf,
-                    now,
-                    self.retry_dur,
-                    self.ka_base_ms,
-                    self.idle_dur,
-                    ka_retries,
-                    None,
-                ) {
-                    Some(t) => t,
-                    None => return,
+                let mut init_pending = VecDeque::with_capacity(16);
+                let mut init_bytes = 0usize;
+                if n <= self.max_inner_pending {
+                    init_pending.push_back(self.rbuf[..n].to_vec());
+                    init_bytes = n;
                 }
-            };
-
-            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                sess.last_data_active = now;
-                if sess.state != HandshakeState::Ready {
-                    if n <= self.max_inner_pending
-                        && sess.pending.len() < MAX_PENDING_PKTS
-                        && sess.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
-                    {
-                        sess.pending.push_back(self.rbuf[..n].to_vec());
-                        sess.pending_bytes += n;
-                    }
-                } else {
-                    let mut sent_ok = false;
-                    if let Some(ref mut cipher) = sess.cipher {
-                        if let Some(wn) = cipher.wrap_into(&self.rbuf[..n], &mut self.wbuf) {
-                            if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
-                                sess.tx_pkts += 1;
-                                sess.tx_bytes += n as u64;
-                                sent_ok = true;
-                            }
-                        }
-                    }
-                    if sent_ok {
-                        record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, n as u64);
-                    }
+                if self.start_lane_hunt(
+                    HuntPurpose::NewPrimary {
+                        client_addr,
+                        ka_max_retries: ka_retries,
+                    },
+                    now,
+                    init_pending,
+                    init_bytes,
+                ) {
+                    return;
                 }
             }
+            match spawn_client_session(
+                self.worker_id,
+                client_addr,
+                &self.cfg,
+                &mut self.poll,
+                &mut self.sessions_by_token,
+                &mut self.token_by_client,
+                &mut self.standby_by_client,
+                &mut self.next_token_id,
+                &mut self.dtls_buf,
+                now,
+                self.retry_dur,
+                self.ka_base_ms,
+                self.idle_dur,
+                ka_retries,
+                None,
+            ) {
+                Some(t) => t,
+                None => return,
+            }
+        };
+
+        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+            sess.last_data_active = now;
+            if sess.state != HandshakeState::Ready {
+                if n <= self.max_inner_pending
+                    && sess.pending.len() < MAX_PENDING_PKTS
+                    && sess.pending_bytes.saturating_add(n) <= MAX_PENDING_BYTES
+                {
+                    sess.pending.push_back(self.rbuf[..n].to_vec());
+                    sess.pending_bytes += n;
+                }
+            } else {
+                let mut sent_ok = false;
+                if let Some(ref mut cipher) = sess.cipher {
+                    if let Some(wn) = cipher.wrap_into(&self.rbuf[..n], &mut self.wbuf) {
+                        if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                            sess.tx_pkts += 1;
+                            sess.tx_bytes += n as u64;
+                            sent_ok = true;
+                        }
+                    }
+                }
+                if sent_ok {
+                    record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, n as u64);
+                }
+            }
+        }
     }
 
     pub(super) fn handle_old_path_drain(
@@ -618,457 +614,422 @@ impl ClientWorker {
             return;
         };
         let pkt = &self.rbuf[..n];
-                if matches!(
-                    sess.state,
-                    HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_)
-                ) {
-                    // Make-Before-Break silent receive-only drain: deliver authenticated in-flight
-                    // downlink SRTP to local app while transmitting ZERO WAN packets until delayed BYE.
-                    match demux_rfc7983(pkt) {
-                        PacketKind::Srtp => {
-                            if let Some(ref mut cipher) = sess.cipher {
-                                if let Some(pn) = cipher.unwrap_into(pkt, &mut self.wbuf) {
-                                    if self
-                                        .listen_sock
-                                        .send_to(&self.wbuf[..pn], sess.client_addr)
-                                        .is_ok()
-                                    {
-                                        sess.rx_pkts += 1;
-                                        sess.rx_bytes += pn as u64;
-                                    }
-                                }
+        if matches!(
+            sess.state,
+            HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_)
+        ) {
+            // Make-Before-Break silent receive-only drain: deliver authenticated in-flight
+            // downlink SRTP to local app while transmitting ZERO WAN packets until delayed BYE.
+            match demux_rfc7983(pkt) {
+                PacketKind::Srtp => {
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if let Some(pn) = cipher.unwrap_into(pkt, &mut self.wbuf) {
+                            if self
+                                .listen_sock
+                                .send_to(&self.wbuf[..pn], sess.client_addr)
+                                .is_ok()
+                            {
+                                sess.rx_pkts += 1;
+                                sess.rx_bytes += pn as u64;
                             }
                         }
-                        PacketKind::Srtcp
-                            if matches!(sess.state, HandshakeState::DrainingBeforeBye(_)) =>
-                        {
-                            if let Some(ref mut cipher) = sess.cipher {
-                                if let Some(has_bye) = cipher.verify_srtcp(pkt) {
-                                    sess.srtcp_rx += 1;
-                                    if has_bye {
-                                        sess.state = HandshakeState::Closing(
-                                            now + Duration::from_millis(CLOSING_DRAIN_MS),
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
+                }
+                PacketKind::Srtcp if matches!(sess.state, HandshakeState::DrainingBeforeBye(_)) => {
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if let Some(has_bye) = cipher.verify_srtcp(pkt) {
+                            sess.srtcp_rx += 1;
+                            if has_bye {
+                                sess.state = HandshakeState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                );
+                            }
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+
+        match demux_rfc7983(pkt) {
+            PacketKind::Stun => {
+                if sess.state == HandshakeState::Migrating {
+                    // V4 1-RTT ICE migration STUN Success signed with per-session mi_key_mig
+                    if let Some(mk) = sess.mi_key_mig {
+                        if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &mk) {
+                            if parsed.authenticated
+                                && parsed.msg_type == STUN_BINDING_SUCCESS
+                                && sess.mig_txid == Some(parsed.txid)
+                            {
+                                // Valid STUN reply; paired 0xFFFD challenge arrives in same flight
+                                return;
+                            }
+                        }
+                    }
+                    sess.auth_drops += 1;
                     return;
                 }
-
-                match demux_rfc7983(pkt) {
-                    PacketKind::Stun => {
-                        if sess.state == HandshakeState::Migrating {
-                            // V4 1-RTT ICE migration STUN Success signed with per-session mi_key_mig
-                            if let Some(mk) = sess.mi_key_mig {
-                                if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &mk) {
-                                    if parsed.authenticated
-                                        && parsed.msg_type == STUN_BINDING_SUCCESS
-                                        && sess.mig_txid == Some(parsed.txid)
-                                    {
-                                        // Valid STUN reply; paired 0xFFFD challenge arrives in same flight
-                                        return;
-                                    }
-                                }
+                if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key) {
+                    if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
+                        if sess.state == HandshakeState::StunWait && parsed.txid == sess.stun_txid {
+                            let rtt_ms = sess.created_at.elapsed().as_secs_f64() * 1000.0;
+                            if let Some(ref th) = self.telemetry {
+                                th.record_stun_ok(
+                                    rtt_ms,
+                                    sess.retries.min(255) as u8,
+                                    parsed.xor_mapped,
+                                );
                             }
-                            sess.auth_drops += 1;
-                            return;
-                        }
-                        if let Some(parsed) =
-                            parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key)
-                        {
-                            if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
-                                if sess.state == HandshakeState::StunWait
-                                    && parsed.txid == sess.stun_txid
-                                {
-                                    let rtt_ms = sess.created_at.elapsed().as_secs_f64() * 1000.0;
-                                    if let Some(ref th) = self.telemetry {
-                                        th.record_stun_ok(
-                                            rtt_ms,
-                                            sess.retries.min(255) as u8,
-                                            parsed.xor_mapped,
-                                        );
-                                    }
-                                    let uname = sess.ice.username();
-                                    let (stun_key, s_c2s, s_s2c) = derive_stun_material(
-                                        &self.cfg.psk,
-                                        &sess.stun_txid,
-                                        &uname,
-                                    );
-                                    sess.stun_key = Some(stun_key);
-                                    sess.ssrc_c2s = s_c2s;
-                                    sess.ssrc_s2c = s_s2c;
-                                    let mapped_s = parsed
-                                        .xor_mapped
-                                        .map(|a| a.to_string())
-                                        .unwrap_or_else(|| "unknown".into());
-                                    log(
+                            let uname = sess.ice.username();
+                            let (stun_key, s_c2s, s_s2c) =
+                                derive_stun_material(&self.cfg.psk, &sess.stun_txid, &uname);
+                            sess.stun_key = Some(stun_key);
+                            sess.ssrc_c2s = s_c2s;
+                            sess.ssrc_s2c = s_s2c;
+                            let mapped_s = parsed
+                                .xor_mapped
+                                .map(|a| a.to_string())
+                                .unwrap_or_else(|| "unknown".into());
+                            log(
                                     self.worker_id,
                                     &format!(
                                         "ICE STUN OK up_sport={} rtt={:.2}ms mapped={} ssrc_tx=0x{:08x} ssrc_rx=0x{:08x}",
                                         sess.local_port, rtt_ms, mapped_s, s_c2s, s_s2c
                                     ),
                                 );
-                                    sess.cached_initial_stun = Vec::new();
-                                    if self.cfg.dtls_decoy {
-                                        let cert = self.cert_cache.get(now);
-                                        let mut dtls = Box::new(new_dtls_instance(
-                                            self.cfg.dtls_min_version,
-                                            self.dtls_pool.pick(),
-                                            cert,
-                                            now,
-                                        ));
-                                        dtls.set_active(true);
-                                        let _ = dtls.handle_timeout(now);
-                                        sess.dtls = Some(dtls);
-                                        sess.state = HandshakeState::DtlsHandshake;
-                                        let _ = drain_client_dtls(
-                                            self.worker_id,
-                                            sess,
-                                            &mut self.dtls_buf,
-                                            &mut self.wbuf,
-                                            &self.cfg,
-                                            &self.cpu,
-                                            now,
-                                            None,
-                                        );
-                                    } else {
-                                        let chosen = resolve_srtp_suite(
-                                            self.cfg.cipher_pref,
-                                            None,
-                                            &self.cpu,
-                                            true,
-                                        );
-                                        let final_key = combine_session_key(&stun_key, None);
-                                        sess.session_key = Some(final_key);
-                                        sess.mi_key_mig =
-                                            Some(derive_ice_migration_key(&final_key));
-                                        sess.active_cipher = Some(chosen);
-                                        let mut c = SrtpCloakCipher::new(
-                                            &final_key, s_c2s, s_s2c, true, chosen,
-                                        );
-                                        c.set_wan_mtu_for(
-                                            self.cfg.wan_mtu,
-                                            client_outer_hdr_len(self.cfg.server_addr),
-                                        );
-                                        sess.cipher = Some(c);
-                                        sess.state = HandshakeState::Ready;
-                                        sess.ready_at = Some(now);
-                                        sess.last_data_active = now;
-                                        sess.last_active_burst = now;
-                                        sess.rate_15s = RollingByteWindow::new(
-                                            now,
-                                            Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
-                                        );
-                                        sess.rate_5min = RollingByteWindow::new(
-                                            now,
-                                            Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS),
-                                        );
-                                        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
-                                        sess.ka_txid = None;
-                                        sess.ka_pkt.clear();
-                                        sess.ka_retries = 0;
-                                        sess.ka_rto_at = None;
-                                        sess.next_keepalive_at =
-                                            now + jitter_duration_ms(self.ka_base_ms);
-                                        sess.next_srtcp_at = now
-                                            + rand_duration_range_ms(
-                                                CLIENT_SRTCP_INIT_MIN_MS,
-                                                CLIENT_SRTCP_INIT_MAX_MS,
-                                            );
-                                        schedule_mbb_timers(sess, &self.cfg, now);
-                                        if sess.is_standby {
-                                            standby_ready.push((tok, sess.client_addr));
-                                        }
-                                        let mut flushed = 0usize;
-                                        let mut flushed_bytes = 0u64;
-                                        sess.pending_bytes = 0;
-                                        if let Some(ref mut cipher) = sess.cipher {
-                                            while let Some(raw) = sess.pending.pop_front() {
-                                                if let Some(wn) =
-                                                    cipher.wrap_into(&raw, &mut self.wbuf)
-                                                {
-                                                    if sess.upstream.send(&self.wbuf[..wn]).is_ok()
-                                                    {
-                                                        sess.tx_pkts += 1;
-                                                        sess.tx_bytes += raw.len() as u64;
-                                                        flushed_bytes = flushed_bytes
-                                                            .saturating_add(raw.len() as u64);
-                                                        flushed += 1;
-                                                    }
-                                                }
+                            sess.cached_initial_stun = Vec::new();
+                            if self.cfg.dtls_decoy {
+                                let cert = self.cert_cache.get(now);
+                                let mut dtls = Box::new(new_dtls_instance(
+                                    self.cfg.dtls_min_version,
+                                    self.dtls_pool.pick(),
+                                    cert,
+                                    now,
+                                ));
+                                dtls.set_active(true);
+                                let _ = dtls.handle_timeout(now);
+                                sess.dtls = Some(dtls);
+                                sess.state = HandshakeState::DtlsHandshake;
+                                let _ = drain_client_dtls(
+                                    self.worker_id,
+                                    sess,
+                                    &mut self.dtls_buf,
+                                    &mut self.wbuf,
+                                    &self.cfg,
+                                    &self.cpu,
+                                    now,
+                                    None,
+                                );
+                            } else {
+                                let chosen =
+                                    resolve_srtp_suite(self.cfg.cipher_pref, None, &self.cpu, true);
+                                let final_key = combine_session_key(&stun_key, None);
+                                sess.session_key = Some(final_key);
+                                sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
+                                sess.active_cipher = Some(chosen);
+                                let mut c =
+                                    SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, chosen);
+                                c.set_wan_mtu_for(
+                                    self.cfg.wan_mtu,
+                                    client_outer_hdr_len(self.cfg.server_addr),
+                                );
+                                sess.cipher = Some(c);
+                                sess.state = HandshakeState::Ready;
+                                sess.ready_at = Some(now);
+                                sess.last_data_active = now;
+                                sess.last_active_burst = now;
+                                sess.rate_15s = RollingByteWindow::new(
+                                    now,
+                                    Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
+                                );
+                                sess.rate_5min = RollingByteWindow::new(
+                                    now,
+                                    Duration::from_secs(TRICKLE_WINDOW_5MIN_SECS),
+                                );
+                                sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
+                                sess.ka_txid = None;
+                                sess.ka_pkt.clear();
+                                sess.ka_retries = 0;
+                                sess.ka_rto_at = None;
+                                sess.next_keepalive_at = now + jitter_duration_ms(self.ka_base_ms);
+                                sess.next_srtcp_at = now
+                                    + rand_duration_range_ms(
+                                        CLIENT_SRTCP_INIT_MIN_MS,
+                                        CLIENT_SRTCP_INIT_MAX_MS,
+                                    );
+                                schedule_mbb_timers(sess, &self.cfg, now);
+                                if sess.is_standby {
+                                    standby_ready.push((tok, sess.client_addr));
+                                }
+                                let mut flushed = 0usize;
+                                let mut flushed_bytes = 0u64;
+                                sess.pending_bytes = 0;
+                                if let Some(ref mut cipher) = sess.cipher {
+                                    while let Some(raw) = sess.pending.pop_front() {
+                                        if let Some(wn) = cipher.wrap_into(&raw, &mut self.wbuf) {
+                                            if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                                                sess.tx_pkts += 1;
+                                                sess.tx_bytes += raw.len() as u64;
+                                                flushed_bytes =
+                                                    flushed_bytes.saturating_add(raw.len() as u64);
+                                                flushed += 1;
                                             }
                                         }
-                                        if flushed_bytes > 0 {
-                                            record_client_media_bytes(
-                                                sess,
-                                                &self.cfg,
-                                                self.ka_base_ms,
-                                                now,
-                                                flushed_bytes,
-                                            );
-                                        }
-                                        log(
-                                        self.worker_id,
-                                        &format!(
-                                            "session READY (no-dtls) up_sport={} cipher={} flushed={}",
-                                            sess.local_port,
-                                            chosen.name(),
-                                            flushed
-                                        ),
-                                    );
-                                    }
-                                } else if sess.state == HandshakeState::Ready
-                                    && sess.ka_txid == Some(parsed.txid)
-                                {
-                                    let ka_rtt = sess
-                                        .ka_sent_at
-                                        .map(|t| {
-                                            now.saturating_duration_since(t).as_secs_f64() * 1000.0
-                                        })
-                                        .unwrap_or(0.0);
-                                    let ka_retries_before_ok = sess.ka_retries;
-                                    if ka_rtt > 0.0 {
-                                        *ka_sample = Some((ka_rtt, ka_retries_before_ok));
-                                    }
-                                    if let Some(ref th) = self.telemetry {
-                                        th.record_stun_ok(
-                                            ka_rtt,
-                                            ka_retries_before_ok,
-                                            parsed.xor_mapped,
-                                        );
-                                    }
-                                    sess.keepalives_ok += 1;
-                                    sess.ka_txid = None;
-                                    sess.ka_pkt.clear();
-                                    sess.ka_retries = 0;
-                                    sess.ka_sent_at = None;
-                                    sess.ka_rto_at = None;
-                                    let in_trickle = is_client_in_trickle(sess, now);
-                                    sess.next_keepalive_at = now
-                                        + if in_trickle
-                                            && self.cfg.keepalive_secs >= TRICKLE_KA_ENABLE_MIN_SECS
-                                            && self.cfg.keepalive_secs < TRICKLE_KA_ENABLE_MAX_SECS
-                                        {
-                                            // Conservative trickle STUN backoff (10-14s, safely below 20-30s CGNAT & 45s server consent)
-                                            rand_duration_range_ms(
-                                                TRICKLE_KA_MIN_MS,
-                                                TRICKLE_KA_MAX_MS,
-                                            )
-                                        } else {
-                                            jitter_duration_ms(self.ka_base_ms)
-                                        };
-                                }
-                            } else {
-                                sess.auth_drops += 1;
-                            }
-                        } else {
-                            sess.auth_drops += 1;
-                        }
-                    }
-                    PacketKind::Dtls => {
-                        // V3.2: strict DTLS pre-validation + Ready gating + Fail-Fast reset in DtlsHandshake
-                        let ready_only_alert = matches!(
-                            sess.state,
-                            HandshakeState::Ready
-                                | HandshakeState::HandoverWait
-                                | HandshakeState::Migrating
-                        ) && sess
-                            .ready_at
-                            .map(|r| {
-                                now.duration_since(r)
-                                    > Duration::from_secs(DTLS_READY_ALERT_ONLY_GRACE_SECS)
-                            })
-                            .unwrap_or(false);
-                        if !validate_dtls_datagram(pkt, ready_only_alert) {
-                            sess.auth_drops += 1;
-                            return;
-                        }
-                        let candidate_sh = if sess.state == HandshakeState::DtlsHandshake {
-                            extract_dtls_server_hello_suite(pkt)
-                        } else {
-                            None
-                        };
-                        let mut dtls_err = false;
-                        if let Some(ref mut dtls) = sess.dtls {
-                            if sess.dtls_next_timeout.map(|t| now >= t).unwrap_or(false) {
-                                let _ = dtls.handle_timeout(now);
-                            }
-                            if dtls.handle_packet(pkt).is_err() {
-                                dtls_err = true;
-                            }
-                        } else {
-                            sess.auth_drops += 1;
-                            return;
-                        }
-                        if dtls_err {
-                            sess.auth_drops += 1;
-                            if matches!(
-                                sess.state,
-                                HandshakeState::Ready
-                                    | HandshakeState::HandoverWait
-                                    | HandshakeState::Migrating
-                            ) {
-                                // Keep established SRTP tunnel alive; drop corrupted DTLS handle only
-                                sess.dtls = None;
-                                sess.dtls_next_timeout = None;
-                            } else if sess.state == HandshakeState::DtlsHandshake {
-                                // P0-4: dimpl Err during handshake means transcript/state is fatally poisoned.
-                                // Fail-fast reset (up to MAX_DTLS_RESETS) instead of stalling 12s!
-                                if sess.dtls_resets < MAX_DTLS_RESETS {
-                                    sess.dtls_resets += 1;
-                                    sess.pending_sh_suite = None;
-                                    sess.dtls_suite_id = None;
-                                    sess.dtls_km = None;
-                                    let cert = self.cert_cache.get(now);
-                                    let mut fresh = Box::new(new_dtls_instance(
-                                        self.cfg.dtls_min_version,
-                                        self.dtls_pool.pick(),
-                                        cert,
-                                        now,
-                                    ));
-                                    fresh.set_active(true);
-                                    let _ = fresh.handle_timeout(now);
-                                    sess.dtls = Some(fresh);
-                                    let _ = drain_client_dtls(
-                                        self.worker_id,
-                                        sess,
-                                        &mut self.dtls_buf,
-                                        &mut self.wbuf,
-                                        &self.cfg,
-                                        &self.cpu,
-                                        now,
-                                        None,
-                                    );
-                                } else {
-                                    sess.state = HandshakeState::Closing(
-                                        now + Duration::from_millis(CLOSING_DRAIN_MS),
-                                    );
-                                }
-                            }
-                            return;
-                        }
-                        let was_ready = sess.state == HandshakeState::Ready;
-                        if drain_client_dtls(
-                            self.worker_id,
-                            sess,
-                            &mut self.dtls_buf,
-                            &mut self.wbuf,
-                            &self.cfg,
-                            &self.cpu,
-                            now,
-                            candidate_sh,
-                        ) {
-                            let active_recently = now.duration_since(sess.last_data_active)
-                                <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
-                            sess.state = HandshakeState::Closing(
-                                now + Duration::from_millis(CLOSING_DRAIN_MS),
-                            );
-                            if was_ready && !sess.is_standby && !sess.is_prewarm && active_recently
-                            {
-                                graceful_reconnects.push((tok, sess.client_addr));
-                            }
-                        } else if !was_ready
-                            && sess.state == HandshakeState::Ready
-                            && sess.is_standby
-                        {
-                            standby_ready.push((tok, sess.client_addr));
-                        }
-                    }
-                    PacketKind::Srtcp => {
-                        // P1-5 fix: Also accept authenticated SRTCP (esp. server SIGTERM BYE) during HandoverWait/Migrating!
-                        if matches!(
-                            sess.state,
-                            HandshakeState::Ready
-                                | HandshakeState::HandoverWait
-                                | HandshakeState::Migrating
-                        ) {
-                            if let Some(ref mut cipher) = sess.cipher {
-                                if let Some(has_bye) = cipher.verify_srtcp(pkt) {
-                                    sess.srtcp_rx += 1;
-                                    if has_bye {
-                                        let active_recently = now
-                                            .duration_since(sess.last_data_active)
-                                            <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
-                                        sess.state = HandshakeState::Closing(
-                                            now + Duration::from_millis(CLOSING_DRAIN_MS),
-                                        );
-                                        if !sess.is_standby && !sess.is_prewarm && active_recently {
-                                            graceful_reconnects.push((tok, sess.client_addr));
-                                        }
-                                    }
-                                } else {
-                                    sess.auth_drops += 1;
-                                }
-                            }
-                        } else {
-                            sess.auth_drops += 1;
-                        }
-                    }
-                    PacketKind::Srtp => {
-                        if matches!(
-                            sess.state,
-                            HandshakeState::Ready
-                                | HandshakeState::HandoverWait
-                                | HandshakeState::Migrating
-                        ) {
-                            let mut rx_ok_bytes = 0u64;
-                            let frame = sess
-                                .cipher
-                                .as_mut()
-                                .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf));
-                            match frame {
-                                Some(SrtpFrame::Data(pn)) => {
-                                    sess.last_data_active = now;
-                                    if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0
-                                    {
-                                        sess.mig_echo_left = 0;
-                                        sess.mig_echo_payload = None;
-                                        sess.mig_echo_next_at = None;
-                                    }
-                                    if self
-                                        .listen_sock
-                                        .send_to(&self.wbuf[..pn], sess.client_addr)
-                                        .is_ok()
-                                    {
-                                        sess.rx_pkts += 1;
-                                        sess.rx_bytes += pn as u64;
-                                        rx_ok_bytes = pn as u64;
                                     }
                                 }
-                                Some(ctrl_frame) => {
-                                    self.handle_client_srtp_ctrl_frame(
-                                        tok,
-                                        ctrl_frame,
-                                        now,
-                                        standby_promoted,
-                                    );
-                                }
-                                None => {
-                                    sess.auth_drops += 1;
-                                }
-                            }
-                            if rx_ok_bytes > 0 {
-                                if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                if flushed_bytes > 0 {
                                     record_client_media_bytes(
                                         sess,
                                         &self.cfg,
                                         self.ka_base_ms,
                                         now,
-                                        rx_ok_bytes,
+                                        flushed_bytes,
                                     );
+                                }
+                                log(
+                                    self.worker_id,
+                                    &format!(
+                                        "session READY (no-dtls) up_sport={} cipher={} flushed={}",
+                                        sess.local_port,
+                                        chosen.name(),
+                                        flushed
+                                    ),
+                                );
+                            }
+                        } else if sess.state == HandshakeState::Ready
+                            && sess.ka_txid == Some(parsed.txid)
+                        {
+                            let ka_rtt = sess
+                                .ka_sent_at
+                                .map(|t| now.saturating_duration_since(t).as_secs_f64() * 1000.0)
+                                .unwrap_or(0.0);
+                            let ka_retries_before_ok = sess.ka_retries;
+                            if ka_rtt > 0.0 {
+                                *ka_sample = Some((ka_rtt, ka_retries_before_ok));
+                            }
+                            if let Some(ref th) = self.telemetry {
+                                th.record_stun_ok(ka_rtt, ka_retries_before_ok, parsed.xor_mapped);
+                            }
+                            sess.keepalives_ok += 1;
+                            sess.ka_txid = None;
+                            sess.ka_pkt.clear();
+                            sess.ka_retries = 0;
+                            sess.ka_sent_at = None;
+                            sess.ka_rto_at = None;
+                            let in_trickle = is_client_in_trickle(sess, now);
+                            sess.next_keepalive_at = now
+                                + if in_trickle
+                                    && self.cfg.keepalive_secs >= TRICKLE_KA_ENABLE_MIN_SECS
+                                    && self.cfg.keepalive_secs < TRICKLE_KA_ENABLE_MAX_SECS
+                                {
+                                    // Conservative trickle STUN backoff (10-14s, safely below 20-30s CGNAT & 45s server consent)
+                                    rand_duration_range_ms(TRICKLE_KA_MIN_MS, TRICKLE_KA_MAX_MS)
+                                } else {
+                                    jitter_duration_ms(self.ka_base_ms)
+                                };
+                        }
+                    } else {
+                        sess.auth_drops += 1;
+                    }
+                } else {
+                    sess.auth_drops += 1;
+                }
+            }
+            PacketKind::Dtls => {
+                // V3.2: strict DTLS pre-validation + Ready gating + Fail-Fast reset in DtlsHandshake
+                let ready_only_alert = matches!(
+                    sess.state,
+                    HandshakeState::Ready
+                        | HandshakeState::HandoverWait
+                        | HandshakeState::Migrating
+                ) && sess
+                    .ready_at
+                    .map(|r| {
+                        now.duration_since(r)
+                            > Duration::from_secs(DTLS_READY_ALERT_ONLY_GRACE_SECS)
+                    })
+                    .unwrap_or(false);
+                if !validate_dtls_datagram(pkt, ready_only_alert) {
+                    sess.auth_drops += 1;
+                    return;
+                }
+                let candidate_sh = if sess.state == HandshakeState::DtlsHandshake {
+                    extract_dtls_server_hello_suite(pkt)
+                } else {
+                    None
+                };
+                let mut dtls_err = false;
+                if let Some(ref mut dtls) = sess.dtls {
+                    if sess.dtls_next_timeout.map(|t| now >= t).unwrap_or(false) {
+                        let _ = dtls.handle_timeout(now);
+                    }
+                    if dtls.handle_packet(pkt).is_err() {
+                        dtls_err = true;
+                    }
+                } else {
+                    sess.auth_drops += 1;
+                    return;
+                }
+                if dtls_err {
+                    sess.auth_drops += 1;
+                    if matches!(
+                        sess.state,
+                        HandshakeState::Ready
+                            | HandshakeState::HandoverWait
+                            | HandshakeState::Migrating
+                    ) {
+                        // Keep established SRTP tunnel alive; drop corrupted DTLS handle only
+                        sess.dtls = None;
+                        sess.dtls_next_timeout = None;
+                    } else if sess.state == HandshakeState::DtlsHandshake {
+                        // P0-4: dimpl Err during handshake means transcript/state is fatally poisoned.
+                        // Fail-fast reset (up to MAX_DTLS_RESETS) instead of stalling 12s!
+                        if sess.dtls_resets < MAX_DTLS_RESETS {
+                            sess.dtls_resets += 1;
+                            sess.pending_sh_suite = None;
+                            sess.dtls_suite_id = None;
+                            sess.dtls_km = None;
+                            let cert = self.cert_cache.get(now);
+                            let mut fresh = Box::new(new_dtls_instance(
+                                self.cfg.dtls_min_version,
+                                self.dtls_pool.pick(),
+                                cert,
+                                now,
+                            ));
+                            fresh.set_active(true);
+                            let _ = fresh.handle_timeout(now);
+                            sess.dtls = Some(fresh);
+                            let _ = drain_client_dtls(
+                                self.worker_id,
+                                sess,
+                                &mut self.dtls_buf,
+                                &mut self.wbuf,
+                                &self.cfg,
+                                &self.cpu,
+                                now,
+                                None,
+                            );
+                        } else {
+                            sess.state = HandshakeState::Closing(
+                                now + Duration::from_millis(CLOSING_DRAIN_MS),
+                            );
+                        }
+                    }
+                    return;
+                }
+                let was_ready = sess.state == HandshakeState::Ready;
+                if drain_client_dtls(
+                    self.worker_id,
+                    sess,
+                    &mut self.dtls_buf,
+                    &mut self.wbuf,
+                    &self.cfg,
+                    &self.cpu,
+                    now,
+                    candidate_sh,
+                ) {
+                    let active_recently = now.duration_since(sess.last_data_active)
+                        <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                    sess.state =
+                        HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
+                    if was_ready && !sess.is_standby && !sess.is_prewarm && active_recently {
+                        graceful_reconnects.push((tok, sess.client_addr));
+                    }
+                } else if !was_ready && sess.state == HandshakeState::Ready && sess.is_standby {
+                    standby_ready.push((tok, sess.client_addr));
+                }
+            }
+            PacketKind::Srtcp => {
+                // P1-5 fix: Also accept authenticated SRTCP (esp. server SIGTERM BYE) during HandoverWait/Migrating!
+                if matches!(
+                    sess.state,
+                    HandshakeState::Ready
+                        | HandshakeState::HandoverWait
+                        | HandshakeState::Migrating
+                ) {
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if let Some(has_bye) = cipher.verify_srtcp(pkt) {
+                            sess.srtcp_rx += 1;
+                            if has_bye {
+                                let active_recently = now.duration_since(sess.last_data_active)
+                                    <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                sess.state = HandshakeState::Closing(
+                                    now + Duration::from_millis(CLOSING_DRAIN_MS),
+                                );
+                                if !sess.is_standby && !sess.is_prewarm && active_recently {
+                                    graceful_reconnects.push((tok, sess.client_addr));
                                 }
                             }
                         } else {
                             sess.auth_drops += 1;
                         }
                     }
-                    PacketKind::Unknown => {
-                        sess.auth_drops += 1;
-                    }
+                } else {
+                    sess.auth_drops += 1;
                 }
+            }
+            PacketKind::Srtp => {
+                if matches!(
+                    sess.state,
+                    HandshakeState::Ready
+                        | HandshakeState::HandoverWait
+                        | HandshakeState::Migrating
+                ) {
+                    let mut rx_ok_bytes = 0u64;
+                    let frame = sess
+                        .cipher
+                        .as_mut()
+                        .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf));
+                    match frame {
+                        Some(SrtpFrame::Data(pn)) => {
+                            sess.last_data_active = now;
+                            if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0 {
+                                sess.mig_echo_left = 0;
+                                sess.mig_echo_payload = None;
+                                sess.mig_echo_next_at = None;
+                            }
+                            if self
+                                .listen_sock
+                                .send_to(&self.wbuf[..pn], sess.client_addr)
+                                .is_ok()
+                            {
+                                sess.rx_pkts += 1;
+                                sess.rx_bytes += pn as u64;
+                                rx_ok_bytes = pn as u64;
+                            }
+                        }
+                        Some(ctrl_frame) => {
+                            self.handle_client_srtp_ctrl_frame(
+                                tok,
+                                ctrl_frame,
+                                now,
+                                standby_promoted,
+                            );
+                        }
+                        None => {
+                            sess.auth_drops += 1;
+                        }
+                    }
+                    if rx_ok_bytes > 0 {
+                        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                            record_client_media_bytes(
+                                sess,
+                                &self.cfg,
+                                self.ka_base_ms,
+                                now,
+                                rx_ok_bytes,
+                            );
+                        }
+                    }
+                } else {
+                    sess.auth_drops += 1;
+                }
+            }
+            PacketKind::Unknown => {
+                sess.auth_drops += 1;
+            }
+        }
     }
 
     fn handle_client_srtp_ctrl_frame(
