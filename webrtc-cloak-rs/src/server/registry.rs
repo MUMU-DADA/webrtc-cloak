@@ -21,7 +21,7 @@ const SEEN_TXID_CAP: usize = 65_536;
 /// 单个 worker 跨线程非所有权移交控制指令队列上限，防内存耗尽。
 const MAX_WORKER_CMD_QUEUE: usize = 4096;
 
-pub(super) enum TxidCheck {
+pub(crate) enum TxidCheck {
     Fresh,
     /// Genuine same-peer short-window UDP retry (bounded <= 6x): resend exact cached 64B reply!
     Retransmit([u8; STUN_CACHED_REPLY_MAX_LEN], u8),
@@ -38,13 +38,13 @@ struct TxidEntry {
 }
 
 /// Shared O(1) bounded FIFO anti-replay cache across all SO_REUSEPORT workers.
-pub(super) struct SeenTxidCache {
+pub(crate) struct SeenTxidCache {
     map: HashMap<[u8; 12], TxidEntry>,
     order: VecDeque<([u8; 12], Instant)>,
 }
 
 impl SeenTxidCache {
-    pub(super) fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             map: HashMap::with_capacity(16),
             order: VecDeque::with_capacity(16),
@@ -66,7 +66,7 @@ impl SeenTxidCache {
         }
     }
 
-    pub(super) fn check(
+    pub(crate) fn check(
         &mut self,
         txid: [u8; 12],
         peer: SocketAddr,
@@ -88,7 +88,7 @@ impl SeenTxidCache {
         TxidCheck::Fresh
     }
 
-    pub(super) fn record(&mut self, txid: [u8; 12], peer: SocketAddr, now: Instant, resp: &[u8]) {
+    pub(crate) fn record(&mut self, txid: [u8; 12], peer: SocketAddr, now: Instant, resp: &[u8]) {
         self.evict_expired(now);
         while self.map.len() >= SEEN_TXID_CAP {
             if let Some((old_txid, old_ts)) = self.order.pop_front() {

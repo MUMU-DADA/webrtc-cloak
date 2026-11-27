@@ -113,7 +113,7 @@ const MIG_ECHO_COUNT: u8 = 3;
 
 /// 跨地域无量纲综合信道评分（`0.0..=100.0`，越高越好）。
 /// 融合相对延迟倍率、真实数据面/STUN 有效丢包率与归一化抖动，在 5ms 局域网到 250ms 跨洲链路上通用一致。
-pub(super) fn compute_lane_score(
+pub(crate) fn compute_lane_score(
     rtt_ewma_ms: f64,
     ref_rtt_ms: f64,
     loss_eff: f64,

@@ -145,6 +145,15 @@ chmod 600 /tmp/webrtc-cloak.psk
   --listen-host 127.0.0.1 --listen-port 19543 \
   --server-host 203.0.113.10 --server-port 19643 \
   --psk-file /tmp/webrtc-cloak.psk
+
+# 可选一级旁路模式（bypass）：带外认证 ICE STUN ECMP 抽卡/劣化换道/黑洞自愈 + 数据面零封装原始 UDP 直通
+./webrtc-cloak bypass --responder \
+  --listen-host 127.0.0.1 --listen-port 19640 \
+  --psk-file /tmp/webrtc-cloak.psk
+./webrtc-cloak bypass \
+  --listen-host 127.0.0.1 --listen-port 19543 \
+  --server-host 203.0.113.10 --server-port 19643 \
+  --psk-file /tmp/webrtc-cloak.psk
 ```
 
 ### 3. 主要命令行参数
@@ -245,6 +254,8 @@ cargo build --release --target x86_64-unknown-linux-musl
         ├── protocol/                      # STUN / dimpl DTLS 1.3+1.2 / X.509 / 双 SSRC SRTP / SRTCP
         ├── client/                        # 客户端 mio 循环、1-RTT 黑洞迁移、MBB 状态机与集成测试
         ├── server/                        # 服务端 mio 循环、防重放、跨 worker 注册表与 Silent Drop
+        ├── bypass/                        # 一级旁路直通模式（带外 STUN ECMP 抽卡 + 原始 UDP 零损耗透传）
+        ├── udp_batch.rs                   # 可选 Linux recvmmsg/sendmmsg 批量收发引擎 (--udp-batch)
         ├── selftest/                      # 线上直测 + 本地离线 12 项自测、劣化代理与报告渲染
         └── telemetry/                     # 外层链路健康只读遥测（原子 JSON / HTTP / Prometheus）
 ```

@@ -1,6 +1,7 @@
 //! CLI 参数解析与子命令分发入口。
 
 mod bench_tools;
+mod bypass;
 mod client;
 mod constants;
 mod protocol;
@@ -10,6 +11,7 @@ mod telemetry;
 mod udp_batch;
 
 use crate::bench_tools::{print_cpu_info, run_bench, run_loadgen, run_sink};
+use crate::bypass::{run_bypass, run_bypass_responder, BypassConfig, BypassResponderConfig};
 use crate::client::{
     run_client, ClientConfig, LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS,
     DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
@@ -154,6 +156,8 @@ fn usage() -> ! {
          webrtc-cloak cpu\n  \
          webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak bypass --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--no-lane-hunt] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
+         webrtc-cloak bypass --responder --listen-host 127.0.0.1 --listen-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--workers 1|auto] [--mtu 1488] [--udp-batch 0] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
          webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--no-color] [--json]"
@@ -494,6 +498,97 @@ fn run() -> Result<(), pico_args::Error> {
             }) {
                 eprintln!("server error: {}", e);
                 process::exit(1);
+            }
+        }
+        "bypass" => {
+            let is_responder = args.contains("--responder");
+            if is_responder {
+                let listen_host: String = args
+                    .opt_value_from_str("--listen-host")?
+                    .unwrap_or_else(|| DEFAULT_CLIENT_LISTEN_HOST.into());
+                let listen_port: u16 = args
+                    .opt_value_from_str("--listen-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let common = finish_common_tunnel(args)?;
+                let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+                if let Err(e) = run_bypass_responder(BypassResponderConfig {
+                    listen_addr,
+                    psk: common.psk,
+                    workers: common.workers,
+                    wan_mtu: common.wan_mtu,
+                    udp_batch: common.udp_batch,
+                    stats_interval_secs: common.stats_interval_secs,
+                    telemetry: common.telemetry,
+                    quiet: false,
+                    stop: Some(install_shutdown_handler()),
+                }) {
+                    eprintln!("bypass responder error: {}", e);
+                    process::exit(1);
+                }
+            } else {
+                let listen_host: String = args
+                    .opt_value_from_str("--listen-host")?
+                    .unwrap_or_else(|| DEFAULT_CLIENT_LISTEN_HOST.into());
+                let listen_port: u16 = args
+                    .opt_value_from_str("--listen-port")?
+                    .unwrap_or(DEFAULT_CLIENT_LISTEN_PORT);
+                let server_host: String = args.value_from_str("--server-host")?;
+                let server_port: u16 = args
+                    .opt_value_from_str("--server-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let rotate_interval_secs: u64 =
+                    args.opt_value_from_str("--rotate-interval")?.unwrap_or(0);
+                let retry_ms: u64 = args
+                    .opt_value_from_str("--retry-ms")?
+                    .unwrap_or(DEFAULT_CLIENT_RETRY_MS);
+                let max_retries: u32 = args.opt_value_from_str("--max-retries")?.unwrap_or(2);
+                let keepalive_secs: u64 = args
+                    .opt_value_from_str("--keepalive")?
+                    .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+                let _ = args.contains("--lane-hunt");
+                let no_lane_hunt = args.contains("--no-lane-hunt");
+                let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+                let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+                let lane_target_rtt_opt: Option<u64> =
+                    args.opt_value_from_str("--lane-target-rtt")?;
+                let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+                let lane_hunt = LaneHuntConfig {
+                    enabled: !no_lane_hunt,
+                    probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                    max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                    target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                    degrade_cooldown_secs: lane_cooldown_opt
+                        .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                }
+                .normalized();
+                if server_host.is_empty() {
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+                let server_addr = parse_socket_addr(&server_host, server_port, "server");
+                if let Err(e) = run_bypass(BypassConfig {
+                    listen_addr,
+                    server_addr,
+                    psk: common.psk,
+                    rotate_interval_secs,
+                    workers: common.workers,
+                    max_sessions: common.max_sessions,
+                    wan_mtu: common.wan_mtu,
+                    udp_batch: common.udp_batch,
+                    retry_ms,
+                    max_retries,
+                    keepalive_secs,
+                    idle_timeout_secs: common.idle_timeout_secs,
+                    stats_interval_secs: common.stats_interval_secs,
+                    lane_hunt,
+                    telemetry: common.telemetry,
+                    quiet: false,
+                    stop: Some(install_shutdown_handler()),
+                }) {
+                    eprintln!("bypass error: {}", e);
+                    process::exit(1);
+                }
             }
         }
         _ => usage(),

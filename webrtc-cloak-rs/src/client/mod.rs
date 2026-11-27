@@ -9,6 +9,7 @@ mod worker_timers;
 #[cfg(test)]
 mod tests;
 
+pub(crate) use self::lane_hunt::compute_lane_score;
 pub use self::lane_hunt::{
     LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS, DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
 };

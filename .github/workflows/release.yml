@@ -206,6 +206,9 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **First-Class Out-of-Band ECMP Lane-Hunting Bypass Mode (`webrtc-cloak bypass`, `v0.5.0`)**:
+            - New top-level `bypass` forwarder mode and `bypass --responder` ultra-lightweight STUN responder mode alongside `client` and `server`
+            - Performs multi-candidate authenticated RFC 8445 ICE STUN ECMP lane hunting, continuous RTT/jitter guard, seamless NAT-rebinding port switch with 3s old-port drain overlap, and blackhole auto-escape on the exact same UDP 5-tuple while passing 100% of inner UDP payloads (e.g., QUIC) raw with zero framing overhead, zero double-encryption, and full kernel `UDP_SEGMENT` (UDP GSO) compatibility
           - **Session Socket Burst-Buffer Sizing (`v0.4.7`, 100% wire-compatible with `v0.4.x`)**:
             - Raised server per-session `backend_sock` kernel buffer ceiling from `512 KiB` to `4 MiB` and client upstream `up_sock` ceiling from `2 MiB` to `8 MiB` (matching `listen_sock`), eliminating `Udp: RcvbufErrors` during sub-vCPU hypervisor scheduling pauses and multi-hop L4 relay micro-bursts with zero idle RSS increase
           - **Opt-In Linux UDP Batch I/O (`--udp-batch <0|2..64>`, `v0.4.6`, 100% wire-compatible with `v0.4.x`)**:
