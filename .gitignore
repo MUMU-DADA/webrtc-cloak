@@ -8,6 +8,7 @@
 *.key
 *.pem
 *.der
+!webrtc-cloak-rs/patches/dimpl/src/crypto/validation/*.der
 .env
 .env.*
 
