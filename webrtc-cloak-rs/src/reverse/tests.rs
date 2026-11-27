@@ -587,6 +587,7 @@ fn reverse_tunnel_ipv6_cross_family_preconnect_buffer_and_silent_drop() {
         expose_addr,
     };
     let entry_handle = thread::spawn(move || run_reverse_entry(entry_cfg).unwrap());
+    let _ = wait_for_status(entry_status, |_| true, Duration::from_secs(5));
     thread::sleep(Duration::from_millis(120));
 
     // 1. Unauthenticated scanner probe sent to Entry tunnel port MUST be 100% silently dropped

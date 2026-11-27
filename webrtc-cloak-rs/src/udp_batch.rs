@@ -291,8 +291,8 @@ impl UdpSendBatch {
             }
             let sent = sendmmsg_all(fd, &mut self.hdrs[..n]);
             let mut bytes = 0u64;
-            for i in 0..sent {
-                bytes = bytes.saturating_add(self.app_bytes[i]);
+            for &b in self.app_bytes.iter().take(sent) {
+                bytes = bytes.saturating_add(b);
             }
             (sent, bytes)
         }
@@ -340,8 +340,8 @@ impl UdpSendBatch {
             }
             let sent = sendmmsg_all(fd, &mut self.hdrs[..n]);
             let mut bytes = 0u64;
-            for i in 0..sent {
-                bytes = bytes.saturating_add(self.app_bytes[i]);
+            for &b in self.app_bytes.iter().take(sent) {
+                bytes = bytes.saturating_add(b);
             }
             (sent, bytes)
         }

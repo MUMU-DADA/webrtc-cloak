@@ -257,18 +257,41 @@ fn relay_bypass_end_to_end_lane_hunt_mbb_blackhole_and_telemetry() {
     };
     let client_handle = thread::spawn(move || run_client(client_cfg).unwrap());
 
-    thread::sleep(Duration::from_millis(350));
+    let _ = wait_for_status(relay_status_addr, |_| true, Duration::from_secs(5));
+    let _ = wait_for_status(client_status_addr, |_| true, Duration::from_secs(5));
 
     // Send 24 packets (1200B QUIC-like) through Client -> Relay(bypass) -> Mux -> Echo
+    // Warm up with a distinct probe first so slow CI runners finish UDP socket bind cleanly.
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let warm_deadline = Instant::now() + Duration::from_secs(6);
+    let warm_pkt = b"relay-bypass-warmup-probe";
+    let mut rbuf = [0u8; 1500];
+    let mut warm_ok = false;
+    while Instant::now() < warm_deadline {
+        let _ = app.send_to(warm_pkt, client_addr);
+        if let Ok((n, _)) = app.recv_from(&mut rbuf) {
+            if &rbuf[..n] == warm_pkt {
+                warm_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(warm_ok, "relay-bypass did not echo warmup packet within 6s");
     app.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     for seq in 0u32..24 {
         let mut payload = vec![0x43u8; 1200];
         payload[1..5].copy_from_slice(&seq.to_be_bytes());
         app.send_to(&payload, client_addr).unwrap();
-        let mut rbuf = [0u8; 1500];
-        let (n, _) = app.recv_from(&mut rbuf).unwrap();
-        assert_eq!(&rbuf[..n], &payload[..], "payload mismatch on seq {}", seq);
+        loop {
+            let (n, _) = app.recv_from(&mut rbuf).unwrap();
+            if &rbuf[..n] == warm_pkt {
+                continue;
+            }
+            assert_eq!(&rbuf[..n], &payload[..], "payload mismatch on seq {}", seq);
+            break;
+        }
     }
 
     // Verify unified relay telemetry (Leg 1 DTLS 1.3 + Leg 2 fast even ECMP lane)
@@ -503,17 +526,44 @@ fn relay_cloak_end_to_end_double_dtls_dual_stack_and_mbb() {
     };
     let client_handle = thread::spawn(move || run_client(client_cfg).unwrap());
 
-    thread::sleep(Duration::from_millis(250));
+    let _ = wait_for_status(exit_status_addr, |_| true, Duration::from_secs(5));
+    let _ = wait_for_status(relay_status_addr, |_| true, Duration::from_secs(5));
+    let _ = wait_for_status(client_status_addr, |_| true, Duration::from_secs(5));
 
+    // Warm up double-DTLS 1.3 handshake with a distinct probe to eliminate slow-CI startup bind races.
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let warm_deadline = Instant::now() + Duration::from_secs(8);
+    let warm_pkt = b"relay-cloak-warmup-probe";
+    let mut rbuf = [0u8; 1500];
+    let mut warm_ok = false;
+    while Instant::now() < warm_deadline {
+        let _ = app.send_to(warm_pkt, client_listen);
+        if let Ok((n, _)) = app.recv_from(&mut rbuf) {
+            if &rbuf[..n] == warm_pkt {
+                warm_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        warm_ok,
+        "double-DTLS relay-cloak did not echo warmup packet within 8s"
+    );
     app.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
     for seq in 0u32..24 {
         let mut payload = vec![0x62u8; 1100];
         payload[1..5].copy_from_slice(&seq.to_be_bytes());
         app.send_to(&payload, client_listen).unwrap();
-        let mut rbuf = [0u8; 1500];
-        let (n, _) = app.recv_from(&mut rbuf).unwrap();
-        assert_eq!(&rbuf[..n], &payload[..], "double-DTLS payload mismatch");
+        loop {
+            let (n, _) = app.recv_from(&mut rbuf).unwrap();
+            if &rbuf[..n] == warm_pkt {
+                continue;
+            }
+            assert_eq!(&rbuf[..n], &payload[..], "double-DTLS payload mismatch");
+            break;
+        }
     }
 
     let rst = wait_for_status(
@@ -692,7 +742,7 @@ fn relay_single_packet_mode_and_unauth_silent_drop() {
     };
     let ch = thread::spawn(move || run_client(client_cfg).unwrap());
 
-    thread::sleep(Duration::from_millis(200));
+    let _ = wait_for_status(relay_status_addr, |_| true, Duration::from_secs(5));
 
     // Unauthenticated junk sent directly to relay ingress must be silently dropped
     let scanner = UdpSocket::bind("127.0.0.1:0").unwrap();
@@ -706,14 +756,38 @@ fn relay_single_packet_mode_and_unauth_silent_drop() {
     assert!(scanner.recv_from(&mut sbuf).is_err());
 
     let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let warm_deadline = Instant::now() + Duration::from_secs(6);
+    let warm_pkt = b"relay-single-warmup-probe";
+    let mut out = [0u8; 1024];
+    let mut warm_ok = false;
+    while Instant::now() < warm_deadline {
+        let _ = app.send_to(warm_pkt, client_listen);
+        if let Ok((n, _)) = app.recv_from(&mut out) {
+            if &out[..n] == warm_pkt {
+                warm_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        warm_ok,
+        "relay single-packet mode did not echo warmup packet"
+    );
     app.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
     for i in 0u16..16 {
         let mut pkt = vec![0x77u8; 700];
         pkt[2..4].copy_from_slice(&i.to_be_bytes());
         app.send_to(&pkt, client_listen).unwrap();
-        let mut out = [0u8; 1024];
-        let (n, _) = app.recv_from(&mut out).unwrap();
-        assert_eq!(&out[..n], &pkt[..]);
+        loop {
+            let (n, _) = app.recv_from(&mut out).unwrap();
+            if &out[..n] == warm_pkt {
+                continue;
+            }
+            assert_eq!(&out[..n], &pkt[..]);
+            break;
+        }
     }
 
     let st = wait_for_status(
