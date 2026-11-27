@@ -46,6 +46,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
             workers: 1,
             max_sessions: 64,
             wan_mtu: 1488,
+            udp_batch: 0,
             idle_timeout_secs: 120,
             stats_interval_secs: 3600,
             wire_audit_file: None,
@@ -171,6 +172,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
             workers: 1,
             max_sessions: 64,
             wan_mtu: 1488,
+            udp_batch: 0,
             retry_ms: 200,
             max_retries: 8,
             keepalive_secs: 1,
@@ -298,6 +300,7 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
             workers: 1,
             max_sessions: 16,
             wan_mtu: 1488,
+            udp_batch: 0,
             idle_timeout_secs: 60,
             stats_interval_secs: 3600,
             wire_audit_file: None,
@@ -356,6 +359,7 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
             workers: 1,
             max_sessions: 16,
             wan_mtu: 1488,
+            udp_batch: 0,
             retry_ms: 200,
             max_retries: 8,
             keepalive_secs: 5,
@@ -434,6 +438,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             workers: 1,
             max_sessions: 16,
             wan_mtu: 1488,
+            udp_batch: 0,
             idle_timeout_secs: 60,
             stats_interval_secs: 3600,
             wire_audit_file: None,
@@ -491,6 +496,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             workers: 1,
             max_sessions: 16,
             wan_mtu: 1488,
+            udp_batch: 0,
             retry_ms: 150,
             max_retries: 8,
             keepalive_secs: 30,
@@ -543,6 +549,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             workers: 1,
             max_sessions: 16,
             wan_mtu: 1488,
+            udp_batch: 0,
             idle_timeout_secs: 60,
             stats_interval_secs: 3600,
             wire_audit_file: None,
@@ -568,4 +575,147 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
         recovered,
         "client MUST fast-reconnect on server graceful BYE well under 3s (keepalive=30s)!"
     );
+}
+
+#[test]
+fn udp_batch_high_burst_bidirectional_and_ipv6_echo() {
+    let psk = b"batch-test-psk-v046-0123456789ab".to_vec();
+
+    // 1) IPv4 end-to-end tunnel with udp_batch=16 on both client & server + 64-pkt burst echo
+    let backend = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let backend_port = backend.local_addr().unwrap().port();
+    let stop_echo = Arc::new(AtomicBool::new(false));
+    let stop_echo_c = Arc::clone(&stop_echo);
+    backend
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let echo_h = thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop_echo_c.load(Ordering::Relaxed) {
+            if let Ok((n, src)) = backend.recv_from(&mut buf) {
+                let _ = backend.send_to(&buf[..n], src);
+            }
+        }
+    });
+
+    let server_port = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client_port = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let stop_srv = Arc::new(AtomicBool::new(false));
+    let stop_cli = Arc::new(AtomicBool::new(false));
+    let srv_stop_c = Arc::clone(&stop_srv);
+    let cli_stop_c = Arc::clone(&stop_cli);
+
+    let srv_psk = psk.clone();
+    let srv_h = thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+            psk: srv_psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 16,
+            wan_mtu: 1488,
+            udp_batch: 16,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(srv_stop_c),
+        });
+    });
+    let cli_psk = psk.clone();
+    let cli_h = thread::spawn(move || {
+        let _ = run_client(ClientConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+            psk: cli_psk,
+            cipher_pref: CipherPref::Auto,
+            dtls_decoy: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            rotate_interval_secs: 0,
+            rotate_max_bytes: 0,
+            rotate_cooldown_secs: 10,
+            workers: 1,
+            max_sessions: 16,
+            wan_mtu: 1488,
+            udp_batch: 16,
+            retry_ms: 80,
+            max_retries: 20,
+            keepalive_secs: 5,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            lane_hunt: Default::default(),
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(cli_stop_c),
+        });
+    });
+    thread::sleep(Duration::from_millis(80));
+
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    app.connect(("127.0.0.1", client_port)).unwrap();
+
+    // Warm handshake
+    let mut rbuf = [0u8; 2048];
+    let mut ready = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        let _ = app.send(b"BATCH_WARMUP");
+        if let Ok(n) = app.recv(&mut rbuf) {
+            if &rbuf[..n] == b"BATCH_WARMUP" {
+                ready = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(30));
+    }
+    assert!(ready, "batched DTLS 1.3 tunnel must become ready");
+
+    // Fire 64 back-to-back 1000B datagrams (exceeds batch=16 across 4 full batches)
+    let burst_total = 64usize;
+    for i in 0..burst_total {
+        let mut msg = vec![(i as u8).wrapping_mul(7).wrapping_add(3); 1000];
+        msg[..4].copy_from_slice(&(i as u32).to_be_bytes());
+        app.send(&msg).unwrap();
+    }
+    let mut seen = vec![false; burst_total];
+    let mut got = 0usize;
+    let t_burst = Instant::now();
+    while got < burst_total && t_burst.elapsed() < Duration::from_secs(4) {
+        if let Ok(n) = app.recv(&mut rbuf) {
+            if n == 1000 {
+                let idx = u32::from_be_bytes(rbuf[..4].try_into().unwrap()) as usize;
+                if idx < burst_total && !seen[idx] {
+                    let expected_fill = (idx as u8).wrapping_mul(7).wrapping_add(3);
+                    assert!(rbuf[4..n].iter().all(|&b| b == expected_fill));
+                    seen[idx] = true;
+                    got += 1;
+                }
+            }
+        }
+    }
+    assert_eq!(
+        got, burst_total,
+        "all 64 burst datagrams must round-trip intact through udp_batch=16"
+    );
+
+    stop_cli.store(true, Ordering::SeqCst);
+    stop_srv.store(true, Ordering::SeqCst);
+    stop_echo.store(true, Ordering::SeqCst);
+    let _ = cli_h.join();
+    let _ = srv_h.join();
+    let _ = echo_h.join();
 }

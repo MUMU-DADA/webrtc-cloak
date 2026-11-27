@@ -23,8 +23,9 @@ use crate::protocol::{
     parse_stun_with_key, rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram,
     PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
+use crate::udp_batch::UdpSendBatch;
 use mio::Token;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -52,16 +53,139 @@ const CLIENT_GRACEFUL_RECONNECT_MIN_MS: u64 = 80;
 /// 收到服务端优雅关闭 BYE 后客户端快连的最大抖动退避（毫秒）。
 const CLIENT_GRACEFUL_RECONNECT_MAX_MS: u64 = 350;
 
+#[inline]
+fn flush_client_uplink_batch(
+    pending_tok: &mut Option<Token>,
+    tx_batch: &mut UdpSendBatch,
+    sessions_by_token: &mut HashMap<Token, super::ClientSession>,
+    cfg: &super::ClientConfig,
+    ka_base_ms: u64,
+    now: Instant,
+) {
+    if let Some(tok) = pending_tok.take() {
+        if tx_batch.is_empty() {
+            return;
+        }
+        if let Some(sess) = sessions_by_token.get_mut(&tok) {
+            let (sp, sb) = tx_batch.flush_connected(&sess.upstream);
+            if sp > 0 {
+                sess.tx_pkts += sp as u64;
+                sess.tx_bytes += sb;
+                record_client_media_bytes(sess, cfg, ka_base_ms, now, sb);
+            }
+        }
+    }
+}
+
 impl ClientWorker {
     pub(super) fn handle_listen_readable(&mut self, now: Instant) {
+        if self.rx_batch.is_some() {
+            self.handle_listen_readable_batched(now);
+            return;
+        }
         loop {
             let (n, client_addr) = match self.listen_sock.recv_from(&mut self.rbuf) {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             };
+            self.dispatch_listen_packet(n, client_addr, now);
+        }
+    }
+
+    fn handle_listen_readable_batched(&mut self, now: Instant) {
+        let Some(mut rx_batch) = self.rx_batch.take() else {
+            return;
+        };
+        let Some(mut tx_batch) = self.tx_batch.take() else {
+            self.rx_batch = Some(rx_batch);
+            return;
+        };
+
+        loop {
+            let count = match rx_batch.recv_from(&self.listen_sock) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            };
+            let mut pending_tok: Option<Token> = None;
+
+            for i in 0..count {
+                let pkt = rx_batch.packet(i);
+                let Some(client_addr) = rx_batch.peer(i) else {
+                    continue;
+                };
+                if pkt.is_empty() || pkt.len() > MAX_INNER_UDP_LEN {
+                    continue;
+                }
+
+                // 快路径：已就绪主会话且未处于快连退避窗，零拷贝加密入批并合并 sendmmsg
+                if !self.pending_reconnects.contains_key(&client_addr) {
+                    if let Some(&tok) = self.token_by_client.get(&client_addr) {
+                        if self
+                            .sessions_by_token
+                            .get(&tok)
+                            .is_some_and(|s| s.state == HandshakeState::Ready)
+                        {
+                            if pending_tok != Some(tok) || tx_batch.is_full() {
+                                flush_client_uplink_batch(
+                                    &mut pending_tok,
+                                    &mut tx_batch,
+                                    &mut self.sessions_by_token,
+                                    &self.cfg,
+                                    self.ka_base_ms,
+                                    now,
+                                );
+                                pending_tok = Some(tok);
+                            }
+                            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                sess.last_data_active = now;
+                                if let Some(slot) = tx_batch.next_slot_mut() {
+                                    if let Some(wn) = sess
+                                        .cipher
+                                        .as_mut()
+                                        .and_then(|c| c.wrap_into(pkt, slot))
+                                    {
+                                        tx_batch.commit_slot(wn, pkt.len() as u64, None);
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                flush_client_uplink_batch(
+                    &mut pending_tok,
+                    &mut tx_batch,
+                    &mut self.sessions_by_token,
+                    &self.cfg,
+                    self.ka_base_ms,
+                    now,
+                );
+                let len = pkt.len().min(self.rbuf.len());
+                self.rbuf[..len].copy_from_slice(&pkt[..len]);
+                self.dispatch_listen_packet(len, client_addr, now);
+            }
+
+            flush_client_uplink_batch(
+                &mut pending_tok,
+                &mut tx_batch,
+                &mut self.sessions_by_token,
+                &self.cfg,
+                self.ka_base_ms,
+                now,
+            );
+        }
+
+        self.rx_batch = Some(rx_batch);
+        self.tx_batch = Some(tx_batch);
+    }
+
+    fn dispatch_listen_packet(&mut self, n: usize, client_addr: SocketAddr, now: Instant) {
             if n > MAX_INNER_UDP_LEN {
-                continue;
+                return;
             }
 
             // If this client is inside the 80..350ms post-server-BYE reconnect jitter window,
@@ -74,7 +198,7 @@ impl ClientWorker {
                     pr.pending.push_back(self.rbuf[..n].to_vec());
                     pr.pending_bytes += n;
                 }
-                continue;
+                return;
             }
 
             // If existing session is in Closing/DrainingBeforeBye, detach it from self.token_by_client while
@@ -100,7 +224,7 @@ impl ClientWorker {
                         hunt.pending_bytes += n;
                     }
                 }
-                continue;
+                return;
             } else if let Some(adopted) = self.try_adopt_prewarm(client_addr, now) {
                 adopted
             } else {
@@ -131,7 +255,7 @@ impl ClientWorker {
                                 hunt.pending.push_back(self.rbuf[..n].to_vec());
                                 hunt.pending_bytes += n;
                             }
-                            continue;
+                            return;
                         }
                     }
                     let mut init_pending = VecDeque::with_capacity(16);
@@ -149,7 +273,7 @@ impl ClientWorker {
                         init_pending,
                         init_bytes,
                     ) {
-                        continue;
+                        return;
                     }
                 }
                 match spawn_client_session(
@@ -170,7 +294,7 @@ impl ClientWorker {
                     None,
                 ) {
                     Some(t) => t,
-                    None => continue,
+                    None => return,
                 }
             };
 
@@ -200,7 +324,6 @@ impl ClientWorker {
                     }
                 }
             }
-        }
     }
 
     pub(super) fn handle_old_path_drain(
@@ -276,15 +399,225 @@ impl ClientWorker {
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
     ) {
+        if self.rx_batch.is_some() {
+            self.handle_upstream_readable_batched(
+                tok,
+                now,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+            );
+            return;
+        }
         let mut ka_sample: Option<(f64, u8)> = None;
-        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-            loop {
-                let n = match sess.upstream.recv(&mut self.rbuf) {
+        loop {
+            let n = {
+                let Some(sess) = self.sessions_by_token.get(&tok) else {
+                    break;
+                };
+                match sess.upstream.recv(&mut self.rbuf) {
                     Ok(n) => n,
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(_) => break,
+                }
+            };
+            self.dispatch_upstream_packet(
+                tok,
+                n,
+                now,
+                &mut ka_sample,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+            );
+        }
+        if let Some((ka_rtt, ka_retries)) = ka_sample {
+            self.evaluate_lane_quality_on_ka(tok, ka_rtt, ka_retries, now);
+        }
+    }
+
+    fn handle_upstream_readable_batched(
+        &mut self,
+        tok: Token,
+        now: Instant,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        let Some(mut rx_batch) = self.rx_batch.take() else {
+            return;
+        };
+        let Some(mut tx_batch) = self.tx_batch.take() else {
+            self.rx_batch = Some(rx_batch);
+            return;
+        };
+        let mut ka_sample: Option<(f64, u8)> = None;
+
+        loop {
+            let count = {
+                let Some(sess) = self.sessions_by_token.get(&tok) else {
+                    break;
                 };
-                let pkt = &self.rbuf[..n];
+                match rx_batch.recv_connected(&sess.upstream) {
+                    Ok(0) => break,
+                    Ok(n) => n,
+                    Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                    Err(_) => break,
+                }
+            };
+
+            for i in 0..count {
+                let pkt = rx_batch.packet(i);
+                if pkt.is_empty() {
+                    continue;
+                }
+                let fast_srtp = self.sessions_by_token.get(&tok).is_some_and(|s| {
+                    matches!(
+                        s.state,
+                        HandshakeState::Ready
+                            | HandshakeState::HandoverWait
+                            | HandshakeState::Migrating
+                    )
+                }) && demux_rfc7983(pkt) == PacketKind::Srtp;
+
+                if fast_srtp {
+                    if tx_batch.is_full() {
+                        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                            let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                            if sp > 0 {
+                                sess.rx_pkts += sp as u64;
+                                sess.rx_bytes += sb;
+                                record_client_media_bytes(
+                                    sess,
+                                    &self.cfg,
+                                    self.ka_base_ms,
+                                    now,
+                                    sb,
+                                );
+                            }
+                        }
+                    }
+                    let frame = {
+                        let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                        let slot = tx_batch.next_slot_mut().unwrap();
+                        sess.cipher
+                            .as_mut()
+                            .and_then(|c| c.unwrap_into_ex(pkt, slot))
+                    };
+                    match frame {
+                        Some(SrtpFrame::Data(pn)) => {
+                            let client_addr = {
+                                let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                                sess.last_data_active = now;
+                                if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0 {
+                                    sess.mig_echo_left = 0;
+                                    sess.mig_echo_payload = None;
+                                    sess.mig_echo_next_at = None;
+                                }
+                                sess.client_addr
+                            };
+                            tx_batch.commit_slot(pn, pn as u64, Some(client_addr));
+                        }
+                        Some(ctrl_frame) => {
+                            let pn = match ctrl_frame {
+                                SrtpFrame::Data(n)
+                                | SrtpFrame::Probe(n)
+                                | SrtpFrame::PathChallenge(n)
+                                | SrtpFrame::Handover(n) => n,
+                            };
+                            let copy_len = pn.min(self.wbuf.len());
+                            self.wbuf[..copy_len]
+                                .copy_from_slice(tx_batch.uncommitted_slot_prefix(copy_len));
+                            if !tx_batch.is_empty() {
+                                if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                    let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                                    if sp > 0 {
+                                        sess.rx_pkts += sp as u64;
+                                        sess.rx_bytes += sb;
+                                        record_client_media_bytes(
+                                            sess,
+                                            &self.cfg,
+                                            self.ka_base_ms,
+                                            now,
+                                            sb,
+                                        );
+                                    }
+                                }
+                            }
+                            self.handle_client_srtp_ctrl_frame(
+                                tok,
+                                ctrl_frame,
+                                now,
+                                standby_promoted,
+                            );
+                        }
+                        None => {
+                            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                sess.auth_drops += 1;
+                            }
+                        }
+                    }
+                    continue;
+                }
+
+                // 慢路径：先刷新已批下行数据，再复用完整控制面状态机
+                if !tx_batch.is_empty() {
+                    if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                        let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                        if sp > 0 {
+                            sess.rx_pkts += sp as u64;
+                            sess.rx_bytes += sb;
+                            record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
+                        }
+                    }
+                }
+                let len = pkt.len().min(self.rbuf.len());
+                self.rbuf[..len].copy_from_slice(&pkt[..len]);
+                self.dispatch_upstream_packet(
+                    tok,
+                    len,
+                    now,
+                    &mut ka_sample,
+                    standby_ready,
+                    standby_promoted,
+                    graceful_reconnects,
+                );
+            }
+
+            if !tx_batch.is_empty() {
+                if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                    let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                    if sp > 0 {
+                        sess.rx_pkts += sp as u64;
+                        sess.rx_bytes += sb;
+                        record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
+                    }
+                }
+            }
+        }
+
+        self.rx_batch = Some(rx_batch);
+        self.tx_batch = Some(tx_batch);
+        if let Some((ka_rtt, ka_retries)) = ka_sample {
+            self.evaluate_lane_quality_on_ka(tok, ka_rtt, ka_retries, now);
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_upstream_packet(
+        &mut self,
+        tok: Token,
+        n: usize,
+        now: Instant,
+        ka_sample: &mut Option<(f64, u8)>,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return;
+        };
+        let pkt = &self.rbuf[..n];
                 if matches!(
                     sess.state,
                     HandshakeState::Closing(_) | HandshakeState::DrainingBeforeBye(_)
@@ -322,7 +655,7 @@ impl ClientWorker {
                         }
                         _ => {}
                     }
-                    continue;
+                    return;
                 }
 
                 match demux_rfc7983(pkt) {
@@ -336,12 +669,12 @@ impl ClientWorker {
                                         && sess.mig_txid == Some(parsed.txid)
                                     {
                                         // Valid STUN reply; paired 0xFFFD challenge arrives in same flight
-                                        continue;
+                                        return;
                                     }
                                 }
                             }
                             sess.auth_drops += 1;
-                            continue;
+                            return;
                         }
                         if let Some(parsed) =
                             parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key)
@@ -498,7 +831,7 @@ impl ClientWorker {
                                         .unwrap_or(0.0);
                                     let ka_retries_before_ok = sess.ka_retries;
                                     if ka_rtt > 0.0 {
-                                        ka_sample = Some((ka_rtt, ka_retries_before_ok));
+                                        *ka_sample = Some((ka_rtt, ka_retries_before_ok));
                                     }
                                     if let Some(ref th) = self.telemetry {
                                         th.record_stun_ok(
@@ -551,7 +884,7 @@ impl ClientWorker {
                             .unwrap_or(false);
                         if !validate_dtls_datagram(pkt, ready_only_alert) {
                             sess.auth_drops += 1;
-                            continue;
+                            return;
                         }
                         let candidate_sh = if sess.state == HandshakeState::DtlsHandshake {
                             extract_dtls_server_hello_suite(pkt)
@@ -568,7 +901,7 @@ impl ClientWorker {
                             }
                         } else {
                             sess.auth_drops += 1;
-                            continue;
+                            return;
                         }
                         if dtls_err {
                             sess.auth_drops += 1;
@@ -615,7 +948,7 @@ impl ClientWorker {
                                     );
                                 }
                             }
-                            continue;
+                            return;
                         }
                         let was_ready = sess.state == HandshakeState::Ready;
                         if drain_client_dtls(
@@ -705,176 +1038,28 @@ impl ClientWorker {
                                         rx_ok_bytes = pn as u64;
                                     }
                                 }
-                                Some(SrtpFrame::PathChallenge(pn)) => {
-                                    sess.rx_pkts += 1;
-                                    if pn == PATH_CHALLENGE_PAYLOAD_LEN
-                                        && self.wbuf[0] == PATH_CHALLENGE_OP_REQ
-                                    {
-                                        // P0-2 fix: Accept 0xFFFD(0x01) both in `Migrating` AND while
-                                        // in `Ready` with unconfirmed `mig_echo_left > 0` (epoch >= current)!
-                                        let cur_epoch = sess
-                                            .mig_echo_payload
-                                            .as_deref()
-                                            .filter(|p| p.len() == PATH_CHALLENGE_PAYLOAD_LEN)
-                                            .map(|p| {
-                                                u64::from_be_bytes(p[9..17].try_into().unwrap())
-                                            })
-                                            .unwrap_or(0);
-                                        let got_epoch = u64::from_be_bytes(
-                                            self.wbuf[9..17].try_into().unwrap(),
-                                        );
-                                        let accept_challenge = sess.state
-                                            == HandshakeState::Migrating
-                                            || (sess.state == HandshakeState::Ready
-                                                && sess.mig_echo_left > 0
-                                                && got_epoch >= cur_epoch);
-                                        if accept_challenge {
-                                            let mut resp_payload =
-                                                [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
-                                            resp_payload[0] = PATH_CHALLENGE_OP_RESP;
-                                            resp_payload[1..PATH_CHALLENGE_PAYLOAD_LEN]
-                                                .copy_from_slice(
-                                                    &self.wbuf[1..PATH_CHALLENGE_PAYLOAD_LEN],
-                                                );
-                                            let was_migrating =
-                                                sess.state == HandshakeState::Migrating;
-                                            let mut flushed = 0usize;
-                                            let mut flushed_bytes = 0u64;
-                                            if was_migrating {
-                                                sess.pending_bytes = 0;
-                                            }
-                                            if let Some(ref mut cipher) = sess.cipher {
-                                                let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
-                                                if let Some(wn) = cipher.wrap_control_into(
-                                                    SRTP_PATH_CHALLENGE_MAGIC,
-                                                    &resp_payload,
-                                                    &mut cbuf,
-                                                ) {
-                                                    if sess.upstream.send(&cbuf[..wn]).is_ok() {
-                                                        sess.tx_pkts += 1;
-                                                    }
-                                                }
-                                                if was_migrating {
-                                                    while let Some(raw) = sess.pending.pop_front() {
-                                                        if let Some(wn) =
-                                                            cipher.wrap_into(&raw, &mut self.wbuf)
-                                                        {
-                                                            if sess
-                                                                .upstream
-                                                                .send(&self.wbuf[..wn])
-                                                                .is_ok()
-                                                            {
-                                                                sess.tx_pkts += 1;
-                                                                sess.tx_bytes += raw.len() as u64;
-                                                                flushed_bytes = flushed_bytes
-                                                                    .saturating_add(
-                                                                        raw.len() as u64
-                                                                    );
-                                                                flushed += 1;
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            sess.state = HandshakeState::Ready;
-                                            sess.mig_txid = None;
-                                            sess.mig_retry_at = None;
-                                            sess.mig_echo_payload = Some(resp_payload.to_vec());
-                                            sess.mig_echo_next_at = Some(
-                                                now + Duration::from_millis(
-                                                    CLIENT_MIG_ECHO_INTERVAL_MS,
-                                                ),
-                                            );
-                                            sess.mig_echo_left = CLIENT_MIG_ECHO_COUNT;
-                                            if was_migrating {
-                                                // 重置新路径的丢包纪元、RTT/抖动与试用期基线，隔离旧黑洞路径的历史断层与残留延迟
-                                                if let Some(ref mut cipher) = sess.cipher {
-                                                    cipher.reset_rx_loss_epoch();
-                                                }
-                                                sess.lane_prev_settled_exp = 0;
-                                                sess.lane_prev_settled_rx = 0;
-                                                sess.lane_last_ka_settled_exp = 0;
-                                                sess.lane_rtt_ewma_ms = None;
-                                                sess.lane_rtt_last_ms = None;
-                                                sess.lane_data_loss_rate = 0.0;
-                                                sess.lane_stun_outcomes.clear();
-                                                sess.lane_jitter_ms = 0.0;
-                                                sess.lane_score = None;
-                                                sess.lane_confirmed = false;
-                                                sess.lane_good_windows = 0;
-                                                sess.lane_subopt_windows = 0;
-                                                sess.lane_degrade_streak = 0;
-                                                sess.next_keepalive_at =
-                                                    now + jitter_duration_ms(self.ka_base_ms);
-                                                if flushed_bytes > 0 {
-                                                    record_client_media_bytes(
-                                                        sess,
-                                                        &self.cfg,
-                                                        self.ka_base_ms,
-                                                        now,
-                                                        flushed_bytes,
-                                                    );
-                                                }
-                                                log(
-                                                self.worker_id,
-                                                &format!(
-                                                    "ICE 1-RTT MIGRATION OK -> READY up_sport={} flushed={}",
-                                                    sess.local_port, flushed
-                                                ),
-                                            );
-                                                if let Some(ref th) = self.telemetry {
-                                                    th.record_migration_1rtt(format!(
-                                                        "up_sport={} flushed={}",
-                                                        sess.local_port, flushed
-                                                    ));
-                                                }
-                                            }
-                                        }
-                                    } else if pn >= PATH_CONFIRM_PAYLOAD_LEN
-                                        && self.wbuf[0] == PATH_CHALLENGE_OP_CONFIRM
-                                    {
-                                        // P2-1: Verify confirm nonce matches active in-flight echo
-                                        let nonce_ok = sess
-                                            .mig_echo_payload
-                                            .as_deref()
-                                            .filter(|p| p.len() >= PATH_CONFIRM_PAYLOAD_LEN)
-                                            .map(|p| p[1..9] == self.wbuf[1..9])
-                                            .unwrap_or(true);
-                                        if nonce_ok {
-                                            sess.mig_echo_left = 0;
-                                            sess.mig_echo_payload = None;
-                                            sess.mig_echo_next_at = None;
-                                        }
-                                    }
-                                }
-                                Some(SrtpFrame::Handover(pn)) => {
-                                    sess.rx_pkts += 1;
-                                    if sess.state == HandshakeState::HandoverWait
-                                        && pn >= 2
-                                        && self.wbuf[0] == HANDOVER_OP_ACK
-                                    {
-                                        sess.handover_payload = None;
-                                        sess.handover_retry_at = None;
-                                        sess.state = HandshakeState::Ready;
-                                        standby_promoted.push((tok, sess.client_addr));
-                                    }
-                                }
-                                Some(SrtpFrame::Probe(_)) => {
-                                    sess.rx_pkts += 1;
-                                    sess.last_data_active = now;
+                                Some(ctrl_frame) => {
+                                    self.handle_client_srtp_ctrl_frame(
+                                        tok,
+                                        ctrl_frame,
+                                        now,
+                                        standby_promoted,
+                                    );
                                 }
                                 None => {
                                     sess.auth_drops += 1;
                                 }
                             }
                             if rx_ok_bytes > 0 {
-                                record_client_media_bytes(
-                                    sess,
-                                    &self.cfg,
-                                    self.ka_base_ms,
-                                    now,
-                                    rx_ok_bytes,
-                                );
+                                if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                    record_client_media_bytes(
+                                        sess,
+                                        &self.cfg,
+                                        self.ka_base_ms,
+                                        now,
+                                        rx_ok_bytes,
+                                    );
+                                }
                             }
                         } else {
                             sess.auth_drops += 1;
@@ -884,10 +1069,155 @@ impl ClientWorker {
                         sess.auth_drops += 1;
                     }
                 }
+    }
+
+    fn handle_client_srtp_ctrl_frame(
+        &mut self,
+        tok: Token,
+        frame: SrtpFrame,
+        now: Instant,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return;
+        };
+        match frame {
+            SrtpFrame::PathChallenge(pn) => {
+                sess.rx_pkts += 1;
+                if pn == PATH_CHALLENGE_PAYLOAD_LEN && self.wbuf[0] == PATH_CHALLENGE_OP_REQ {
+                    // P0-2 fix: Accept 0xFFFD(0x01) both in `Migrating` AND while
+                    // in `Ready` with unconfirmed `mig_echo_left > 0` (epoch >= current)!
+                    let cur_epoch = sess
+                        .mig_echo_payload
+                        .as_deref()
+                        .filter(|p| p.len() == PATH_CHALLENGE_PAYLOAD_LEN)
+                        .map(|p| u64::from_be_bytes(p[9..17].try_into().unwrap()))
+                        .unwrap_or(0);
+                    let got_epoch = u64::from_be_bytes(self.wbuf[9..17].try_into().unwrap());
+                    let accept_challenge = sess.state == HandshakeState::Migrating
+                        || (sess.state == HandshakeState::Ready
+                            && sess.mig_echo_left > 0
+                            && got_epoch >= cur_epoch);
+                    if accept_challenge {
+                        let mut resp_payload = [0u8; PATH_CHALLENGE_PAYLOAD_LEN];
+                        resp_payload[0] = PATH_CHALLENGE_OP_RESP;
+                        resp_payload[1..PATH_CHALLENGE_PAYLOAD_LEN]
+                            .copy_from_slice(&self.wbuf[1..PATH_CHALLENGE_PAYLOAD_LEN]);
+                        let was_migrating = sess.state == HandshakeState::Migrating;
+                        let mut flushed = 0usize;
+                        let mut flushed_bytes = 0u64;
+                        if was_migrating {
+                            sess.pending_bytes = 0;
+                        }
+                        if let Some(ref mut cipher) = sess.cipher {
+                            let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
+                            if let Some(wn) = cipher.wrap_control_into(
+                                SRTP_PATH_CHALLENGE_MAGIC,
+                                &resp_payload,
+                                &mut cbuf,
+                            ) {
+                                if sess.upstream.send(&cbuf[..wn]).is_ok() {
+                                    sess.tx_pkts += 1;
+                                }
+                            }
+                            if was_migrating {
+                                while let Some(raw) = sess.pending.pop_front() {
+                                    if let Some(wn) = cipher.wrap_into(&raw, &mut self.wbuf) {
+                                        if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                                            sess.tx_pkts += 1;
+                                            sess.tx_bytes += raw.len() as u64;
+                                            flushed_bytes =
+                                                flushed_bytes.saturating_add(raw.len() as u64);
+                                            flushed += 1;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        sess.state = HandshakeState::Ready;
+                        sess.mig_txid = None;
+                        sess.mig_retry_at = None;
+                        sess.mig_echo_payload = Some(resp_payload.to_vec());
+                        sess.mig_echo_next_at =
+                            Some(now + Duration::from_millis(CLIENT_MIG_ECHO_INTERVAL_MS));
+                        sess.mig_echo_left = CLIENT_MIG_ECHO_COUNT;
+                        if was_migrating {
+                            // 重置新路径的丢包纪元、RTT/抖动与试用期基线，隔离旧黑洞路径的历史断层与残留延迟
+                            if let Some(ref mut cipher) = sess.cipher {
+                                cipher.reset_rx_loss_epoch();
+                            }
+                            sess.lane_prev_settled_exp = 0;
+                            sess.lane_prev_settled_rx = 0;
+                            sess.lane_last_ka_settled_exp = 0;
+                            sess.lane_rtt_ewma_ms = None;
+                            sess.lane_rtt_last_ms = None;
+                            sess.lane_data_loss_rate = 0.0;
+                            sess.lane_stun_outcomes.clear();
+                            sess.lane_jitter_ms = 0.0;
+                            sess.lane_score = None;
+                            sess.lane_confirmed = false;
+                            sess.lane_good_windows = 0;
+                            sess.lane_subopt_windows = 0;
+                            sess.lane_degrade_streak = 0;
+                            sess.next_keepalive_at = now + jitter_duration_ms(self.ka_base_ms);
+                            if flushed_bytes > 0 {
+                                record_client_media_bytes(
+                                    sess,
+                                    &self.cfg,
+                                    self.ka_base_ms,
+                                    now,
+                                    flushed_bytes,
+                                );
+                            }
+                            log(
+                                self.worker_id,
+                                &format!(
+                                    "ICE 1-RTT MIGRATION OK -> READY up_sport={} flushed={}",
+                                    sess.local_port, flushed
+                                ),
+                            );
+                            if let Some(ref th) = self.telemetry {
+                                th.record_migration_1rtt(format!(
+                                    "up_sport={} flushed={}",
+                                    sess.local_port, flushed
+                                ));
+                            }
+                        }
+                    }
+                } else if pn >= PATH_CONFIRM_PAYLOAD_LEN
+                    && self.wbuf[0] == PATH_CHALLENGE_OP_CONFIRM
+                {
+                    // P2-1: Verify confirm nonce matches active in-flight echo
+                    let nonce_ok = sess
+                        .mig_echo_payload
+                        .as_deref()
+                        .filter(|p| p.len() >= PATH_CONFIRM_PAYLOAD_LEN)
+                        .map(|p| p[1..9] == self.wbuf[1..9])
+                        .unwrap_or(true);
+                    if nonce_ok {
+                        sess.mig_echo_left = 0;
+                        sess.mig_echo_payload = None;
+                        sess.mig_echo_next_at = None;
+                    }
+                }
             }
-        }
-        if let Some((ka_rtt, ka_retries)) = ka_sample {
-            self.evaluate_lane_quality_on_ka(tok, ka_rtt, ka_retries, now);
+            SrtpFrame::Handover(pn) => {
+                sess.rx_pkts += 1;
+                if sess.state == HandshakeState::HandoverWait
+                    && pn >= 2
+                    && self.wbuf[0] == HANDOVER_OP_ACK
+                {
+                    sess.handover_payload = None;
+                    sess.handover_retry_at = None;
+                    sess.state = HandshakeState::Ready;
+                    standby_promoted.push((tok, sess.client_addr));
+                }
+            }
+            SrtpFrame::Probe(_) => {
+                sess.rx_pkts += 1;
+                sess.last_data_active = now;
+            }
+            SrtpFrame::Data(_) => {}
         }
     }
 

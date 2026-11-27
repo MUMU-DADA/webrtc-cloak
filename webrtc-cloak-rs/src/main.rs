@@ -7,13 +7,17 @@ mod protocol;
 mod selftest;
 mod server;
 mod telemetry;
+mod udp_batch;
 
 use crate::bench_tools::{print_cpu_info, run_bench, run_loadgen, run_sink};
 use crate::client::{
     run_client, ClientConfig, LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS,
     DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
 };
-use crate::constants::{DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_WAN_MTU};
+use crate::constants::{
+    normalize_udp_batch, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS, DEFAULT_UDP_BATCH,
+    DEFAULT_WAN_MTU,
+};
 use crate::protocol::{
     detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,
 };
@@ -75,6 +79,7 @@ struct CommonTunnelArgs {
     workers: usize,
     max_sessions: usize,
     wan_mtu: usize,
+    udp_batch: usize,
     dtls_enabled: bool,
     idle_timeout_secs: u64,
     stats_interval_secs: u64,
@@ -147,8 +152,8 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
          webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--no-color] [--json]"
@@ -208,6 +213,10 @@ fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_ar
         .unwrap_or(DEFAULT_MAX_SESSIONS)
         .max(1);
     let wan_mtu = args.opt_value_from_str("--mtu")?.unwrap_or(DEFAULT_WAN_MTU);
+    let udp_batch = normalize_udp_batch(
+        args.opt_value_from_str("--udp-batch")?
+            .unwrap_or(DEFAULT_UDP_BATCH),
+    );
     let dtls_enabled = !args.contains("--no-dtls-decoy");
     let idle_timeout_secs = args
         .opt_value_from_str("--idle-timeout")?
@@ -228,6 +237,7 @@ fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_ar
         workers,
         max_sessions,
         wan_mtu,
+        udp_batch,
         dtls_enabled,
         idle_timeout_secs,
         stats_interval_secs,
@@ -430,6 +440,7 @@ fn run() -> Result<(), pico_args::Error> {
                 workers: common.workers,
                 max_sessions: common.max_sessions,
                 wan_mtu: common.wan_mtu,
+                udp_batch: common.udp_batch,
                 retry_ms,
                 max_retries,
                 keepalive_secs,
@@ -473,6 +484,7 @@ fn run() -> Result<(), pico_args::Error> {
                 workers: common.workers,
                 max_sessions: common.max_sessions,
                 wan_mtu: common.wan_mtu,
+                udp_batch: common.udp_batch,
                 idle_timeout_secs: common.idle_timeout_secs,
                 stats_interval_secs: common.stats_interval_secs,
                 wire_audit_file,

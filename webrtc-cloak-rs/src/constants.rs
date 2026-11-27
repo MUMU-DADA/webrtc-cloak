@@ -70,6 +70,22 @@ pub const CTRL_FRAME_BUF_LEN: usize = 256;
 pub const SOCK_BUF_8MIB: usize = 8 * 1024 * 1024;
 /// `mio::Events` 单次 poll 事件数组容量。
 pub const MIO_EVENTS_CAP: usize = 256;
+/// 可选 Linux UDP 批量收发（`recvmmsg`/`sendmmsg`）默认关闭（`0` = 单包路径，按 `--udp-batch` 显式开启）。
+pub const DEFAULT_UDP_BATCH: usize = 0;
+/// 可选 Linux UDP 批量收发单批最大报文数上限。
+pub const MAX_UDP_BATCH: usize = 64;
+
+/// 归一化 `--udp-batch` 参数：`0` 或 `1` 均视为关闭（返回 `0`），`>= 2` 限幅至 `MAX_UDP_BATCH`。
+#[inline]
+pub const fn normalize_udp_batch(n: usize) -> usize {
+    if n <= 1 {
+        0
+    } else if n > MAX_UDP_BATCH {
+        MAX_UDP_BATCH
+    } else {
+        n
+    }
+}
 /// `mio::Poll` 中主监听套接字的保留事件令牌。
 pub const LISTEN_TOKEN: Token = Token(0);
 /// `mio::Poll` 中用于 Unix 信号自管道无锁优雅退出唤醒的保留令牌。

@@ -2,7 +2,7 @@
 
 use super::handlers::{
     arm_or_reuse_migration_challenge, drain_server_dtls, graceful_teardown_server,
-    process_ready_srtp, send_encrypted_path_challenge,
+    handle_ready_srtp_frame, process_ready_srtp, send_encrypted_path_challenge,
 };
 use super::registry::{TxidCheck, WorkerCmd};
 use super::worker::ServerWorker;
@@ -19,11 +19,13 @@ use crate::protocol::{
     build_stun_success_response, build_stun_success_response_with_key, combine_session_key,
     demux_rfc7983, derive_ice_migration_key, derive_stun_material, new_dtls_instance,
     parse_stun_with_key, peek_stun_request_username, rand_duration_range_ms, resolve_srtp_suite,
-    validate_dtls_datagram, PacketKind, RollingByteWindow, SrtpCloakCipher,
+    validate_dtls_datagram, PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
+use crate::udp_batch::UdpSendBatch;
 use mio::Token;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
+use std::net::SocketAddr;
 use std::time::{Duration, Instant};
 
 /// 服务端在 DTLS Flight 5 完成前每会话最多缓存的 0-RTT 早到 SRTP 包数。
@@ -31,18 +33,186 @@ const EARLY_SRTP_CAP: usize = 32;
 /// 服务端未验证迁移候选映射表硬容量上限，防止 OOM。
 const MAX_MIG_PENDING_MAP: usize = 4096;
 
+#[inline]
+fn flush_server_uplink_batch(
+    pending_tok: &mut Option<Token>,
+    tx_batch: &mut UdpSendBatch,
+    sessions_by_token: &mut HashMap<Token, ServerSession>,
+    now: Instant,
+) {
+    if let Some(tok) = pending_tok.take() {
+        if tx_batch.is_empty() {
+            return;
+        }
+        if let Some(sess) = sessions_by_token.get_mut(&tok) {
+            let (sent_pkts, sent_bytes) = match sess.backend {
+                BackendPipe::Owned(ref sock) => tx_batch.flush_connected(sock),
+                _ => {
+                    // 清空残留槽位，防止影响后续会话
+                    let _ = tx_batch.is_empty();
+                    (0, 0)
+                }
+            };
+            if sent_pkts > 0 {
+                sess.rx_pkts += sent_pkts as u64;
+                sess.rx_bytes += sent_bytes;
+                record_server_media_bytes(sess, now, sent_bytes);
+            }
+        }
+    }
+}
+
 impl ServerWorker {
     pub(super) fn handle_listen_readable(&mut self, now: Instant) {
+        if self.rx_batch.is_some() {
+            self.handle_listen_readable_batched(now);
+            return;
+        }
         loop {
             let (n, peer_addr) = match self.listen_sock.recv_from(&mut self.rbuf) {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             };
-            let pkt = &self.rbuf[..n];
-            self.audit.record(0, pkt);
+            self.dispatch_listen_packet(n, peer_addr, now);
+        }
+    }
 
-            match demux_rfc7983(pkt) {
+    fn handle_listen_readable_batched(&mut self, now: Instant) {
+        let Some(mut rx_batch) = self.rx_batch.take() else {
+            return;
+        };
+        let Some(mut tx_batch) = self.tx_batch.take() else {
+            self.rx_batch = Some(rx_batch);
+            return;
+        };
+
+        loop {
+            let count = match rx_batch.recv_from(&self.listen_sock) {
+                Ok(0) => break,
+                Ok(n) => n,
+                Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                Err(_) => break,
+            };
+            let mut pending_tok: Option<Token> = None;
+
+            for i in 0..count {
+                let pkt = rx_batch.packet(i);
+                let Some(peer_addr) = rx_batch.peer(i) else {
+                    continue;
+                };
+                if pkt.is_empty() {
+                    continue;
+                }
+
+                // 快路径：已就绪且持有 Owned 后端套接字的 SRTP 数据包，零拷贝解密入批并合并 sendmmsg
+                if demux_rfc7983(pkt) == PacketKind::Srtp {
+                    if let Some(&tok) = self.token_by_peer.get(&peer_addr) {
+                        let fast_ready = self.sessions_by_token.get(&tok).is_some_and(|s| {
+                            s.state == ServerState::Ready
+                                && matches!(s.backend, BackendPipe::Owned(_))
+                        });
+                        if fast_ready {
+                            if pending_tok != Some(tok) || tx_batch.is_full() {
+                                flush_server_uplink_batch(
+                                    &mut pending_tok,
+                                    &mut tx_batch,
+                                    &mut self.sessions_by_token,
+                                    now,
+                                );
+                                pending_tok = Some(tok);
+                            }
+                            self.audit.record(0, pkt);
+                            let frame = {
+                                let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                                let slot = tx_batch.next_slot_mut().unwrap();
+                                sess.cipher
+                                    .as_mut()
+                                    .and_then(|c| c.unwrap_into_ex(pkt, slot))
+                            };
+                            match frame {
+                                Some(SrtpFrame::Data(pn)) => {
+                                    tx_batch.commit_slot(pn, pn as u64, None);
+                                    if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                        sess.last_data_active = now;
+                                        sess.last_peer_rx = now;
+                                    }
+                                }
+                                Some(ctrl_frame) => {
+                                    let pn = match ctrl_frame {
+                                        SrtpFrame::Data(n)
+                                        | SrtpFrame::Probe(n)
+                                        | SrtpFrame::PathChallenge(n)
+                                        | SrtpFrame::Handover(n) => n,
+                                    };
+                                    let copy_len = pn.min(self.wbuf.len());
+                                    self.wbuf[..copy_len]
+                                        .copy_from_slice(tx_batch.uncommitted_slot_prefix(copy_len));
+                                    flush_server_uplink_batch(
+                                        &mut pending_tok,
+                                        &mut tx_batch,
+                                        &mut self.sessions_by_token,
+                                        now,
+                                    );
+                                    handle_ready_srtp_frame(
+                                        self.worker_id,
+                                        tok,
+                                        peer_addr,
+                                        ctrl_frame,
+                                        &mut self.sessions_by_token,
+                                        &mut self.token_by_peer,
+                                        &mut self.token_by_ufrag,
+                                        &mut self.local_mig_pending,
+                                        &self.poll,
+                                        &self.listen_sock,
+                                        &self.cfg,
+                                        &self.registry,
+                                        self.telemetry.as_ref(),
+                                        &mut self.wbuf,
+                                        now,
+                                        &mut self.audit,
+                                    );
+                                }
+                                None => {
+                                    if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                        sess.auth_drops += 1;
+                                    }
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
+
+                // 慢路径（STUN / DTLS / SRTCP / 首包建后端 / 迁移 / 交接）：先按序刷新数据批再复用既有状态机
+                flush_server_uplink_batch(
+                    &mut pending_tok,
+                    &mut tx_batch,
+                    &mut self.sessions_by_token,
+                    now,
+                );
+                let len = pkt.len().min(self.rbuf.len());
+                self.rbuf[..len].copy_from_slice(&pkt[..len]);
+                self.dispatch_listen_packet(len, peer_addr, now);
+            }
+
+            flush_server_uplink_batch(
+                &mut pending_tok,
+                &mut tx_batch,
+                &mut self.sessions_by_token,
+                now,
+            );
+        }
+
+        self.rx_batch = Some(rx_batch);
+        self.tx_batch = Some(tx_batch);
+    }
+
+    fn dispatch_listen_packet(&mut self, n: usize, peer_addr: SocketAddr, now: Instant) {
+        let pkt = &self.rbuf[..n];
+        self.audit.record(0, pkt);
+
+        match demux_rfc7983(pkt) {
                 PacketKind::Stun => {
                     // V4 + P0-1 fix: `already_same_peer` strictly checks `s.peer_addr == peer_addr`
                     // (NOT old_peer_addr or unverified candidate!) so retries & Addr1->Addr2->Addr1
@@ -82,7 +252,7 @@ impl ServerWorker {
                                 match txid_status {
                                     TxidCheck::Rejected => {
                                         self.unauth_drops += 1;
-                                        continue;
+                                        return;
                                     }
                                     TxidCheck::Retransmit(buf, len) => {
                                         let reply = &buf[..len as usize];
@@ -126,7 +296,7 @@ impl ServerWorker {
                                                 },
                                             );
                                         }
-                                        continue;
+                                        return;
                                     }
                                     TxidCheck::Fresh => {}
                                 }
@@ -148,7 +318,7 @@ impl ServerWorker {
                                         self.local_mig_pending.retain(|_, (_, e)| now <= *e);
                                         if self.local_mig_pending.len() >= MAX_MIG_PENDING_MAP {
                                             self.unauth_drops += 1;
-                                            continue;
+                                            return;
                                         }
                                     }
                                     if let Some(&tok) = self.token_by_ufrag.get(&uname) {
@@ -178,7 +348,7 @@ impl ServerWorker {
                                                         &mut self.audit,
                                                     );
                                                 }
-                                                continue;
+                                                return;
                                             }
                                         }
                                     }
@@ -188,7 +358,7 @@ impl ServerWorker {
                                         self.cross_worker_pending.retain(|_, (_, _, e)| now <= *e);
                                         if self.cross_worker_pending.len() >= MAX_MIG_PENDING_MAP {
                                             self.unauth_drops += 1;
-                                            continue;
+                                            return;
                                         }
                                     }
                                     self.cross_worker_pending.insert(
@@ -208,20 +378,20 @@ impl ServerWorker {
                                             stun_resp: resp,
                                         },
                                     );
-                                    continue;
+                                    return;
                                 }
                             }
                         }
                         // Existing active ufrag from another peer MUST pass mi_key_mig; reject global PSK hijack!
                         self.unauth_drops += 1;
-                        continue;
+                        return;
                     }
 
                     let parsed = match parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key) {
                         Some(p) if p.msg_type == STUN_BINDING_REQUEST && p.authenticated => p,
                         _ => {
                             self.unauth_drops += 1;
-                            continue;
+                            return;
                         }
                     };
 
@@ -245,7 +415,7 @@ impl ServerWorker {
                     match txid_status {
                         TxidCheck::Rejected => {
                             self.unauth_drops += 1;
-                            continue;
+                            return;
                         }
                         TxidCheck::Retransmit(buf, len) => {
                             let reply = &buf[..len as usize];
@@ -258,7 +428,7 @@ impl ServerWorker {
                                     }
                                 }
                             }
-                            continue;
+                            return;
                         }
                         TxidCheck::Fresh => {}
                     }
@@ -277,14 +447,14 @@ impl ServerWorker {
                                 sess.keepalives += 1;
                                 sess.last_peer_rx = now;
                             }
-                            continue;
+                            return;
                         }
                     }
 
                     // NEW-M-01: Reject orphan STUN keepalives (without USE-CANDIDATE)
                     if !parsed.use_candidate {
                         self.unauth_drops += 1;
-                        continue;
+                        return;
                     }
 
                     // P0-3: Reject duplicate ufrag hijacking an active/handshaking session on another peer!
@@ -299,7 +469,7 @@ impl ServerWorker {
                             || self.registry.lookup_ufrag(&uname).is_some())
                     {
                         self.unauth_drops += 1;
-                        continue;
+                        return;
                     }
 
                     // P0-1 fix: Re-key ONLY if `old.peer_addr == peer_addr`!
@@ -397,7 +567,7 @@ impl ServerWorker {
                                     self.cfg.max_sessions, peer_addr
                                 ),
                             );
-                            continue;
+                            return;
                         }
                     }
 
@@ -528,7 +698,7 @@ impl ServerWorker {
                             if sess.peer_addr != peer_addr
                                 || matches!(sess.state, ServerState::Closing(_, _))
                             {
-                                continue;
+                                return;
                             }
                             let ready_only_alert = sess.state == ServerState::Ready
                                 && (sess.rx_pkts > 0
@@ -543,7 +713,7 @@ impl ServerWorker {
                                         .unwrap_or(false));
                             if !validate_dtls_datagram(pkt, ready_only_alert) {
                                 sess.auth_drops += 1;
-                                continue;
+                                return;
                             }
                             let mut dtls_err = false;
                             if let Some(ref mut dtls) = sess.dtls {
@@ -555,7 +725,7 @@ impl ServerWorker {
                                 }
                             } else {
                                 sess.auth_drops += 1;
-                                continue;
+                                return;
                             }
                             if dtls_err {
                                 sess.auth_drops += 1;
@@ -579,7 +749,7 @@ impl ServerWorker {
                                     sess.dtls = Some(fresh);
                                     sess.dtls_next_timeout = None;
                                 }
-                                continue;
+                                return;
                             }
                             if sess.state == ServerState::DtlsHandshake {
                                 sess.last_peer_rx = now;
@@ -753,10 +923,13 @@ impl ServerWorker {
                     self.unauth_drops += 1;
                 }
             }
-        }
     }
 
     pub(super) fn handle_backend_readable(&mut self, tok: Token, now: Instant) {
+        if self.rx_batch.is_some() {
+            self.handle_backend_readable_batched(tok, now);
+            return;
+        }
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             loop {
                 let n = match sess.backend {
@@ -797,5 +970,78 @@ impl ServerWorker {
                 }
             }
         }
+    }
+
+    fn handle_backend_readable_batched(&mut self, tok: Token, now: Instant) {
+        let Some(mut rx_batch) = self.rx_batch.take() else {
+            return;
+        };
+        let Some(mut tx_batch) = self.tx_batch.take() else {
+            self.rx_batch = Some(rx_batch);
+            return;
+        };
+
+        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+            loop {
+                let count = match sess.backend {
+                    BackendPipe::Owned(ref sock) => match rx_batch.recv_connected(sock) {
+                        Ok(0) => break,
+                        Ok(n) => n,
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    },
+                    _ => break,
+                };
+                let can_tx_downlink = matches!(
+                    sess.state,
+                    ServerState::Ready | ServerState::Closing(_, true)
+                );
+                if !can_tx_downlink {
+                    continue;
+                }
+                let peer_addr = sess.peer_addr;
+                let is_ready = sess.state == ServerState::Ready;
+                for i in 0..count {
+                    let pkt = rx_batch.packet(i);
+                    if pkt.is_empty() || pkt.len() > MAX_INNER_UDP_LEN {
+                        continue;
+                    }
+                    if tx_batch.is_full() {
+                        let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                        if sp > 0 {
+                            sess.tx_pkts += sp as u64;
+                            sess.tx_bytes += sb;
+                            if is_ready {
+                                record_server_media_bytes(sess, now, sb);
+                            }
+                        }
+                    }
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if is_ready {
+                            sess.last_data_active = now;
+                        }
+                        if let Some(slot) = tx_batch.next_slot_mut() {
+                            if let Some(wn) = cipher.wrap_into(pkt, slot) {
+                                self.audit.record(1, &slot[..wn]);
+                                tx_batch.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
+                            }
+                        }
+                    }
+                }
+                if !tx_batch.is_empty() {
+                    let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
+                    if sp > 0 {
+                        sess.tx_pkts += sp as u64;
+                        sess.tx_bytes += sb;
+                        if is_ready {
+                            record_server_media_bytes(sess, now, sb);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.rx_batch = Some(rx_batch);
+        self.tx_batch = Some(tx_batch);
     }
 }

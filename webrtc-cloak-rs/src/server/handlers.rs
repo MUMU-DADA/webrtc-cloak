@@ -397,6 +397,46 @@ pub(super) fn process_ready_srtp(
         }
     };
 
+    handle_ready_srtp_frame(
+        worker_id,
+        tok,
+        from_peer,
+        frame,
+        sessions_by_token,
+        token_by_peer,
+        token_by_ufrag,
+        local_mig_pending,
+        poll,
+        listen_sock,
+        cfg,
+        registry,
+        telemetry,
+        wbuf,
+        now,
+        audit,
+    );
+}
+
+/// 分发已完成解密的 Ready SRTP 帧（供单包与批量 `recvmmsg` 热路径共用，避免重复解密触发重放丢弃）。
+#[allow(clippy::too_many_arguments)]
+pub(super) fn handle_ready_srtp_frame(
+    worker_id: usize,
+    tok: Token,
+    from_peer: SocketAddr,
+    frame: SrtpFrame,
+    sessions_by_token: &mut HashMap<Token, ServerSession>,
+    token_by_peer: &mut HashMap<SocketAddr, Token>,
+    token_by_ufrag: &mut HashMap<String, Token>,
+    local_mig_pending: &mut HashMap<SocketAddr, (Token, Instant)>,
+    poll: &Poll,
+    listen_sock: &MioUdpSocket,
+    cfg: &ServerConfig,
+    registry: &SharedV4Registry,
+    telemetry: Option<&Arc<TelemetryHub>>,
+    wbuf: &mut [u8],
+    now: Instant,
+    audit: &mut WireAudit,
+) {
     match frame {
         SrtpFrame::Data(pn) => {
             let delivered = deliver_uplink_payload(

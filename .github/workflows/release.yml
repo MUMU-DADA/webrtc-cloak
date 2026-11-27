@@ -206,6 +206,9 @@ jobs:
           - **Checksums**: `SHA256SUMS.txt`
 
           ### Key Highlights
+          - **Opt-In Linux UDP Batch I/O (`--udp-batch <0|2..64>`, `v0.4.6`, 100% wire-compatible with `v0.4.x`)**:
+            - Disabled by default (`--udp-batch 0`, zero extra buffer allocation, preserves exact single-packet path and ~2 MiB router footprint)
+            - When enabled on Linux (e.g. `--udp-batch 32`), accelerates all four hot loops (server/client uplink & downlink) with pre-allocated zero-copy `recvmmsg` / `sendmmsg` batching across IPv4 and IPv6, slashing syscall and KVM VM-exit/KPTI overhead by an order of magnitude while keeping strict control-frame ordering and exact byte/packet telemetry; non-Linux platforms safely fall back to single-packet I/O
           - **Universal Multi-Metric Adaptive Lane Scoring & Continuous Reinforcement (`v0.4.5`, 100% wire-compatible with `v0.4.x`)**:
             - **Zero-hardcoded-threshold cold-start calibration (`--lane-target-rtt 0`)**: automatically samples across multiple staggered STUN rounds (`>= 2` rounds / up to 3 rounds for background `PreWarm`) with universal early-settle `(best_rtt + 45ms).clamp(80, 550)` to lock onto the global minimum RTT across 5ms–250ms geographies
             - **Zero-wire-overhead SRTP data-plane packet loss + composite lane score (`0–100`)**: `SrtpCloakCipher::rx_settled_stats()` tracks exact downlink loss across Video+Audio SSRCs while excluding the trailing 24-packet reorder tail (0% false loss under heavy ECMP reordering) and isolating 1-RTT migration gaps via `reset_rx_loss_epoch()`; catches low-RTT throttled/lossy ("fake-good") lanes (`>= 8%` loss) and escapes via 0ms MBB `0xFFFC` handover

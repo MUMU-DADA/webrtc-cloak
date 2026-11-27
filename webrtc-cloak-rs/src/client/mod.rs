@@ -25,6 +25,7 @@ use crate::protocol::{
     RollingByteWindow, SessionIceParams, SrtpCloakCipher,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryHub};
+use crate::udp_batch::format_udp_batch_mode;
 use dimpl::Dtls;
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::Token;
@@ -88,6 +89,7 @@ pub struct ClientConfig {
     pub workers: usize,
     pub max_sessions: usize,
     pub wan_mtu: usize,
+    pub udp_batch: usize,
     pub retry_ms: u64,
     pub max_retries: u32,
     pub keepalive_secs: u64,
@@ -396,13 +398,14 @@ pub fn run_client(cfg: ClientConfig) -> std::io::Result<()> {
             String::new()
         };
         println!(
-            "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs){}",
+            "[client-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,pfs){} udp_batch={}",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
             workers,
             cfg.dtls_min_version.as_str(),
-            lane_info
+            lane_info,
+            format_udp_batch_mode(cfg.udp_batch),
         );
     }
     #[cfg(not(target_os = "linux"))]

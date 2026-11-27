@@ -18,6 +18,7 @@ use crate::protocol::{
     CpuAccelInfo, DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
+use crate::udp_batch::{is_udp_batch_active, UdpRecvBatch, UdpSendBatch};
 use dimpl::ProtocolVersion;
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Events, Interest, Poll, Token};
@@ -54,6 +55,8 @@ pub(super) struct ClientWorker {
     pub(super) rbuf: Vec<u8>,
     pub(super) wbuf: Vec<u8>,
     pub(super) dtls_buf: Vec<u8>,
+    pub(super) rx_batch: Option<UdpRecvBatch>,
+    pub(super) tx_batch: Option<UdpSendBatch>,
     pub(super) cpu: CpuAccelInfo,
     pub(super) retry_dur: Duration,
     pub(super) ka_base_ms: u64,
@@ -113,6 +116,9 @@ pub(super) fn run_client_worker(
 
     let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
     let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
+    let batch_enabled = is_udp_batch_active(cfg.udp_batch);
+    let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
+    let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
     let mut worker = ClientWorker {
         worker_id,
         cfg,
@@ -140,6 +146,8 @@ pub(super) fn run_client_worker(
         rbuf: vec![0u8; rbuf_len],
         wbuf: vec![0u8; wbuf_len],
         dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
+        rx_batch,
+        tx_batch,
         cpu,
         retry_dur,
         ka_base_ms,

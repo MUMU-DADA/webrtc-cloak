@@ -14,6 +14,7 @@ use crate::protocol::{
     DtlsMinVersion, RollingByteWindow, SrtpCloakCipher,
 };
 use crate::telemetry::{TelemetryConfig, TelemetryHub};
+use crate::udp_batch::format_udp_batch_mode;
 use dimpl::Dtls;
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Interest, Poll, Token};
@@ -98,6 +99,7 @@ pub struct ServerConfig {
     pub workers: usize,
     pub max_sessions: usize,
     pub wan_mtu: usize,
+    pub udp_batch: usize,
     pub idle_timeout_secs: u64,
     pub stats_interval_secs: u64,
     pub wire_audit_file: Option<String>,
@@ -328,12 +330,13 @@ pub fn run_server(cfg: ServerConfig) -> std::io::Result<()> {
     );
     if !cfg.quiet {
         println!(
-            "[server-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,cookie,pfs) silent_drop=true",
+            "[server-rs] V4.0 CPU arch={} hw_accel=[{}] recommended={} workers={} dtls=dimpl-{}(mutual-cert,cookie,pfs) silent_drop=true udp_batch={}",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
             workers,
             cfg.dtls_min_version.as_str(),
+            format_udp_batch_mode(cfg.udp_batch),
         );
     }
     #[cfg(not(target_os = "linux"))]
