@@ -573,12 +573,32 @@ impl ClientWorker {
                         } else {
                             sess.next_keepwarm_at = Some(now + keepwarm_dur);
                         }
-                    } else if now.duration_since(sess.last_data_active) > self.idle_dur {
+                    } else if !self.reverse_agent
+                        && now.duration_since(sess.last_data_active) > self.idle_dur
+                    {
                         graceful_teardown_client(sess, &mut self.dtls_buf);
                         sess.state = HandshakeState::Closing(
                             now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                         );
                         continue;
+                    }
+                    if self.reverse_agent
+                        && !sess.is_standby
+                        && !sess.is_prewarm
+                        && !sess.rev_registered
+                    {
+                        if let Some(t) = sess.next_rev_hello_at {
+                            if now < t {
+                                let rem = t.saturating_duration_since(now);
+                                if rem < wait {
+                                    wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                                }
+                            } else {
+                                wait = wait.min(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        } else {
+                            wait = wait.min(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                        }
                     }
                     // RFC 7675 §5.1 + RFC 5389 §7.2.1 bidirectional STUN consent check:
                     // ONLY an authenticated STUN Binding Success Response proves uplink connectivity
@@ -630,9 +650,9 @@ impl ClientWorker {
                                             );
                                             continue;
                                         }
-                                        let active_recently = now
-                                            .duration_since(sess.last_data_active)
-                                            <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                        let active_recently = self.reverse_agent
+                                            || now.duration_since(sess.last_data_active)
+                                                <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                         if active_recently
                                             && !sess.is_standby
                                             && sess.mi_key_mig.is_some()

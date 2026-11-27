@@ -5,10 +5,10 @@ use crate::client::compute_lane_score;
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    unspecified_addr_for, worker_udp_recv_buf_len, LISTEN_TOKEN, MIO_EVENTS_CAP, SOCK_BUF_8MIB,
-    STUN_BINDING_SUCCESS, STUN_HDR_LEN, TELEMETRY_DEFAULT_INTERVAL_SECS, WORKER_ACTIVE_POLL_SECS,
-    WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
-    WORKER_QUIET_STOP_POLL_MS,
+    unspecified_addr_for, worker_udp_recv_buf_len, worker_udp_write_buf_len, SharedPoll,
+    LISTEN_TOKEN, MIO_EVENTS_CAP, SOCK_BUF_8MIB, STUN_BINDING_SUCCESS, STUN_HDR_LEN,
+    TELEMETRY_DEFAULT_INTERVAL_SECS, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
+    WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
     build_ice_stun_request, is_shutdown_requested, jitter_duration_ms, make_fresh_stun_txid,
@@ -184,11 +184,12 @@ struct BypassSession {
     auth_drops: u64,
 }
 
-struct BypassWorker {
+pub(crate) struct BypassWorker {
     worker_id: usize,
     cfg: BypassConfig,
-    poll: Poll,
-    listen_sock: MioUdpSocket,
+    poll: SharedPoll,
+    listen_sock: Option<MioUdpSocket>,
+    report_telemetry_periodic: bool,
     sessions_by_tok: HashMap<Token, BypassSession>,
     tok_by_client: HashMap<SocketAddr, Token>,
     old_drains: HashMap<Token, OldDrain>,
@@ -235,7 +236,7 @@ pub(super) fn run_bypass_worker(
     telemetry: Option<Arc<TelemetryHub>>,
 ) -> std::io::Result<()> {
     BYPASS_QUIET.with(|q| q.set(cfg.quiet));
-    let poll = Poll::new()?;
+    let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, cfg.quiet, cfg.stop.is_some());
 
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
@@ -260,6 +261,7 @@ pub(super) fn run_bypass_worker(
         .map(|th| th.interval())
         .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
+    let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
 
     let mut w = BypassWorker {
         worker_id,
@@ -269,8 +271,9 @@ pub(super) fn run_bypass_worker(
         last_stats: now,
         telemetry_dur,
         last_telemetry: now,
-        poll,
-        listen_sock,
+        poll: shared_poll,
+        listen_sock: Some(listen_sock),
+        report_telemetry_periodic: true,
         sessions_by_tok: HashMap::with_capacity(8),
         tok_by_client: HashMap::with_capacity(8),
         old_drains: HashMap::with_capacity(4),
@@ -304,7 +307,7 @@ pub(super) fn run_bypass_worker(
             break;
         }
         let wait = w.next_poll_timeout(Instant::now());
-        if let Err(e) = w.poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = poll.poll(&mut events, Some(wait)) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
@@ -333,9 +336,9 @@ pub(super) fn run_bypass_worker(
             if tok == LISTEN_TOKEN {
                 w.handle_local_readable(now);
             } else if w.sessions_by_tok.contains_key(&tok) {
-                w.handle_upstream_readable(tok, now);
+                w.handle_upstream_readable_with(tok, now, None);
             } else if w.old_drains.contains_key(&tok) {
-                w.handle_drain_readable(tok, now);
+                w.handle_drain_readable_with(tok, now, None);
             } else if w.hunt_tok_set.contains_key(&tok) {
                 w.handle_hunt_readable(tok, now);
             } else if w.prewarm.as_ref().is_some_and(|p| p.tok == tok) {
@@ -651,11 +654,14 @@ impl BypassWorker {
     }
 
     fn handle_local_readable(&mut self, now: Instant) {
+        let Some(listen_sock) = self.listen_sock.take() else {
+            return;
+        };
         if self.rx_batch.is_some() && self.tx_batch.is_some() {
             let mut rx_b = self.rx_batch.take().unwrap();
             let mut tx_b = self.tx_batch.take().unwrap();
             loop {
-                match rx_b.recv_from(&self.listen_sock) {
+                match rx_b.recv_from(&listen_sock) {
                     Ok(count) => {
                         let mut cur_tok: Option<Token> = None;
                         for i in 0..count {
@@ -695,11 +701,12 @@ impl BypassWorker {
             }
             self.rx_batch = Some(rx_b);
             self.tx_batch = Some(tx_b);
+            self.listen_sock = Some(listen_sock);
             return;
         }
 
         loop {
-            let (n, client_addr) = match self.listen_sock.recv_from(&mut self.rbuf) {
+            let (n, client_addr) = match listen_sock.recv_from(&mut self.rbuf) {
                 Ok(v) => v,
                 Err(ref e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
@@ -718,6 +725,7 @@ impl BypassWorker {
                 }
             }
         }
+        self.listen_sock = Some(listen_sock);
     }
 
     fn flush_tx_batch_to_session(&mut self, tok: Token, tx_b: &mut UdpSendBatch, now: Instant) {
@@ -736,7 +744,12 @@ impl BypassWorker {
         }
     }
 
-    fn handle_upstream_readable(&mut self, tok: Token, now: Instant) {
+    fn handle_upstream_readable_with(
+        &mut self,
+        tok: Token,
+        now: Instant,
+        mut downlink: Option<&mut crate::server::ServerWorker>,
+    ) {
         if self.rx_batch.is_some() && self.tx_batch.is_some() {
             let mut rx_b = self.rx_batch.take().unwrap();
             let mut tx_b = self.tx_batch.take().unwrap();
@@ -758,15 +771,33 @@ impl BypassWorker {
                                 continue;
                             }
                             if tx_b.is_full() {
-                                let (sp, sb) = tx_b.flush_to(&self.listen_sock);
-                                if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
-                                    s.rx_pkts = s.rx_pkts.saturating_add(sp as u64);
-                                    s.rx_bytes = s.rx_bytes.saturating_add(sb);
-                                    s.last_activity = now;
+                                let (sp, sb) = if let Some(ref mut ingress) = downlink {
+                                    let (sp, sb) = tx_b.flush_to(&ingress.listen_sock);
+                                    if sp > 0 {
+                                        ingress.record_downlink_sent(client_addr, sp, sb, now);
+                                    }
+                                    (sp, sb)
+                                } else if let Some(ref sock) = self.listen_sock {
+                                    tx_b.flush_to(sock)
+                                } else {
+                                    (0, 0)
+                                };
+                                if sp > 0 {
+                                    if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
+                                        s.rx_pkts = s.rx_pkts.saturating_add(sp as u64);
+                                        s.rx_bytes = s.rx_bytes.saturating_add(sb);
+                                        s.last_activity = now;
+                                    }
                                 }
                             }
                             if let Some(slot) = tx_b.next_slot_mut() {
-                                if pkt.len() <= slot.len() {
+                                if let Some(ref mut ingress) = downlink {
+                                    if let Some((wn, peer_addr)) = ingress
+                                        .encrypt_downlink_into_slot(client_addr, pkt, slot, now)
+                                    {
+                                        tx_b.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
+                                    }
+                                } else if pkt.len() <= slot.len() {
                                     slot[..pkt.len()].copy_from_slice(pkt);
                                     tx_b.commit_slot(
                                         pkt.len(),
@@ -777,11 +808,23 @@ impl BypassWorker {
                             }
                         }
                         if !tx_b.is_empty() {
-                            let (sp, sb) = tx_b.flush_to(&self.listen_sock);
-                            if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
-                                s.rx_pkts = s.rx_pkts.saturating_add(sp as u64);
-                                s.rx_bytes = s.rx_bytes.saturating_add(sb);
-                                s.last_activity = now;
+                            let (sp, sb) = if let Some(ref mut ingress) = downlink {
+                                let (sp, sb) = tx_b.flush_to(&ingress.listen_sock);
+                                if sp > 0 {
+                                    ingress.record_downlink_sent(client_addr, sp, sb, now);
+                                }
+                                (sp, sb)
+                            } else if let Some(ref sock) = self.listen_sock {
+                                tx_b.flush_to(sock)
+                            } else {
+                                (0, 0)
+                            };
+                            if sp > 0 {
+                                if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
+                                    s.rx_pkts = s.rx_pkts.saturating_add(sp as u64);
+                                    s.rx_bytes = s.rx_bytes.saturating_add(sb);
+                                    s.last_activity = now;
+                                }
                             }
                         }
                         for sf in stun_frames {
@@ -811,11 +854,14 @@ impl BypassWorker {
                 self.process_session_stun(tok, &sf, now);
                 continue;
             }
-            if self
-                .listen_sock
-                .send_to(&self.rbuf[..n], client_addr)
-                .is_ok()
-            {
+            let delivered = if let Some(ref mut ingress) = downlink {
+                ingress.deliver_downlink_single(client_addr, &self.rbuf[..n], now)
+            } else if let Some(ref sock) = self.listen_sock {
+                sock.send_to(&self.rbuf[..n], client_addr).is_ok()
+            } else {
+                false
+            };
+            if delivered {
                 if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
                     s.rx_pkts = s.rx_pkts.saturating_add(1);
                     s.rx_bytes = s.rx_bytes.saturating_add(n as u64);
@@ -825,7 +871,12 @@ impl BypassWorker {
         }
     }
 
-    fn handle_drain_readable(&mut self, tok: Token, now: Instant) {
+    fn handle_drain_readable_with(
+        &mut self,
+        tok: Token,
+        now: Instant,
+        mut downlink: Option<&mut crate::server::ServerWorker>,
+    ) {
         while let Some(d) = self.old_drains.get(&tok) {
             let (n, client_addr) = match d.sock.recv(&mut self.rbuf) {
                 Ok(n) => (n, d.client_addr),
@@ -835,11 +886,14 @@ impl BypassWorker {
             if n == 0 || is_stun_wire_packet(&self.rbuf[..n]) {
                 continue;
             }
-            if self
-                .listen_sock
-                .send_to(&self.rbuf[..n], client_addr)
-                .is_ok()
-            {
+            let delivered = if let Some(ref mut ingress) = downlink {
+                ingress.deliver_downlink_single(client_addr, &self.rbuf[..n], now)
+            } else if let Some(ref sock) = self.listen_sock {
+                sock.send_to(&self.rbuf[..n], client_addr).is_ok()
+            } else {
+                false
+            };
+            if delivered {
                 if let Some(&active_tok) = self.tok_by_client.get(&client_addr) {
                     if let Some(s) = self.sessions_by_tok.get_mut(&active_tok) {
                         s.rx_pkts = s.rx_pkts.saturating_add(1);
@@ -1485,7 +1539,9 @@ impl BypassWorker {
         }
 
         // 5. Periodic stats & telemetry
-        if self.cfg.stats_interval_secs > 0 && now.duration_since(self.last_stats) >= self.stats_dur
+        if self.report_telemetry_periodic
+            && self.cfg.stats_interval_secs > 0
+            && now.duration_since(self.last_stats) >= self.stats_dur
         {
             self.last_stats = now;
             if !self.sessions_by_tok.is_empty() {
@@ -1509,17 +1565,182 @@ impl BypassWorker {
             }
         }
 
-        if self.telemetry.is_some() && now.duration_since(self.last_telemetry) >= self.telemetry_dur
+        if self.report_telemetry_periodic
+            && self.telemetry.is_some()
+            && now.duration_since(self.last_telemetry) >= self.telemetry_dur
         {
             self.last_telemetry = now;
             self.push_telemetry_snapshot();
         }
     }
 
-    fn push_telemetry_snapshot(&self) {
-        let Some(ref th) = self.telemetry else {
-            return;
+    pub(crate) fn new_for_relay(
+        worker_id: usize,
+        cfg: BypassConfig,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> Self {
+        BYPASS_QUIET.with(|q| q.set(cfg.quiet));
+        let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
+        let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
+        let batch_enabled = is_udp_batch_active(cfg.udp_batch);
+        let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
+        // Relay downlink writes SRTP-wrapped packets straight into tx_batch slots.
+        let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
+        let telemetry_dur = telemetry
+            .as_ref()
+            .map(|th| th.interval())
+            .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
+        let now = Instant::now();
+        let mut w = BypassWorker {
+            worker_id,
+            ka_base_ms: cfg.keepalive_secs.max(1) * 1000,
+            idle_dur: Duration::from_secs(cfg.idle_timeout_secs),
+            stats_dur: Duration::from_secs(cfg.stats_interval_secs),
+            last_stats: now,
+            telemetry_dur,
+            last_telemetry: now,
+            poll,
+            listen_sock: None,
+            report_telemetry_periodic: false,
+            sessions_by_tok: HashMap::with_capacity(8),
+            tok_by_client: HashMap::with_capacity(8),
+            old_drains: HashMap::with_capacity(4),
+            drain_order: VecDeque::with_capacity(4),
+            hunt: None,
+            hunt_tok_set: HashMap::with_capacity(8),
+            prewarm: None,
+            next_prewarm_at: cfg.lane_hunt.enabled.then_some(now),
+            best_observed_rtt_ms: None,
+            trial_fail_streak: 0,
+            next_token_id: 1,
+            telemetry,
+            rbuf: vec![0u8; rbuf_len],
+            rx_batch,
+            tx_batch,
+            closed_tx_bytes: 0,
+            closed_rx_bytes: 0,
+            closed_tx_pkts: 0,
+            closed_rx_pkts: 0,
+            closed_auth_drops: 0,
+            cfg,
         };
+        if w.cfg.lane_hunt.enabled {
+            w.start_hunt(HuntReason::PreWarm, now);
+        }
+        w
+    }
+
+    #[inline]
+    pub(crate) fn ready_upstream_tok(&self, client_addr: SocketAddr) -> Option<Token> {
+        let tok = *self.tok_by_client.get(&client_addr)?;
+        self.sessions_by_tok.contains_key(&tok).then_some(tok)
+    }
+
+    #[inline]
+    pub(crate) fn flush_batched_uplink(
+        &mut self,
+        tok: Token,
+        tx_b: &mut UdpSendBatch,
+        now: Instant,
+    ) -> (usize, u64) {
+        if tx_b.is_empty() {
+            return (0, 0);
+        }
+        if let Some(sess) = self.sessions_by_tok.get_mut(&tok) {
+            let (sp, sb) = tx_b.flush_connected(&sess.upstream);
+            if sp > 0 {
+                sess.tx_pkts = sess.tx_pkts.saturating_add(sp as u64);
+                sess.tx_bytes = sess.tx_bytes.saturating_add(sb);
+                sess.last_activity = now;
+            }
+            (sp, sb)
+        } else {
+            tx_b.clear();
+            (0, 0)
+        }
+    }
+
+    pub(crate) fn send_uplink_single(
+        &mut self,
+        client_addr: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> bool {
+        if payload.is_empty() {
+            return false;
+        }
+        let Some(tok) = self.ensure_session(client_addr, now) else {
+            return false;
+        };
+        if let Some(sess) = self.sessions_by_tok.get_mut(&tok) {
+            if sess.upstream.send(payload).is_ok() {
+                sess.tx_pkts = sess.tx_pkts.saturating_add(1);
+                sess.tx_bytes = sess.tx_bytes.saturating_add(payload.len() as u64);
+                sess.last_activity = now;
+                return true;
+            }
+        }
+        false
+    }
+
+    pub(crate) fn handle_event_relay(
+        &mut self,
+        tok: Token,
+        ingress: &mut crate::server::ServerWorker,
+        now: Instant,
+    ) {
+        if self.sessions_by_tok.contains_key(&tok) {
+            self.handle_upstream_readable_with(tok, now, Some(ingress));
+        } else if self.old_drains.contains_key(&tok) {
+            self.handle_drain_readable_with(tok, now, Some(ingress));
+        } else if self.hunt_tok_set.contains_key(&tok) {
+            self.handle_hunt_readable(tok, now);
+        } else if self.prewarm.as_ref().is_some_and(|p| p.tok == tok) {
+            self.handle_prewarm_readable(now);
+        }
+    }
+
+    pub(crate) fn close_flow(&mut self, client_addr: SocketAddr) {
+        if let Some(tok) = self.tok_by_client.remove(&client_addr) {
+            if let Some(mut s) = self.sessions_by_tok.remove(&tok) {
+                let _ = self.poll.registry().deregister(&mut s.upstream);
+                self.closed_tx_bytes = self.closed_tx_bytes.saturating_add(s.tx_bytes);
+                self.closed_rx_bytes = self.closed_rx_bytes.saturating_add(s.rx_bytes);
+                self.closed_tx_pkts = self.closed_tx_pkts.saturating_add(s.tx_pkts);
+                self.closed_rx_pkts = self.closed_rx_pkts.saturating_add(s.rx_pkts);
+                self.closed_auth_drops = self.closed_auth_drops.saturating_add(s.auth_drops);
+            }
+        }
+    }
+
+    pub(crate) fn shutdown_all(&mut self) {
+        if let Some(mut h) = self.hunt.take() {
+            self.clear_hunt_candidates(&mut h.candidates);
+            if let Some((mut bs, _, _, _, _, _)) = h.best {
+                let _ = self.poll.registry().deregister(&mut bs);
+            }
+        }
+        self.drop_prewarm();
+        for (_, mut d) in self.old_drains.drain() {
+            let _ = self.poll.registry().deregister(&mut d.sock);
+        }
+        self.drain_order.clear();
+        for (_, mut s) in self.sessions_by_tok.drain() {
+            let _ = self.poll.registry().deregister(&mut s.upstream);
+        }
+        self.tok_by_client.clear();
+    }
+
+    pub(crate) fn drive_timers_relay(&mut self, now: Instant) {
+        self.drive_timers(now);
+    }
+
+    pub(crate) fn next_poll_timeout_relay(&self, now: Instant) -> Duration {
+        self.next_poll_timeout(now)
+    }
+
+    pub(crate) fn build_worker_snapshot(&self) -> WorkerSnapshot {
         let mut active = 0usize;
         let mut migrating = 0usize;
         let mut tx_bytes = self.closed_tx_bytes;
@@ -1553,29 +1774,32 @@ impl BypassWorker {
             }
         }
 
-        th.update_worker(
-            self.worker_id,
-            WorkerSnapshot {
-                active_sessions: active,
-                handshaking_sessions: 0,
-                migrating_sessions: migrating,
-                tx_bytes_total: tx_bytes,
-                rx_bytes_total: rx_bytes,
-                tx_pkts_total: tx_pkts,
-                rx_pkts_total: rx_pkts,
-                auth_drops_total: auth_drops,
-                unauth_drops_total: 0,
-                active_up_sport: up_sport,
-                active_backend_sport: 0,
-                data_loss_pct: 0.0,
-                lane_score,
-                lane_best_rtt_ms: self.best_observed_rtt_ms,
-                lane_confirmed: all_confirmed,
-                dtls_version: "none",
-                cipher: "bypass-raw",
-                dual_ssrc: false,
-            },
-        );
+        WorkerSnapshot {
+            active_sessions: active,
+            handshaking_sessions: 0,
+            migrating_sessions: migrating,
+            tx_bytes_total: tx_bytes,
+            rx_bytes_total: rx_bytes,
+            tx_pkts_total: tx_pkts,
+            rx_pkts_total: rx_pkts,
+            auth_drops_total: auth_drops,
+            unauth_drops_total: 0,
+            active_up_sport: up_sport,
+            active_backend_sport: 0,
+            data_loss_pct: 0.0,
+            lane_score,
+            lane_best_rtt_ms: self.best_observed_rtt_ms,
+            lane_confirmed: all_confirmed,
+            dtls_version: "none",
+            cipher: "bypass-raw",
+            dual_ssrc: false,
+        }
+    }
+
+    fn push_telemetry_snapshot(&self) {
+        if let Some(ref th) = self.telemetry {
+            th.update_worker(self.worker_id, self.build_worker_snapshot());
+        }
     }
 
     fn next_poll_timeout(&self, now: Instant) -> Duration {

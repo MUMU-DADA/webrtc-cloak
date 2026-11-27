@@ -58,6 +58,18 @@ impl Polyval {
     }
 }
 
+/// Returns `true` if hardware CLMUL / PMULL POLYVAL acceleration is active on this CPU.
+#[must_use]
+pub fn hardware_accelerated() -> bool {
+    backend::hardware_accelerated()
+}
+
+/// Returns the active POLYVAL backend name (`avx+pclmulqdq`, `sse2+pclmulqdq`, `armv8-pmull`, or `soft`).
+#[must_use]
+pub fn backend_name() -> &'static str {
+    backend::backend_name()
+}
+
 impl KeyInit for Polyval {
     fn new(h: &Key) -> Self {
         Self::new(h)

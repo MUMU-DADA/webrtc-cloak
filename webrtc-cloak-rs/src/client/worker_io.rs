@@ -5,17 +5,18 @@ use super::lane_hunt::{client_outer_hdr_len, HuntPurpose};
 use super::worker::ClientWorker;
 use super::{
     cancel_standby_for_client, is_client_in_trickle, log, record_client_media_bytes,
-    schedule_mbb_timers, HandshakeState, PendingReconnect, ACTIVE_ROTATE_WINDOW_SECS,
-    CLIENT_HANDOVER_MIN_RETRY_MS, CLIENT_MIG_ECHO_INTERVAL_MS, CLIENT_SRTCP_INIT_MAX_MS,
-    CLIENT_SRTCP_INIT_MIN_MS, KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, RECENT_ROTATION_DAMP_SECS,
-    TRICKLE_WINDOW_5MIN_SECS,
+    schedule_mbb_timers, ClientDownlink, HandshakeState, PendingReconnect,
+    ACTIVE_ROTATE_WINDOW_SECS, CLIENT_HANDOVER_MIN_RETRY_MS, CLIENT_MIG_ECHO_INTERVAL_MS,
+    CLIENT_SRTCP_INIT_MAX_MS, CLIENT_SRTCP_INIT_MIN_MS, KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED,
+    RECENT_ROTATION_DAMP_SECS, TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
     CLOSING_DRAIN_MS, CTRL_FRAME_BUF_LEN, DTLS_READY_ALERT_ONLY_GRACE_SECS, HANDOVER_OP_ACK,
     HANDOVER_OP_REQ, HANDOVER_PROOF_LEN, MAX_DTLS_RESETS, MAX_INNER_UDP_LEN,
     PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
     PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, POST_BYE_CLOSING_DRAIN_MS,
-    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, STUN_BINDING_SUCCESS, TRICKLE_WINDOW_15S_SECS,
+    REV_OP_FLOW_CLOSE, REV_OP_HELLO_ACK, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC,
+    STUN_BINDING_SUCCESS, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     combine_session_key, compute_handover_proof, demux_rfc7983, derive_ice_migration_key,
@@ -54,6 +55,68 @@ const CLIENT_GRACEFUL_RECONNECT_MIN_MS: u64 = 80;
 const CLIENT_GRACEFUL_RECONNECT_MAX_MS: u64 = 350;
 
 #[inline]
+fn deliver_client_downlink_single(
+    listen_sock: &Option<mio::net::UdpSocket>,
+    downlink: &mut Option<ClientDownlink<'_>>,
+    client_addr: SocketAddr,
+    payload: &[u8],
+    now: Instant,
+) -> bool {
+    match downlink {
+        Some(ClientDownlink::Relay(ingress)) => {
+            ingress.deliver_downlink_single(client_addr, payload, now)
+        }
+        Some(ClientDownlink::ReverseAgent(_)) => false,
+        None => listen_sock
+            .as_ref()
+            .is_some_and(|sock| sock.send_to(payload, client_addr).is_ok()),
+    }
+}
+
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn flush_client_downlink_batch(
+    tx_batch: &mut UdpSendBatch,
+    listen_sock: &Option<mio::net::UdpSocket>,
+    downlink: &mut Option<ClientDownlink<'_>>,
+    client_addr: SocketAddr,
+    sess: &mut super::ClientSession,
+    cfg: &super::ClientConfig,
+    ka_base_ms: u64,
+    now: Instant,
+) {
+    if tx_batch.is_empty() {
+        return;
+    }
+    let (sp, sb) = match downlink {
+        Some(ClientDownlink::Relay(ingress)) => {
+            let (sp, sb) = tx_batch.flush_to(&ingress.listen_sock);
+            if sp > 0 {
+                ingress.record_downlink_sent(client_addr, sp, sb, now);
+            }
+            (sp, sb)
+        }
+        Some(ClientDownlink::ReverseAgent(_)) => {
+            tx_batch.clear();
+            (0, 0)
+        }
+        None => {
+            if let Some(ref sock) = listen_sock {
+                tx_batch.flush_to(sock)
+            } else {
+                tx_batch.clear();
+                (0, 0)
+            }
+        }
+    };
+    if sp > 0 {
+        sess.rx_pkts += sp as u64;
+        sess.rx_bytes += sb;
+        record_client_media_bytes(sess, cfg, ka_base_ms, now, sb);
+    }
+}
+
+#[inline]
 fn flush_client_uplink_batch(
     pending_tok: &mut Option<Token>,
     tx_batch: &mut UdpSendBatch,
@@ -83,27 +146,36 @@ impl ClientWorker {
             self.handle_listen_readable_batched(now);
             return;
         }
+        let Some(listen_sock) = self.listen_sock.take() else {
+            return;
+        };
         loop {
-            let (n, client_addr) = match self.listen_sock.recv_from(&mut self.rbuf) {
+            let (n, client_addr) = match listen_sock.recv_from(&mut self.rbuf) {
                 Ok(v) => v,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             };
             self.dispatch_listen_packet(n, client_addr, now);
         }
+        self.listen_sock = Some(listen_sock);
     }
 
     fn handle_listen_readable_batched(&mut self, now: Instant) {
+        let Some(listen_sock) = self.listen_sock.take() else {
+            return;
+        };
         let Some(mut rx_batch) = self.rx_batch.take() else {
+            self.listen_sock = Some(listen_sock);
             return;
         };
         let Some(mut tx_batch) = self.tx_batch.take() else {
             self.rx_batch = Some(rx_batch);
+            self.listen_sock = Some(listen_sock);
             return;
         };
 
         loop {
-            let count = match rx_batch.recv_from(&self.listen_sock) {
+            let count = match rx_batch.recv_from(&listen_sock) {
                 Ok(0) => break,
                 Ok(n) => n,
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
@@ -179,9 +251,15 @@ impl ClientWorker {
 
         self.rx_batch = Some(rx_batch);
         self.tx_batch = Some(tx_batch);
+        self.listen_sock = Some(listen_sock);
     }
 
-    fn dispatch_listen_packet(&mut self, n: usize, client_addr: SocketAddr, now: Instant) {
+    pub(super) fn dispatch_listen_packet(
+        &mut self,
+        n: usize,
+        client_addr: SocketAddr,
+        now: Instant,
+    ) {
         if n > MAX_INNER_UDP_LEN {
             return;
         }
@@ -322,11 +400,12 @@ impl ClientWorker {
         }
     }
 
-    pub(super) fn handle_old_path_drain(
+    pub(super) fn handle_old_path_drain_with(
         &mut self,
         tok: Token,
         now: Instant,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+        mut downlink: Option<ClientDownlink<'_>>,
     ) {
         if let Some(drain) = self.old_path_drains.get_mut(&tok) {
             // V4 silent receive-only drain for old socket after 1-RTT ICE migration:
@@ -343,15 +422,34 @@ impl ClientWorker {
                     PacketKind::Srtp => {
                         if let Some(owner) = self.sessions_by_token.get_mut(&owner_tok) {
                             if let Some(ref mut cipher) = owner.cipher {
-                                if let Some(pn) = cipher.unwrap_into(pkt, &mut self.wbuf) {
-                                    if self
-                                        .listen_sock
-                                        .send_to(&self.wbuf[..pn], owner.client_addr)
-                                        .is_ok()
-                                    {
-                                        owner.rx_pkts += 1;
-                                        owner.rx_bytes += pn as u64;
+                                match cipher.unwrap_into_ex(pkt, &mut self.wbuf) {
+                                    Some(SrtpFrame::Data(pn)) => {
+                                        if deliver_client_downlink_single(
+                                            &self.listen_sock,
+                                            &mut downlink,
+                                            owner.client_addr,
+                                            &self.wbuf[..pn],
+                                            now,
+                                        ) {
+                                            owner.rx_pkts += 1;
+                                            owner.rx_bytes += pn as u64;
+                                        }
                                     }
+                                    Some(SrtpFrame::ReverseData { flow_id, len }) => {
+                                        if let Some(ClientDownlink::ReverseAgent(mux)) =
+                                            downlink.as_mut()
+                                        {
+                                            if mux.deliver_to_backend(
+                                                flow_id,
+                                                &self.wbuf[..len],
+                                                now,
+                                            ) {
+                                                owner.rx_pkts += 1;
+                                                owner.rx_bytes += len as u64;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
                                 }
                             }
                         }
@@ -366,9 +464,9 @@ impl ClientWorker {
                                 if let Some(ref mut cipher) = owner.cipher {
                                     if let Some(true) = cipher.verify_srtcp(pkt) {
                                         owner.srtcp_rx += 1;
-                                        let active_recently = now
-                                            .duration_since(owner.last_data_active)
-                                            <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                        let active_recently = self.reverse_agent
+                                            || now.duration_since(owner.last_data_active)
+                                                <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                         owner.state = HandshakeState::Closing(
                                             now + Duration::from_millis(CLOSING_DRAIN_MS),
                                         );
@@ -387,21 +485,24 @@ impl ClientWorker {
         }
     }
 
-    pub(super) fn handle_upstream_readable(
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn handle_upstream_readable_with(
         &mut self,
         tok: Token,
         now: Instant,
         standby_ready: &mut Vec<(Token, SocketAddr)>,
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+        mut downlink: Option<ClientDownlink<'_>>,
     ) {
         if self.rx_batch.is_some() {
-            self.handle_upstream_readable_batched(
+            self.handle_upstream_readable_batched_with(
                 tok,
                 now,
                 standby_ready,
                 standby_promoted,
                 graceful_reconnects,
+                downlink,
             );
             return;
         }
@@ -417,7 +518,7 @@ impl ClientWorker {
                     Err(_) => break,
                 }
             };
-            self.dispatch_upstream_packet(
+            self.dispatch_upstream_packet_with(
                 tok,
                 n,
                 now,
@@ -425,6 +526,7 @@ impl ClientWorker {
                 standby_ready,
                 standby_promoted,
                 graceful_reconnects,
+                &mut downlink,
             );
         }
         if let Some((ka_rtt, ka_retries)) = ka_sample {
@@ -432,13 +534,15 @@ impl ClientWorker {
         }
     }
 
-    fn handle_upstream_readable_batched(
+    #[allow(clippy::too_many_arguments)]
+    fn handle_upstream_readable_batched_with(
         &mut self,
         tok: Token,
         now: Instant,
         standby_ready: &mut Vec<(Token, SocketAddr)>,
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+        mut downlink: Option<ClientDownlink<'_>>,
     ) {
         let Some(mut rx_batch) = self.rx_batch.take() else {
             return;
@@ -450,13 +554,13 @@ impl ClientWorker {
         let mut ka_sample: Option<(f64, u8)> = None;
 
         loop {
-            let count = {
+            let (count, batch_client_addr) = {
                 let Some(sess) = self.sessions_by_token.get(&tok) else {
                     break;
                 };
                 match rx_batch.recv_connected(&sess.upstream) {
                     Ok(0) => break,
-                    Ok(n) => n,
+                    Ok(n) => (n, sess.client_addr),
                     Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                     Err(_) => break,
                 }
@@ -479,26 +583,31 @@ impl ClientWorker {
                 if fast_srtp {
                     if tx_batch.is_full() {
                         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                            let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
-                            if sp > 0 {
-                                sess.rx_pkts += sp as u64;
-                                sess.rx_bytes += sb;
-                                record_client_media_bytes(
-                                    sess,
-                                    &self.cfg,
-                                    self.ka_base_ms,
-                                    now,
-                                    sb,
-                                );
-                            }
+                            flush_client_downlink_batch(
+                                &mut tx_batch,
+                                &self.listen_sock,
+                                &mut downlink,
+                                batch_client_addr,
+                                sess,
+                                &self.cfg,
+                                self.ka_base_ms,
+                                now,
+                            );
                         }
                     }
+                    let use_wbuf = downlink.is_some();
                     let frame = {
                         let sess = self.sessions_by_token.get_mut(&tok).unwrap();
-                        let slot = tx_batch.next_slot_mut().unwrap();
-                        sess.cipher
-                            .as_mut()
-                            .and_then(|c| c.unwrap_into_ex(pkt, slot))
+                        if use_wbuf {
+                            sess.cipher
+                                .as_mut()
+                                .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf))
+                        } else {
+                            let slot = tx_batch.next_slot_mut().unwrap();
+                            sess.cipher
+                                .as_mut()
+                                .and_then(|c| c.unwrap_into_ex(pkt, slot))
+                        }
                     };
                     match frame {
                         Some(SrtpFrame::Data(pn)) => {
@@ -512,32 +621,70 @@ impl ClientWorker {
                                 }
                                 sess.client_addr
                             };
-                            tx_batch.commit_slot(pn, pn as u64, Some(client_addr));
+                            if let Some(ClientDownlink::Relay(ingress)) = downlink.as_mut() {
+                                if let Some(slot) = tx_batch.next_slot_mut() {
+                                    if let Some((wn, peer_addr)) = ingress
+                                        .encrypt_downlink_into_slot(
+                                            client_addr,
+                                            &self.wbuf[..pn],
+                                            slot,
+                                            now,
+                                        )
+                                    {
+                                        tx_batch.commit_slot(wn, pn as u64, Some(peer_addr));
+                                    }
+                                }
+                            } else if downlink.is_none() {
+                                tx_batch.commit_slot(pn, pn as u64, Some(client_addr));
+                            }
+                        }
+                        Some(SrtpFrame::ReverseData { flow_id, len }) => {
+                            let delivered = if let Some(ClientDownlink::ReverseAgent(mux)) =
+                                downlink.as_mut()
+                            {
+                                mux.deliver_to_backend(flow_id, &self.wbuf[..len], now)
+                            } else {
+                                false
+                            };
+                            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                sess.last_data_active = now;
+                                if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0 {
+                                    sess.mig_echo_left = 0;
+                                    sess.mig_echo_payload = None;
+                                    sess.mig_echo_next_at = None;
+                                }
+                                if delivered {
+                                    sess.rx_pkts += 1;
+                                    sess.rx_bytes += len as u64;
+                                    record_client_media_bytes(
+                                        sess,
+                                        &self.cfg,
+                                        self.ka_base_ms,
+                                        now,
+                                        len as u64,
+                                    );
+                                }
+                            }
                         }
                         Some(ctrl_frame) => {
-                            let pn = match ctrl_frame {
-                                SrtpFrame::Data(n)
-                                | SrtpFrame::Probe(n)
-                                | SrtpFrame::PathChallenge(n)
-                                | SrtpFrame::Handover(n) => n,
-                            };
-                            let copy_len = pn.min(self.wbuf.len());
-                            self.wbuf[..copy_len]
-                                .copy_from_slice(tx_batch.uncommitted_slot_prefix(copy_len));
+                            if !use_wbuf {
+                                let pn = ctrl_frame.payload_len();
+                                let copy_len = pn.min(self.wbuf.len());
+                                self.wbuf[..copy_len]
+                                    .copy_from_slice(tx_batch.uncommitted_slot_prefix(copy_len));
+                            }
                             if !tx_batch.is_empty() {
                                 if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                                    let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
-                                    if sp > 0 {
-                                        sess.rx_pkts += sp as u64;
-                                        sess.rx_bytes += sb;
-                                        record_client_media_bytes(
-                                            sess,
-                                            &self.cfg,
-                                            self.ka_base_ms,
-                                            now,
-                                            sb,
-                                        );
-                                    }
+                                    flush_client_downlink_batch(
+                                        &mut tx_batch,
+                                        &self.listen_sock,
+                                        &mut downlink,
+                                        batch_client_addr,
+                                        sess,
+                                        &self.cfg,
+                                        self.ka_base_ms,
+                                        now,
+                                    );
                                 }
                             }
                             self.handle_client_srtp_ctrl_frame(
@@ -545,6 +692,7 @@ impl ClientWorker {
                                 ctrl_frame,
                                 now,
                                 standby_promoted,
+                                &mut downlink,
                             );
                         }
                         None => {
@@ -559,17 +707,21 @@ impl ClientWorker {
                 // 慢路径：先刷新已批下行数据，再复用完整控制面状态机
                 if !tx_batch.is_empty() {
                     if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                        let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
-                        if sp > 0 {
-                            sess.rx_pkts += sp as u64;
-                            sess.rx_bytes += sb;
-                            record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
-                        }
+                        flush_client_downlink_batch(
+                            &mut tx_batch,
+                            &self.listen_sock,
+                            &mut downlink,
+                            batch_client_addr,
+                            sess,
+                            &self.cfg,
+                            self.ka_base_ms,
+                            now,
+                        );
                     }
                 }
                 let len = pkt.len().min(self.rbuf.len());
                 self.rbuf[..len].copy_from_slice(&pkt[..len]);
-                self.dispatch_upstream_packet(
+                self.dispatch_upstream_packet_with(
                     tok,
                     len,
                     now,
@@ -577,17 +729,22 @@ impl ClientWorker {
                     standby_ready,
                     standby_promoted,
                     graceful_reconnects,
+                    &mut downlink,
                 );
             }
 
             if !tx_batch.is_empty() {
                 if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                    let (sp, sb) = tx_batch.flush_to(&self.listen_sock);
-                    if sp > 0 {
-                        sess.rx_pkts += sp as u64;
-                        sess.rx_bytes += sb;
-                        record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
-                    }
+                    flush_client_downlink_batch(
+                        &mut tx_batch,
+                        &self.listen_sock,
+                        &mut downlink,
+                        batch_client_addr,
+                        sess,
+                        &self.cfg,
+                        self.ka_base_ms,
+                        now,
+                    );
                 }
             }
         }
@@ -600,7 +757,7 @@ impl ClientWorker {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn dispatch_upstream_packet(
+    fn dispatch_upstream_packet_with(
         &mut self,
         tok: Token,
         n: usize,
@@ -609,6 +766,7 @@ impl ClientWorker {
         standby_ready: &mut Vec<(Token, SocketAddr)>,
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
         graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+        downlink: &mut Option<ClientDownlink<'_>>,
     ) {
         let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
             return;
@@ -623,15 +781,28 @@ impl ClientWorker {
             match demux_rfc7983(pkt) {
                 PacketKind::Srtp => {
                     if let Some(ref mut cipher) = sess.cipher {
-                        if let Some(pn) = cipher.unwrap_into(pkt, &mut self.wbuf) {
-                            if self
-                                .listen_sock
-                                .send_to(&self.wbuf[..pn], sess.client_addr)
-                                .is_ok()
-                            {
-                                sess.rx_pkts += 1;
-                                sess.rx_bytes += pn as u64;
+                        match cipher.unwrap_into_ex(pkt, &mut self.wbuf) {
+                            Some(SrtpFrame::Data(pn)) => {
+                                if deliver_client_downlink_single(
+                                    &self.listen_sock,
+                                    downlink,
+                                    sess.client_addr,
+                                    &self.wbuf[..pn],
+                                    now,
+                                ) {
+                                    sess.rx_pkts += 1;
+                                    sess.rx_bytes += pn as u64;
+                                }
                             }
+                            Some(SrtpFrame::ReverseData { flow_id, len }) => {
+                                if let Some(ClientDownlink::ReverseAgent(mux)) = downlink.as_mut() {
+                                    if mux.deliver_to_backend(flow_id, &self.wbuf[..len], now) {
+                                        sess.rx_pkts += 1;
+                                        sess.rx_bytes += len as u64;
+                                    }
+                                }
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -929,8 +1100,9 @@ impl ClientWorker {
                     now,
                     candidate_sh,
                 ) {
-                    let active_recently = now.duration_since(sess.last_data_active)
-                        <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                    let active_recently = self.reverse_agent
+                        || now.duration_since(sess.last_data_active)
+                            <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                     sess.state =
                         HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
                     if was_ready && !sess.is_standby && !sess.is_prewarm && active_recently {
@@ -952,8 +1124,9 @@ impl ClientWorker {
                         if let Some(has_bye) = cipher.verify_srtcp(pkt) {
                             sess.srtcp_rx += 1;
                             if has_bye {
-                                let active_recently = now.duration_since(sess.last_data_active)
-                                    <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
+                                let active_recently = self.reverse_agent
+                                    || now.duration_since(sess.last_data_active)
+                                        <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                 sess.state = HandshakeState::Closing(
                                     now + Duration::from_millis(CLOSING_DRAIN_MS),
                                 );
@@ -989,14 +1162,31 @@ impl ClientWorker {
                                 sess.mig_echo_payload = None;
                                 sess.mig_echo_next_at = None;
                             }
-                            if self
-                                .listen_sock
-                                .send_to(&self.wbuf[..pn], sess.client_addr)
-                                .is_ok()
-                            {
+                            if deliver_client_downlink_single(
+                                &self.listen_sock,
+                                downlink,
+                                sess.client_addr,
+                                &self.wbuf[..pn],
+                                now,
+                            ) {
                                 sess.rx_pkts += 1;
                                 sess.rx_bytes += pn as u64;
                                 rx_ok_bytes = pn as u64;
+                            }
+                        }
+                        Some(SrtpFrame::ReverseData { flow_id, len }) => {
+                            sess.last_data_active = now;
+                            if sess.state == HandshakeState::Ready && sess.mig_echo_left > 0 {
+                                sess.mig_echo_left = 0;
+                                sess.mig_echo_payload = None;
+                                sess.mig_echo_next_at = None;
+                            }
+                            if let Some(ClientDownlink::ReverseAgent(mux)) = downlink.as_mut() {
+                                if mux.deliver_to_backend(flow_id, &self.wbuf[..len], now) {
+                                    sess.rx_pkts += 1;
+                                    sess.rx_bytes += len as u64;
+                                    rx_ok_bytes = len as u64;
+                                }
                             }
                         }
                         Some(ctrl_frame) => {
@@ -1005,6 +1195,7 @@ impl ClientWorker {
                                 ctrl_frame,
                                 now,
                                 standby_promoted,
+                                downlink,
                             );
                         }
                         None => {
@@ -1038,6 +1229,7 @@ impl ClientWorker {
         frame: SrtpFrame,
         now: Instant,
         standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        downlink: &mut Option<ClientDownlink<'_>>,
     ) {
         let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
             return;
@@ -1178,7 +1370,34 @@ impl ClientWorker {
                 sess.rx_pkts += 1;
                 sess.last_data_active = now;
             }
-            SrtpFrame::Data(_) => {}
+            SrtpFrame::ReverseCtrl(pn) => {
+                sess.rx_pkts += 1;
+                if pn >= 2 && self.wbuf[0] == REV_OP_HELLO_ACK {
+                    let newly_ack = !sess.rev_registered;
+                    sess.rev_registered = true;
+                    sess.next_rev_hello_at = None;
+                    if newly_ack {
+                        log(
+                            self.worker_id,
+                            &format!(
+                                "REVERSE TUNNEL REGISTERED up_sport={} (always-on)",
+                                sess.local_port
+                            ),
+                        );
+                    }
+                } else if pn >= 5 && self.wbuf[0] == REV_OP_FLOW_CLOSE {
+                    let flow_id = u32::from_be_bytes([
+                        self.wbuf[1],
+                        self.wbuf[2],
+                        self.wbuf[3],
+                        self.wbuf[4],
+                    ]);
+                    if let Some(ClientDownlink::ReverseAgent(mux)) = downlink.as_mut() {
+                        mux.close_flow(flow_id);
+                    }
+                }
+            }
+            SrtpFrame::Data(_) | SrtpFrame::ReverseData { .. } => {}
         }
     }
 
@@ -1299,6 +1518,10 @@ impl ClientWorker {
                     new_sess.lane_subopt_windows = 0;
                     new_sess.lane_degrade_streak = 0;
                     new_sess.next_lane_hunt_at = now + trial_cooldown;
+                    if self.reverse_agent {
+                        new_sess.rev_registered = true;
+                        new_sess.next_rev_hello_at = None;
+                    }
                     schedule_mbb_timers(new_sess, &self.cfg, now);
                     new_sess.local_port
                 }

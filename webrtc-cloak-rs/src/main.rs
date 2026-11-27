@@ -5,6 +5,8 @@ mod bypass;
 mod client;
 mod constants;
 mod protocol;
+mod relay;
+mod reverse;
 mod selftest;
 mod server;
 mod telemetry;
@@ -22,6 +24,10 @@ use crate::constants::{
 };
 use crate::protocol::{
     detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,
+};
+use crate::relay::{run_relay, RelayConfig, RelayUpstreamConfig};
+use crate::reverse::{
+    run_reverse_agent, run_reverse_entry, ReverseAgentConfig, ReverseEntryConfig,
 };
 use crate::selftest::{run_selftest, SelftestOptions};
 use crate::server::{run_server, ServerConfig};
@@ -156,6 +162,9 @@ fn usage() -> ! {
          webrtc-cloak cpu\n  \
          webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak relay --listen-host 0.0.0.0 --listen-port 19643 --upstream-host <IPv4|IPv6> --upstream-port 19643 [--upstream-mode bypass|cloak] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--upstream-psk <KEY> | --upstream-psk-file <PATH> | env WEBRTC_CLOAK_UPSTREAM_PSK] [--cipher auto|aes-gcm|chacha20|blake2b] [--upstream-cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--upstream-dtls-min-version auto|1.2|1.3] [--lane-hunt | --no-lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak reverse --entry --listen-host 0.0.0.0 --listen-port 19643 --expose-host 127.0.0.1 --expose-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak reverse --agent --server-host <IPv4|IPv6> --server-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bypass --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--no-lane-hunt] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
          webrtc-cloak bypass --responder --listen-host 127.0.0.1 --listen-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--workers 1|auto] [--mtu 1488] [--udp-batch 0] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
@@ -165,31 +174,39 @@ fn usage() -> ! {
     process::exit(2);
 }
 
-fn resolve_psk(psk_arg: Option<String>, psk_file: Option<String>) -> Vec<u8> {
+fn resolve_optional_psk(
+    psk_arg: Option<String>,
+    psk_file: Option<String>,
+    env_var: &str,
+) -> Option<Vec<u8>> {
     if let Some(path) = psk_file {
         match std::fs::read_to_string(&path) {
             Ok(s) => {
                 let trimmed = s.trim();
                 if !trimmed.is_empty() {
-                    return trimmed.as_bytes().to_vec();
+                    return Some(trimmed.as_bytes().to_vec());
                 }
             }
             Err(e) => {
-                eprintln!("Failed to read --psk-file {}: {}", path, e);
+                eprintln!("Failed to read psk-file {}: {}", path, e);
                 process::exit(2);
             }
         }
     }
     if let Some(k) = psk_arg.filter(|s| !s.is_empty()) {
-        return k.into_bytes();
+        return Some(k.into_bytes());
     }
-    if let Ok(env_k) = env::var("WEBRTC_CLOAK_PSK") {
+    if let Ok(env_k) = env::var(env_var) {
         let trimmed = env_k.trim();
         if !trimmed.is_empty() {
-            return trimmed.as_bytes().to_vec();
+            return Some(trimmed.as_bytes().to_vec());
         }
     }
-    usage();
+    None
+}
+
+fn resolve_psk(psk_arg: Option<String>, psk_file: Option<String>) -> Vec<u8> {
+    resolve_optional_psk(psk_arg, psk_file, "WEBRTC_CLOAK_PSK").unwrap_or_else(|| usage())
 }
 
 fn check_no_extra(args: Arguments) {
@@ -498,6 +515,299 @@ fn run() -> Result<(), pico_args::Error> {
             }) {
                 eprintln!("server error: {}", e);
                 process::exit(1);
+            }
+        }
+        "relay" => {
+            let listen_host: String = args
+                .opt_value_from_str("--listen-host")?
+                .unwrap_or_else(|| DEFAULT_SERVER_LISTEN_HOST.into());
+            let listen_port: u16 = args
+                .opt_value_from_str("--listen-port")?
+                .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+            let upstream_mode: String = args
+                .opt_value_from_str("--upstream-mode")?
+                .unwrap_or_else(|| "bypass".into());
+            let upstream_host: String = args.value_from_str("--upstream-host")?;
+            let upstream_port: u16 = args
+                .opt_value_from_str("--upstream-port")?
+                .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+            let upstream_psk_arg: Option<String> = args.opt_value_from_str("--upstream-psk")?;
+            let upstream_psk_file: Option<String> =
+                args.opt_value_from_str("--upstream-psk-file")?;
+            let upstream_cipher_opt: Option<CipherPref> =
+                args.opt_value_from_fn("--upstream-cipher", parse_cipher_pref)?;
+            let upstream_dtls_min_opt: Option<DtlsMinVersion> =
+                args.opt_value_from_fn("--upstream-dtls-min-version", parse_dtls_min_version)?;
+            let upstream_no_dtls_decoy = args.contains("--upstream-no-dtls-decoy");
+            let wire_audit_file: Option<String> = args.opt_value_from_str("--wire-audit-file")?;
+            let rotate_interval_secs: u64 =
+                args.opt_value_from_str("--rotate-interval")?.unwrap_or(0);
+            let rotate_bytes_mb: Option<u64> = args.opt_value_from_str("--rotate-bytes")?;
+            let retry_ms: u64 = args
+                .opt_value_from_str("--retry-ms")?
+                .unwrap_or(DEFAULT_CLIENT_RETRY_MS);
+            let max_retries_opt: Option<u32> = args.opt_value_from_str("--max-retries")?;
+            let keepalive_secs: u64 = args
+                .opt_value_from_str("--keepalive")?
+                .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+            let lane_hunt_flag = args.contains("--lane-hunt");
+            let no_lane_hunt = args.contains("--no-lane-hunt");
+            let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+            let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+            let lane_target_rtt_opt: Option<u64> = args.opt_value_from_str("--lane-target-rtt")?;
+            let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+            if upstream_host.is_empty() {
+                usage();
+            }
+            let common = finish_common_tunnel(args)?;
+            let upstream_psk = resolve_optional_psk(
+                upstream_psk_arg,
+                upstream_psk_file,
+                "WEBRTC_CLOAK_UPSTREAM_PSK",
+            )
+            .unwrap_or_else(|| common.psk.clone());
+            let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+            let upstream_addr = parse_socket_addr(&upstream_host, upstream_port, "upstream");
+            let stop = Some(install_shutdown_handler());
+
+            let ingress = ServerConfig {
+                listen_addr,
+                backend_addr: upstream_addr,
+                psk: common.psk,
+                cipher_pref: common.cipher_pref,
+                dtls_required: common.dtls_enabled,
+                dtls_min_version: common.dtls_min_version,
+                workers: common.workers,
+                max_sessions: common.max_sessions,
+                wan_mtu: common.wan_mtu,
+                udp_batch: common.udp_batch,
+                idle_timeout_secs: common.idle_timeout_secs,
+                stats_interval_secs: common.stats_interval_secs,
+                wire_audit_file,
+                telemetry: common.telemetry.clone(),
+                quiet: false,
+                stop: stop.clone(),
+            };
+
+            let upstream = match upstream_mode.as_str() {
+                "bypass" => {
+                    let lane_hunt = LaneHuntConfig {
+                        enabled: !no_lane_hunt,
+                        probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                        max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                        target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                        degrade_cooldown_secs: lane_cooldown_opt
+                            .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                    }
+                    .normalized();
+                    RelayUpstreamConfig::Bypass(BypassConfig {
+                        listen_addr,
+                        server_addr: upstream_addr,
+                        psk: upstream_psk,
+                        rotate_interval_secs,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        retry_ms,
+                        max_retries: max_retries_opt.unwrap_or(2),
+                        keepalive_secs,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        lane_hunt,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop,
+                    })
+                }
+                "cloak" => {
+                    let lane_enabled = !no_lane_hunt
+                        && (lane_hunt_flag
+                            || lane_probes_opt.is_some_and(|p| p > 1)
+                            || lane_target_rtt_opt.is_some_and(|t| t > 0));
+                    let lane_hunt = LaneHuntConfig {
+                        enabled: lane_enabled,
+                        probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                        max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                        target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                        degrade_cooldown_secs: lane_cooldown_opt
+                            .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                    }
+                    .normalized();
+                    let rotate_max_bytes = match rotate_bytes_mb {
+                        Some(mb) => mb.saturating_mul(MIB),
+                        None if rotate_interval_secs > 0 => DEFAULT_ROTATE_BYTE_BUDGET_MIB * MIB,
+                        None => 0,
+                    };
+                    RelayUpstreamConfig::Cloak(ClientConfig {
+                        listen_addr,
+                        server_addr: upstream_addr,
+                        psk: upstream_psk,
+                        cipher_pref: upstream_cipher_opt.unwrap_or(common.cipher_pref),
+                        dtls_decoy: common.dtls_enabled && !upstream_no_dtls_decoy,
+                        dtls_min_version: upstream_dtls_min_opt.unwrap_or(common.dtls_min_version),
+                        rotate_interval_secs,
+                        rotate_max_bytes,
+                        rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        retry_ms,
+                        max_retries: max_retries_opt.unwrap_or(DEFAULT_CLIENT_MAX_RETRIES),
+                        keepalive_secs,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        lane_hunt,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop,
+                    })
+                }
+                other => {
+                    eprintln!(
+                        "Unknown --upstream-mode: {} (expected bypass or cloak)",
+                        other
+                    );
+                    usage();
+                }
+            };
+
+            if let Err(e) = run_relay(RelayConfig { ingress, upstream }) {
+                eprintln!("relay error: {}", e);
+                process::exit(1);
+            }
+        }
+        "reverse" => {
+            let is_entry = args.contains("--entry");
+            let is_agent = args.contains("--agent");
+            if is_entry == is_agent {
+                eprintln!("reverse requires exactly one of --entry or --agent");
+                usage();
+            }
+            if is_entry {
+                let listen_host: String = args
+                    .opt_value_from_str("--listen-host")?
+                    .unwrap_or_else(|| DEFAULT_SERVER_LISTEN_HOST.into());
+                let listen_port: u16 = args
+                    .opt_value_from_str("--listen-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let expose_host: String = args
+                    .opt_value_from_str("--expose-host")?
+                    .unwrap_or_else(|| DEFAULT_CLIENT_LISTEN_HOST.into());
+                let expose_port: u16 = args.value_from_str("--expose-port")?;
+                let wire_audit_file: Option<String> =
+                    args.opt_value_from_str("--wire-audit-file")?;
+                if expose_port == 0 {
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+                let expose_addr = parse_socket_addr(&expose_host, expose_port, "expose");
+                if let Err(e) = run_reverse_entry(ReverseEntryConfig {
+                    server: ServerConfig {
+                        listen_addr,
+                        backend_addr: expose_addr,
+                        psk: common.psk,
+                        cipher_pref: common.cipher_pref,
+                        dtls_required: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        wire_audit_file,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    expose_addr,
+                }) {
+                    eprintln!("reverse entry error: {}", e);
+                    process::exit(1);
+                }
+            } else {
+                let server_host: String = args.value_from_str("--server-host")?;
+                let server_port: u16 = args
+                    .opt_value_from_str("--server-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let backend_host: String = args
+                    .opt_value_from_str("--backend-host")?
+                    .unwrap_or_else(|| DEFAULT_BACKEND_HOST.into());
+                let backend_port: u16 = args.value_from_str("--backend-port")?;
+                let rotate_interval_secs: u64 =
+                    args.opt_value_from_str("--rotate-interval")?.unwrap_or(0);
+                let rotate_bytes_mb: Option<u64> = args.opt_value_from_str("--rotate-bytes")?;
+                let retry_ms: u64 = args
+                    .opt_value_from_str("--retry-ms")?
+                    .unwrap_or(DEFAULT_CLIENT_RETRY_MS);
+                let max_retries: u32 = args
+                    .opt_value_from_str("--max-retries")?
+                    .unwrap_or(DEFAULT_CLIENT_MAX_RETRIES);
+                let keepalive_secs: u64 = args
+                    .opt_value_from_str("--keepalive")?
+                    .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+                let lane_hunt_flag = args.contains("--lane-hunt");
+                let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+                let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+                let lane_target_rtt_opt: Option<u64> =
+                    args.opt_value_from_str("--lane-target-rtt")?;
+                let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+                let lane_enabled = lane_hunt_flag
+                    || lane_probes_opt.is_some_and(|p| p > 1)
+                    || lane_target_rtt_opt.is_some_and(|t| t > 0);
+                let lane_hunt = LaneHuntConfig {
+                    enabled: lane_enabled,
+                    probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                    max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                    target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                    degrade_cooldown_secs: lane_cooldown_opt
+                        .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                }
+                .normalized();
+                if server_host.is_empty() || backend_port == 0 {
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let rotate_max_bytes = match rotate_bytes_mb {
+                    Some(mb) => mb.saturating_mul(MIB),
+                    None if rotate_interval_secs > 0 => DEFAULT_ROTATE_BYTE_BUDGET_MIB * MIB,
+                    None => 0,
+                };
+                let server_addr = parse_socket_addr(&server_host, server_port, "server");
+                let backend_addr = parse_socket_addr(&backend_host, backend_port, "backend");
+                if let Err(e) = run_reverse_agent(ReverseAgentConfig {
+                    client: ClientConfig {
+                        listen_addr: backend_addr,
+                        server_addr,
+                        psk: common.psk,
+                        cipher_pref: common.cipher_pref,
+                        dtls_decoy: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        rotate_interval_secs,
+                        rotate_max_bytes,
+                        rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        retry_ms,
+                        max_retries,
+                        keepalive_secs,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        lane_hunt,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    backend_addr,
+                }) {
+                    eprintln!("reverse agent error: {}", e);
+                    process::exit(1);
+                }
             }
         }
         "bypass" => {

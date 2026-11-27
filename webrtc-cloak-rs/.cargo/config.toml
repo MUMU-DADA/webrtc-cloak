@@ -6,6 +6,7 @@ rustflags = [
 [target.x86_64-apple-darwin]
 rustflags = [
   "-C", "force-unwind-tables=no",
+  "--cfg", "chacha20_avx512",
 ]
 
 [target.x86_64-unknown-linux-musl]
@@ -14,6 +15,7 @@ rustflags = [
   "-C", "target-feature=+crt-static",
   "-C", "target-cpu=x86-64",
   "-C", "force-unwind-tables=no",
+  "--cfg", "chacha20_avx512",
 ]
 
 [target.aarch64-unknown-linux-musl]
@@ -63,6 +65,17 @@ linker = "rust-lld"
 rustflags = [
   "-C", "target-feature=+crt-static",
   "-C", "force-unwind-tables=no",
+  "--cfg", "chacha20_avx512",
+]
+
+[target.x86_64-pc-windows-msvc]
+rustflags = [
+  "--cfg", "chacha20_avx512",
+]
+
+[target.i686-pc-windows-msvc]
+rustflags = [
+  "--cfg", "chacha20_avx512",
 ]
 
 [target.riscv64gc-unknown-linux-musl]

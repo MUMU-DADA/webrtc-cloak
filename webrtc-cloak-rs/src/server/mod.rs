@@ -6,11 +6,11 @@ mod worker;
 mod worker_cmds;
 mod worker_io;
 
-use self::registry::SharedV4Registry;
-pub(crate) use self::registry::{SeenTxidCache, TxidCheck};
+pub(crate) use self::registry::{SeenTxidCache, SharedV4Registry, TxidCheck};
 use self::worker::run_server_worker;
+pub(crate) use self::worker::ServerWorker;
 use crate::constants::{
-    outer_udp_hdr_len, unspecified_addr_for, SOCK_BUF_4MIB, TRICKLE_RATE_15S_BYTES,
+    outer_udp_hdr_len, unspecified_addr_for, SharedPoll, SOCK_BUF_4MIB, TRICKLE_RATE_15S_BYTES,
 };
 use crate::protocol::{
     build_dimpl_config_pool_for, detect_cpu_accel, rand_duration_range_ms, CipherPref, CipherSuite,
@@ -20,13 +20,13 @@ use crate::telemetry::{TelemetryConfig, TelemetryHub};
 use crate::udp_batch::format_udp_batch_mode;
 use dimpl::Dtls;
 use mio::net::UdpSocket as MioUdpSocket;
-use mio::{Interest, Poll, Token};
+use mio::{Interest, Token};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::Cell;
 use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::Write;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -120,11 +120,20 @@ pub(super) enum ServerState {
     Closing(Instant, bool),
 }
 
+pub(crate) enum ServerHook<'a> {
+    Relay(&'a mut crate::relay::RelayEgress),
+    ReverseEntry(&'a mut crate::reverse::ReverseEntryHub),
+}
+
 pub(super) enum BackendPipe {
     /// Lazily unbound until first Data packet arrives OR atomic `0xFFFC` handover installs old socket.
     Unbound,
     /// Exclusively owned backend UDP socket registered in this worker's `mio::Poll`.
     Owned(MioUdpSocket),
+    /// In-process zero-loopback relay flow key mapped to `RelayEgress` (0 extra sockets!).
+    RelayFlow(SocketAddr),
+    /// Registered Reverse Tunnel Agent session (traffic muxed over `0xFFFB` ReverseData frames).
+    ReverseAgent,
     /// Handed over to a newer MBB session on the SAME worker (chained <=4-hop drain forwarding).
     ForwardLocal {
         target_tok: Token,
@@ -135,6 +144,31 @@ pub(super) enum BackendPipe {
         target_worker: usize,
         target_ufrag: String,
     },
+}
+
+#[derive(Default)]
+pub(super) struct RelayState {
+    pub(super) enabled: bool,
+    pub(super) reverse_entry: bool,
+    pub(super) next_flow_id: u32,
+    pub(super) flow_to_ingress: HashMap<SocketAddr, Token>,
+    pub(super) closed_flows: Vec<SocketAddr>,
+    pub(super) closed_reverse_tokens: Vec<Token>,
+}
+
+/// Allocates a synthetic unique `SocketAddr` key (`fd00::/8` ULA space, never passed to OS)
+/// identifying a logical ingress-to-egress flow inside a single-process `RelayWorker`.
+#[inline]
+pub(super) fn alloc_relay_flow_addr(worker_id: usize, next_flow_id: &mut u32) -> SocketAddr {
+    *next_flow_id = next_flow_id.wrapping_add(1);
+    if *next_flow_id == 0 {
+        *next_flow_id = 1;
+    }
+    let fid = *next_flow_id;
+    let hi =
+        0xfd00_0000_0000_0000u128 | (((worker_id as u128) & 0xffff) << 48) | ((fid as u128) << 16);
+    let port = ((fid & 0xffff) as u16).max(1);
+    SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(hi), port, 0, 0))
 }
 
 #[derive(Clone, Copy)]
@@ -153,6 +187,8 @@ pub(super) struct ServerSession {
     pub(super) tie_breaker: [u8; 8],
     pub(super) backend: BackendPipe,
     pub(super) backend_lport: u16,
+    /// True once this session registers as an always-on Reverse Tunnel Agent (`REV_OP_HELLO`).
+    pub(super) is_reverse_agent: bool,
     /// P1-1: Single-use MBB handover lock (idempotent for same `new_ufrag`, blocks double-handover).
     pub(super) handed_over_to: Option<String>,
     pub(super) state: ServerState,
@@ -246,9 +282,20 @@ pub(super) fn ensure_owned_backend(
     tok: Token,
     sess: &mut ServerSession,
     backend_addr: SocketAddr,
-    poll: &Poll,
+    poll: &SharedPoll,
+    relay: &mut RelayState,
 ) -> bool {
     if matches!(sess.backend, BackendPipe::Unbound) {
+        if relay.reverse_entry {
+            return false;
+        }
+        if relay.enabled {
+            let flow_addr = alloc_relay_flow_addr(worker_id, &mut relay.next_flow_id);
+            relay.flow_to_ingress.insert(flow_addr, tok);
+            sess.backend = BackendPipe::RelayFlow(flow_addr);
+            sess.backend_lport = flow_addr.port();
+            return true;
+        }
         let bind_any = unspecified_addr_for(backend_addr);
         let mut bs = match make_udp_socket(bind_any, Some(backend_addr), false, SOCK_BUF_4MIB) {
             Ok(s) => s,
@@ -271,9 +318,24 @@ pub(super) fn ensure_owned_backend(
     true
 }
 
-pub(super) fn deregister_backend(poll: &Poll, backend: &mut BackendPipe) {
-    if let BackendPipe::Owned(ref mut sock) = backend {
-        let _ = poll.registry().deregister(sock);
+pub(super) fn deregister_backend(
+    poll: &SharedPoll,
+    tok: Token,
+    backend: &mut BackendPipe,
+    relay: &mut RelayState,
+) {
+    match backend {
+        BackendPipe::Owned(ref mut sock) => {
+            let _ = poll.registry().deregister(sock);
+        }
+        BackendPipe::RelayFlow(flow_addr) if relay.flow_to_ingress.get(flow_addr) == Some(&tok) => {
+            relay.flow_to_ingress.remove(flow_addr);
+            relay.closed_flows.push(*flow_addr);
+        }
+        BackendPipe::ReverseAgent => {
+            relay.closed_reverse_tokens.push(tok);
+        }
+        _ => {}
     }
 }
 
@@ -283,13 +345,14 @@ fn cleanup_session_routes(
     worker_id: usize,
     tok: Token,
     sess: &mut ServerSession,
-    poll: &Poll,
+    poll: &SharedPoll,
+    relay: &mut RelayState,
     token_by_peer: &mut HashMap<SocketAddr, Token>,
     token_by_ufrag: &mut HashMap<String, Token>,
     local_mig_pending: &mut HashMap<SocketAddr, (Token, Instant)>,
     registry: &SharedV4Registry,
 ) {
-    deregister_backend(poll, &mut sess.backend);
+    deregister_backend(poll, tok, &mut sess.backend, relay);
     if token_by_peer.get(&sess.peer_addr) == Some(&tok) {
         token_by_peer.remove(&sess.peer_addr);
     }

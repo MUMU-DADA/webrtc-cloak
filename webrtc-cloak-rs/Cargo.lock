@@ -627,8 +627,6 @@ dependencies = [
 [[package]]
 name = "poly1305"
 version = "0.9.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6e2d0073b297041425c7c3df6eb4792d598a15323fe63346852b092eca02904c"
 dependencies = [
  "cpufeatures",
  "universal-hash",
@@ -948,8 +946,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "webrtc-cloak"
-version = "0.5.1"
+version = "0.6.0"
 dependencies = [
+ "aes",
  "aes-gcm",
  "blake2",
  "chacha20poly1305",
@@ -961,6 +960,8 @@ dependencies = [
  "mio",
  "p256",
  "pico-args",
+ "poly1305",
+ "polyval",
  "serde_json",
  "sha1",
  "sha2",

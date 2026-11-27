@@ -3,14 +3,15 @@
 use super::registry::{SharedV4Registry, WorkerCmd};
 use super::{
     deregister_backend, ensure_owned_backend, log, record_server_media_bytes, BackendPipe,
-    PendingPathMigration, ServerConfig, ServerSession, ServerState, WireAudit,
-    MAX_CHALLENGES_PER_SEC, MAX_FORWARD_HOPS, MIGRATION_CHALLENGE_TTL, OLD_PEER_DRAIN_TTL,
-    SERVER_SRTCP_INIT_MAX_MS, SERVER_SRTCP_INIT_MIN_MS,
+    PendingPathMigration, RelayState, ServerConfig, ServerHook, ServerSession, ServerState,
+    WireAudit, MAX_CHALLENGES_PER_SEC, MAX_FORWARD_HOPS, MIGRATION_CHALLENGE_TTL,
+    OLD_PEER_DRAIN_TTL, SERVER_SRTCP_INIT_MAX_MS, SERVER_SRTCP_INIT_MIN_MS,
 };
 use crate::constants::{
-    outer_udp_hdr_len, CTRL_FRAME_BUF_LEN, HANDOVER_MIN_REQ_LEN, HANDOVER_OP_ACK, HANDOVER_OP_REQ,
-    HANDOVER_PROOF_LEN, PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ, PATH_CHALLENGE_OP_RESP,
-    PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, PROBE_IO_BUF_LEN, SRTP_HANDOVER_MAGIC,
+    outer_udp_hdr_len, SharedPoll, CTRL_FRAME_BUF_LEN, HANDOVER_MIN_REQ_LEN, HANDOVER_OP_ACK,
+    HANDOVER_OP_REQ, HANDOVER_PROOF_LEN, PATH_CHALLENGE_OP_CONFIRM, PATH_CHALLENGE_OP_REQ,
+    PATH_CHALLENGE_OP_RESP, PATH_CHALLENGE_PAYLOAD_LEN, PATH_CONFIRM_PAYLOAD_LEN, PROBE_IO_BUF_LEN,
+    REV_OP_FLOW_CLOSE, REV_OP_HELLO, REV_OP_HELLO_ACK, SRTP_HANDOVER_MAGIC,
     SRTP_PATH_CHALLENGE_MAGIC, STUN_MAX_USERNAME_LEN, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
@@ -21,7 +22,7 @@ use crate::protocol::{
 use crate::telemetry::TelemetryHub;
 use dimpl::{Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
-use mio::{Interest, Poll, Token};
+use mio::{Interest, Token};
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -151,19 +152,32 @@ pub(super) fn deliver_uplink_payload(
     payload: &[u8],
     hops_left: u8,
     sessions_by_token: &mut HashMap<Token, ServerSession>,
-    poll: &Poll,
+    poll: &SharedPoll,
+    relay: &mut RelayState,
+    hook: &mut Option<ServerHook<'_>>,
     backend_addr: SocketAddr,
     registry: &SharedV4Registry,
+    now: Instant,
 ) -> bool {
     let mut cur_tok = start_tok;
     let mut remaining = hops_left;
     loop {
         if let Some(sess) = sessions_by_token.get_mut(&cur_tok) {
             if matches!(sess.backend, BackendPipe::Unbound) {
-                let _ = ensure_owned_backend(worker_id, cur_tok, sess, backend_addr, poll);
+                let _ = ensure_owned_backend(worker_id, cur_tok, sess, backend_addr, poll, relay);
             }
             match sess.backend {
                 BackendPipe::Owned(ref sock) => return sock.send(payload).is_ok(),
+                BackendPipe::RelayFlow(flow_addr) => {
+                    return matches!(hook, Some(ServerHook::Relay(_)))
+                        && match hook {
+                            Some(ServerHook::Relay(e)) => {
+                                e.send_uplink_single(flow_addr, payload, now)
+                            }
+                            _ => false,
+                        };
+                }
+                BackendPipe::ReverseAgent => return false,
                 BackendPipe::ForwardLocal {
                     target_tok,
                     ref target_ufrag,
@@ -368,7 +382,9 @@ pub(super) fn process_ready_srtp(
     token_by_peer: &mut HashMap<SocketAddr, Token>,
     token_by_ufrag: &mut HashMap<String, Token>,
     local_mig_pending: &mut HashMap<SocketAddr, (Token, Instant)>,
-    poll: &Poll,
+    poll: &SharedPoll,
+    relay: &mut RelayState,
+    hook: &mut Option<ServerHook<'_>>,
     listen_sock: &MioUdpSocket,
     cfg: &ServerConfig,
     registry: &SharedV4Registry,
@@ -407,6 +423,8 @@ pub(super) fn process_ready_srtp(
         token_by_ufrag,
         local_mig_pending,
         poll,
+        relay,
+        hook,
         listen_sock,
         cfg,
         registry,
@@ -428,7 +446,9 @@ pub(super) fn handle_ready_srtp_frame(
     token_by_peer: &mut HashMap<SocketAddr, Token>,
     token_by_ufrag: &mut HashMap<String, Token>,
     local_mig_pending: &mut HashMap<SocketAddr, (Token, Instant)>,
-    poll: &Poll,
+    poll: &SharedPoll,
+    relay: &mut RelayState,
+    hook: &mut Option<ServerHook<'_>>,
     listen_sock: &MioUdpSocket,
     cfg: &ServerConfig,
     registry: &SharedV4Registry,
@@ -446,8 +466,11 @@ pub(super) fn handle_ready_srtp_frame(
                 MAX_FORWARD_HOPS,
                 sessions_by_token,
                 poll,
+                relay,
+                hook,
                 cfg.backend_addr,
                 registry,
+                now,
             );
             if let Some(sess) = sessions_by_token.get_mut(&tok) {
                 sess.last_data_active = now;
@@ -584,6 +607,8 @@ pub(super) fn handle_ready_srtp_frame(
                         Reject,
                         IdempotentOk,
                         Transfer(Option<(MioUdpSocket, u16)>),
+                        TransferRelay(SocketAddr, u16),
+                        TransferReverseAgent,
                     }
                     let action = if let Some(old_s) = sessions_by_token.get_mut(&old_tok) {
                         let verified = old_s
@@ -603,24 +628,33 @@ pub(super) fn handle_ready_srtp_frame(
                             LocalHandoverAction::Reject
                         } else {
                             old_s.handed_over_to = Some(new_ufrag.clone());
-                            let old_lport = old_s.backend_lport;
-                            let prev_pipe = std::mem::replace(
-                                &mut old_s.backend,
-                                BackendPipe::ForwardLocal {
-                                    target_tok: tok,
-                                    target_ufrag: new_ufrag.clone(),
-                                },
-                            );
-                            match prev_pipe {
-                                BackendPipe::Owned(mut sock) => {
-                                    let _ = poll.registry().deregister(&mut sock);
-                                    LocalHandoverAction::Transfer(Some((sock, old_lport)))
-                                }
-                                // P1-1: Even if Unbound, old_s stays ForwardLocal so no dual-socket split-brain!
-                                BackendPipe::Unbound => LocalHandoverAction::Transfer(None),
-                                other => {
-                                    old_s.backend = other;
-                                    LocalHandoverAction::Transfer(None)
+                            if matches!(old_s.backend, BackendPipe::ReverseAgent) {
+                                // Keep old_s in ReverseAgent so trailing in-flight ReverseData frames
+                                // arriving during DrainingBeforeBye still deliver to expose_sock.
+                                LocalHandoverAction::TransferReverseAgent
+                            } else {
+                                let old_lport = old_s.backend_lport;
+                                let prev_pipe = std::mem::replace(
+                                    &mut old_s.backend,
+                                    BackendPipe::ForwardLocal {
+                                        target_tok: tok,
+                                        target_ufrag: new_ufrag.clone(),
+                                    },
+                                );
+                                match prev_pipe {
+                                    BackendPipe::Owned(mut sock) => {
+                                        let _ = poll.registry().deregister(&mut sock);
+                                        LocalHandoverAction::Transfer(Some((sock, old_lport)))
+                                    }
+                                    BackendPipe::RelayFlow(flow_addr) => {
+                                        LocalHandoverAction::TransferRelay(flow_addr, old_lport)
+                                    }
+                                    // P1-1: Even if Unbound, old_s stays ForwardLocal so no dual-socket split-brain!
+                                    BackendPipe::Unbound => LocalHandoverAction::Transfer(None),
+                                    other => {
+                                        old_s.backend = other;
+                                        LocalHandoverAction::Transfer(None)
+                                    }
                                 }
                             }
                         }
@@ -639,7 +673,7 @@ pub(super) fn handle_ready_srtp_frame(
                             }
                             LocalHandoverAction::Transfer(sock_opt) => {
                                 if let Some((mut sock, lport)) = sock_opt {
-                                    deregister_backend(poll, &mut new_s.backend);
+                                    deregister_backend(poll, tok, &mut new_s.backend, relay);
                                     if poll
                                         .registry()
                                         .register(&mut sock, tok, Interest::READABLE)
@@ -661,6 +695,47 @@ pub(super) fn handle_ready_srtp_frame(
                                             ));
                                         }
                                     }
+                                }
+                                send_encrypted_handover_ack(new_s, true, listen_sock, audit);
+                            }
+                            LocalHandoverAction::TransferRelay(flow_addr, lport) => {
+                                deregister_backend(poll, tok, &mut new_s.backend, relay);
+                                new_s.backend = BackendPipe::RelayFlow(flow_addr);
+                                new_s.backend_lport = lport;
+                                relay.flow_to_ingress.insert(flow_addr, tok);
+                                log(
+                                    worker_id,
+                                    &format!(
+                                        "MBB HANDOVER (local/relay) {} -> {} flow_id={} (0 upstream change!)",
+                                        old_ufrag, new_ufrag, lport
+                                    ),
+                                );
+                                if let Some(th) = telemetry {
+                                    th.record_mbb_rotation(format!(
+                                        "{}->{} relay_flow={}",
+                                        old_ufrag, new_ufrag, lport
+                                    ));
+                                }
+                                send_encrypted_handover_ack(new_s, true, listen_sock, audit);
+                            }
+                            LocalHandoverAction::TransferReverseAgent => {
+                                new_s.is_reverse_agent = true;
+                                new_s.backend = BackendPipe::ReverseAgent;
+                                if let Some(ServerHook::ReverseEntry(hub)) = hook.as_mut() {
+                                    hub.on_tunnel_handover(old_tok, tok);
+                                }
+                                log(
+                                    worker_id,
+                                    &format!(
+                                        "MBB HANDOVER (reverse-entry) {} -> {} (0 flow disruption!)",
+                                        old_ufrag, new_ufrag
+                                    ),
+                                );
+                                if let Some(th) = telemetry {
+                                    th.record_mbb_rotation(format!(
+                                        "{}->{} reverse-tunnel",
+                                        old_ufrag, new_ufrag
+                                    ));
                                 }
                                 send_encrypted_handover_ack(new_s, true, listen_sock, audit);
                             }
@@ -690,6 +765,78 @@ pub(super) fn handle_ready_srtp_frame(
             // Not found anywhere -> send negative ack cleanly so client does not stall
             if let Some(s) = sessions_by_token.get_mut(&tok) {
                 send_encrypted_handover_ack(s, false, listen_sock, audit);
+            }
+        }
+        SrtpFrame::ReverseData { flow_id, len } => {
+            let delivered = if let Some(ServerHook::ReverseEntry(hub)) = hook.as_mut() {
+                hub.deliver_to_peer_single(flow_id, &wbuf[..len], now)
+            } else {
+                false
+            };
+            if let Some(sess) = sessions_by_token.get_mut(&tok) {
+                sess.last_data_active = now;
+                sess.last_peer_rx = now;
+                if delivered {
+                    sess.rx_pkts += 1;
+                    sess.rx_bytes += len as u64;
+                    record_server_media_bytes(sess, now, len as u64);
+                }
+            }
+        }
+        SrtpFrame::ReverseCtrl(pn) => {
+            let Some(ServerHook::ReverseEntry(hub)) = hook.as_mut() else {
+                return;
+            };
+            if pn >= 2 && wbuf[0] == REV_OP_HELLO {
+                let pending = hub.on_agent_hello(tok);
+                if let Some(sess) = sessions_by_token.get_mut(&tok) {
+                    let newly_registered = !sess.is_reverse_agent;
+                    sess.is_reverse_agent = true;
+                    sess.backend = BackendPipe::ReverseAgent;
+                    sess.last_peer_rx = now;
+                    sess.last_data_active = now;
+                    sess.rx_pkts += 1;
+                    let ack = [REV_OP_HELLO_ACK, 0x01];
+                    let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
+                    let mut flushed_bytes = 0u64;
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if let Some(wn) = cipher.wrap_reverse_ctrl_into(&ack, &mut cbuf) {
+                            audit.record(1, &cbuf[..wn]);
+                            if listen_sock.send_to(&cbuf[..wn], sess.peer_addr).is_ok() {
+                                sess.tx_pkts += 1;
+                            }
+                        }
+                        for (fid, raw) in pending {
+                            if let Some(wn) = cipher.wrap_reverse_data_into(fid, &raw, wbuf) {
+                                audit.record(1, &wbuf[..wn]);
+                                if listen_sock.send_to(&wbuf[..wn], sess.peer_addr).is_ok() {
+                                    sess.tx_pkts += 1;
+                                    sess.tx_bytes += raw.len() as u64;
+                                    flushed_bytes = flushed_bytes.saturating_add(raw.len() as u64);
+                                }
+                            }
+                        }
+                    }
+                    if flushed_bytes > 0 {
+                        record_server_media_bytes(sess, now, flushed_bytes);
+                    }
+                    if newly_registered {
+                        log(
+                            worker_id,
+                            &format!(
+                                "REVERSE AGENT REGISTERED peer={} ufrag={}",
+                                sess.peer_addr, sess.username
+                            ),
+                        );
+                    }
+                }
+            } else if pn >= 5 && wbuf[0] == REV_OP_FLOW_CLOSE {
+                let flow_id = u32::from_be_bytes([wbuf[1], wbuf[2], wbuf[3], wbuf[4]]);
+                hub.remove_flow(flow_id);
+                if let Some(sess) = sessions_by_token.get_mut(&tok) {
+                    sess.rx_pkts += 1;
+                    sess.last_peer_rx = now;
+                }
             }
         }
     }

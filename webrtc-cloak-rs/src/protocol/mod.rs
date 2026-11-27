@@ -238,6 +238,27 @@ pub enum SrtpFrame {
     PathChallenge(usize),
     /// V4 in-band encrypted MBB `backend_sock` atomic handover request / ack (`0xFFFC`)
     Handover(usize),
+    /// Reverse tunnel multiplexed L4 UDP payload (`0xFFFB || len(2B) || flow_id(4B) || payload`)
+    ReverseData {
+        flow_id: u32,
+        len: usize,
+    },
+    /// Reverse tunnel in-band control frame (`0xFFFA || len(2B) || ctrl_payload`)
+    ReverseCtrl(usize),
+}
+
+impl SrtpFrame {
+    #[inline]
+    pub const fn payload_len(self) -> usize {
+        match self {
+            SrtpFrame::Data(n)
+            | SrtpFrame::Probe(n)
+            | SrtpFrame::PathChallenge(n)
+            | SrtpFrame::Handover(n)
+            | SrtpFrame::ReverseData { len: n, .. }
+            | SrtpFrame::ReverseCtrl(n) => n,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -267,21 +288,27 @@ pub enum CipherPref {
     Fixed(CipherSuite),
 }
 
-/// Runtime CPU hardware acceleration probe (uses std::arch::is_*_feature_detected!).
+/// Runtime CPU hardware acceleration probe (uses std::arch::is_*_feature_detected!
+/// cross-checked against actual compiled crate backends so silent fallbacks never hide).
 #[derive(Debug, Clone)]
 pub struct CpuAccelInfo {
     pub arch: &'static str,
     pub features: Vec<&'static str>,
     pub has_hw_aes_gcm: bool,
+    pub aes_backend: &'static str,
+    pub gcm_polyval_backend: &'static str,
+    pub chacha20_backend: &'static str,
+    pub poly1305_backend: &'static str,
     pub recommended: CipherSuite,
 }
 
 pub fn detect_cpu_accel() -> CpuAccelInfo {
     #[allow(unused_mut)]
     let mut features = Vec::new();
-    let has_hw_aes_gcm;
+    let aes_backend: &'static str;
+    let chacha20_backend: &'static str;
 
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "x86_64", target_arch = "x86"))]
     {
         if std::arch::is_x86_feature_detected!("sse2") {
             features.push("SSE2");
@@ -316,8 +343,29 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
         if std::arch::is_x86_feature_detected!("vpclmulqdq") {
             features.push("VPCLMULQDQ");
         }
-        has_hw_aes_gcm = std::arch::is_x86_feature_detected!("aes")
-            && std::arch::is_x86_feature_detected!("pclmulqdq");
+        aes_backend = if !aes::hardware_accelerated() {
+            "soft"
+        } else if std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("vaes")
+        {
+            "x86-vaes512"
+        } else if std::arch::is_x86_feature_detected!("vaes") {
+            "x86-vaes256"
+        } else {
+            "x86-aesni"
+        };
+        chacha20_backend = if cfg!(chacha20_avx512)
+            && std::arch::is_x86_feature_detected!("avx512f")
+            && std::arch::is_x86_feature_detected!("avx512vl")
+        {
+            "x86-avx512"
+        } else if std::arch::is_x86_feature_detected!("avx2") {
+            "x86-avx2"
+        } else if std::arch::is_x86_feature_detected!("sse2") {
+            "x86-sse2"
+        } else {
+            "soft"
+        };
     }
 
     #[cfg(target_arch = "aarch64")]
@@ -337,14 +385,28 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
         if std::arch::is_aarch64_feature_detected!("crc") {
             features.push("ARMv8-CRC32");
         }
-        has_hw_aes_gcm = std::arch::is_aarch64_feature_detected!("aes")
-            && std::arch::is_aarch64_feature_detected!("pmull");
+        aes_backend = if aes::hardware_accelerated() {
+            "armv8-aes"
+        } else {
+            "soft"
+        };
+        chacha20_backend = if cfg!(target_feature = "neon") {
+            "armv8-neon"
+        } else {
+            "soft"
+        };
     }
 
-    #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+    #[cfg(not(any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")))]
     {
-        has_hw_aes_gcm = false;
+        aes_backend = "soft";
+        chacha20_backend = "soft";
     }
+
+    let gcm_polyval_backend = polyval::backend_name();
+    let poly1305_backend = poly1305::backend_name();
+    // Ground-truth check: require BOTH AES and POLYVAL/GHASH crate backends to actually accelerate!
+    let has_hw_aes_gcm = aes::hardware_accelerated() && polyval::hardware_accelerated();
 
     let recommended = if has_hw_aes_gcm {
         CipherSuite::Aes128Gcm
@@ -356,6 +418,10 @@ pub fn detect_cpu_accel() -> CpuAccelInfo {
         arch: std::env::consts::ARCH,
         features,
         has_hw_aes_gcm,
+        aes_backend,
+        gcm_polyval_backend,
+        chacha20_backend,
+        poly1305_backend,
         recommended,
     }
 }

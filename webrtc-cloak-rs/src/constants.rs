@@ -150,6 +150,18 @@ pub const SRTP_PROBE_MAGIC_LEN: u16 = 0xFFFE;
 pub const SRTP_PATH_CHALLENGE_MAGIC: u16 = 0xFFFD;
 /// V4 带内加密 MBB 后端套接字原子交接请求/确认帧魔数。
 pub const SRTP_HANDOVER_MAGIC: u16 = 0xFFFC;
+/// 反向隧道多路复用 L4 UDP 数据帧魔数（`0xFFFB || len(2B) || flow_id(4B) || payload`）。
+pub const SRTP_REVERSE_DATA_MAGIC: u16 = 0xFFFB;
+/// 反向隧道带内控制帧魔数（`0xFFFA || len(2B) || ctrl_payload`）。
+pub const SRTP_REVERSE_CTRL_MAGIC: u16 = 0xFFFA;
+/// 反向隧道控制帧操作码：Agent 上线注册（`[0x01, version=1]`）。
+pub const REV_OP_HELLO: u8 = 0x01;
+/// 反向隧道控制帧操作码：Entry 注册确认（`[0x02, status=1]`）。
+pub const REV_OP_HELLO_ACK: u8 = 0x02;
+/// 反向隧道控制帧操作码：流空闲回收通知（`[0x03, flow_id_be(4B)]`）。
+pub const REV_OP_FLOW_CLOSE: u8 = 0x03;
+/// 反向隧道控制帧协议版本号。
+pub const REV_PROTO_VERSION: u8 = 0x01;
 /// 路径挑战控制帧操作码：服务端发往候选地址的挑战请求。
 pub const PATH_CHALLENGE_OP_REQ: u8 = 0x01;
 /// 路径挑战控制帧操作码：客户端回传的挑战响应。
@@ -214,3 +226,20 @@ pub const WORKER_QUIET_STOP_POLL_MS: u64 = 20;
 pub const WORKER_MIN_FAST_WAIT_MS: u64 = 5;
 /// 常规保活/SRTCP/关闭定时器计算的最小 poll 步进下限（毫秒）。
 pub const WORKER_MIN_NORMAL_WAIT_MS: u64 = 10;
+
+/// 共享 `mio::Registry` 轻量包装，使 `server` / `client` / `bypass` 工作核心既可独立运行，
+/// 也可零开销共用同一个单线程 `mio::Poll` 事件循环实现零回环原生中继。
+#[derive(Clone)]
+pub(crate) struct SharedPoll(std::sync::Arc<mio::Registry>);
+
+impl SharedPoll {
+    #[inline]
+    pub(crate) fn new(reg: mio::Registry) -> Self {
+        Self(std::sync::Arc::new(reg))
+    }
+
+    #[inline]
+    pub(crate) fn registry(&self) -> &mio::Registry {
+        &self.0
+    }
+}

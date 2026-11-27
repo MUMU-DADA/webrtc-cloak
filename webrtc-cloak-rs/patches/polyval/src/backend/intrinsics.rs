@@ -85,6 +85,20 @@ impl State {
     }
 }
 
+/// Returns true if hardware CLMUL / PMULL POLYVAL acceleration is active at runtime.
+#[inline]
+pub(crate) fn hardware_accelerated() -> bool {
+    let (_, ok) = InitToken::init_get();
+    ok
+}
+
+/// Returns the active POLYVAL backend name at runtime.
+#[inline]
+pub(crate) fn backend_name() -> &'static str {
+    let _ = InitToken::init_get();
+    intrinsics_impl::backend_name()
+}
+
 /// Precomputed key material for POLYVAL using R/F algorithm
 ///
 /// Stores H and D values for each power, where D = swap(H) ⊕ (H0 × P1)

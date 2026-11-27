@@ -6,7 +6,8 @@ use super::{
 use crate::constants::{
     DEFAULT_WAN_MTU, IPV4_UDP_HDR_LEN, MAX_INNER_UDP_LEN, MIN_WIRE_UDP_MTU, RTP_AUDIO_PT,
     RTP_FIXED_HDR_LEN, RTP_FULL_HDR_LEN, RTP_V2_EXT_BYTE, RTP_VIDEO_PT, SRTP_DATA_PREFIX_LEN,
-    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, SRTP_PROBE_MAGIC_LEN, SRTP_TAG_LEN,
+    SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, SRTP_PROBE_MAGIC_LEN, SRTP_REVERSE_CTRL_MAGIC,
+    SRTP_REVERSE_DATA_MAGIC, SRTP_TAG_LEN,
 };
 use aes_gcm::aead::AeadInOut;
 use aes_gcm::{Aes128Gcm, Nonce as GcmNonce, Tag as GcmTag};
@@ -38,6 +39,8 @@ const RTP_ONE_BYTE_EXT_MAGIC_LO: u8 = 0xDE;
 const RTP_TWCC_EXT_ID_LEN: u8 = 0x31;
 /// 带内控制帧加密区前缀长度（2B 控制魔数 + 2B 控制负载长度）。
 const SRTP_CTRL_PREFIX_LEN: usize = 4;
+/// 反向隧道多路复用数据帧加密区前缀长度（2B 魔数 `0xFFFB` + 2B 负载长度 + 4B `flow_id`）。
+const SRTP_REV_DATA_PREFIX_LEN: usize = 8;
 /// 带内控制帧允许携带的最大负载字节数。
 const SRTP_MAX_CTRL_PAYLOAD_LEN: usize = 1460;
 /// 触发小范围随机填充的大包有效负载阈值（字节），避免接近 MTU 时浪费空间。
@@ -477,7 +480,32 @@ impl SrtpCloakCipher {
     ///   [16B AEAD / MAC Tag]
     #[inline]
     pub fn wrap_into(&mut self, plaintext: &[u8], out: &mut [u8]) -> Option<usize> {
-        self.wrap_inner(None, false, plaintext, out)
+        self.wrap_inner(None, None, false, plaintext, out)
+    }
+
+    /// Zero-allocation wrap of a reverse-tunnel multiplexed UDP flow packet
+    /// (`0xFFFB || payload_len(2B) || flow_id(4B) || payload || random pad`) inside AEAD ciphertext.
+    /// Wire-indistinguishable from normal Chrome `0x90` SRTP media packets.
+    #[inline]
+    pub fn wrap_reverse_data_into(
+        &mut self,
+        flow_id: u32,
+        plaintext: &[u8],
+        out: &mut [u8],
+    ) -> Option<usize> {
+        self.wrap_inner(
+            Some(SRTP_REVERSE_DATA_MAGIC),
+            Some(flow_id),
+            false,
+            plaintext,
+            out,
+        )
+    }
+
+    /// Wrap an in-band AEAD-encrypted reverse-tunnel control frame (`0xFFFA`).
+    #[inline]
+    pub fn wrap_reverse_ctrl_into(&mut self, payload: &[u8], out: &mut [u8]) -> Option<usize> {
+        self.wrap_control_inner(SRTP_REVERSE_CTRL_MAGIC, false, payload, out)
     }
 
     /// Wrap an in-band AEAD-encrypted diagnostic probe (`0xFFFE || probe_len || payload || random pad`).
@@ -487,7 +515,7 @@ impl SrtpCloakCipher {
         self.wrap_control_into(SRTP_PROBE_MAGIC_LEN, payload, out)
     }
 
-    /// Wrap an in-band AEAD-encrypted control frame (`magic` in `{0xFFFE, 0xFFFD, 0xFFFC}`).
+    /// Wrap an in-band AEAD-encrypted control frame (`magic` in `{0xFFFE, 0xFFFD, 0xFFFC, 0xFFFA}`).
     /// Byte-for-byte identical Chrome `0x90` SRTP on the wire; strictly inside AEAD ciphertext.
     #[inline]
     pub fn wrap_control_into(
@@ -522,24 +550,30 @@ impl SrtpCloakCipher {
         if payload.len() > SRTP_MAX_CTRL_PAYLOAD_LEN
             || !matches!(
                 magic,
-                SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
+                SRTP_PROBE_MAGIC_LEN
+                    | SRTP_PATH_CHALLENGE_MAGIC
+                    | SRTP_HANDOVER_MAGIC
+                    | SRTP_REVERSE_CTRL_MAGIC
             )
         {
             return None;
         }
-        self.wrap_inner(Some(magic), no_pad, payload, out)
+        self.wrap_inner(Some(magic), None, no_pad, payload, out)
     }
 
     #[inline]
     fn wrap_inner(
         &mut self,
         control_magic: Option<u16>,
+        rev_flow_id: Option<u32>,
         no_pad: bool,
         plaintext: &[u8],
         out: &mut [u8],
     ) -> Option<usize> {
         let is_control = control_magic.is_some();
-        let prefix_len = if is_control {
+        let prefix_len = if rev_flow_id.is_some() {
+            SRTP_REV_DATA_PREFIX_LEN
+        } else if is_control {
             SRTP_CTRL_PREFIX_LEN
         } else {
             SRTP_DATA_PREFIX_LEN
@@ -706,13 +740,17 @@ impl SrtpCloakCipher {
         out[19] = 0x00;
 
         // Inner encrypted payload:
-        //   Data   : [inner_len: u16 BE] || [plaintext] || [random pad]
-        //   Control: [magic: u16 BE (0xFFFE/0xFFFD/0xFFFC)] || [len: u16 BE] || [payload] || [random pad]
+        //   Data       : [inner_len: u16 BE] || [plaintext] || [random pad]
+        //   Control    : [magic: u16 BE (0xFFFE/0xFFFD/0xFFFC/0xFFFA)] || [len: u16 BE] || [payload] || [random pad]
+        //   ReverseData: [0xFFFB: u16 BE] || [len: u16 BE] || [flow_id: u32 BE] || [plaintext] || [random pad]
         let ct_end = RTP_FULL_HDR_LEN + ct_len;
         if let Some(magic) = control_magic {
             out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2].copy_from_slice(&magic.to_be_bytes());
             out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 4]
                 .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+            if let Some(fid) = rev_flow_id {
+                out[RTP_FULL_HDR_LEN + 4..RTP_FULL_HDR_LEN + 8].copy_from_slice(&fid.to_be_bytes());
+            }
         } else {
             out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
                 .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
@@ -973,9 +1011,30 @@ impl SrtpCloakCipher {
         let roc = matched_roc?;
         self.update_rx_seq_stream(is_audio, roc, seq16);
         let raw_len = u16::from_be_bytes([out[0], out[1]]);
+        if raw_len == SRTP_REVERSE_DATA_MAGIC {
+            if ct_len < SRTP_REV_DATA_PREFIX_LEN {
+                return None;
+            }
+            let payload_len = u16::from_be_bytes([out[2], out[3]]) as usize;
+            let flow_id = u32::from_be_bytes([out[4], out[5], out[6], out[7]]);
+            if payload_len > MAX_INNER_UDP_LEN || SRTP_REV_DATA_PREFIX_LEN + payload_len > ct_len {
+                return None;
+            }
+            out.copy_within(
+                SRTP_REV_DATA_PREFIX_LEN..SRTP_REV_DATA_PREFIX_LEN + payload_len,
+                0,
+            );
+            return Some(SrtpFrame::ReverseData {
+                flow_id,
+                len: payload_len,
+            });
+        }
         if matches!(
             raw_len,
-            SRTP_PROBE_MAGIC_LEN | SRTP_PATH_CHALLENGE_MAGIC | SRTP_HANDOVER_MAGIC
+            SRTP_PROBE_MAGIC_LEN
+                | SRTP_PATH_CHALLENGE_MAGIC
+                | SRTP_HANDOVER_MAGIC
+                | SRTP_REVERSE_CTRL_MAGIC
         ) {
             if ct_len < SRTP_CTRL_PREFIX_LEN {
                 return None;
@@ -989,6 +1048,7 @@ impl SrtpCloakCipher {
                 SRTP_PROBE_MAGIC_LEN => SrtpFrame::Probe(ctrl_len),
                 SRTP_PATH_CHALLENGE_MAGIC => SrtpFrame::PathChallenge(ctrl_len),
                 SRTP_HANDOVER_MAGIC => SrtpFrame::Handover(ctrl_len),
+                SRTP_REVERSE_CTRL_MAGIC => SrtpFrame::ReverseCtrl(ctrl_len),
                 _ => unreachable!(),
             });
         }

@@ -1,17 +1,18 @@
 //! 客户端 mio 工作线程状态容器、主事件循环与遥测上报。
 
-use super::dtls::graceful_teardown_client;
+use super::dtls::{graceful_teardown_client, spawn_client_session};
 use super::lane_hunt::{HuntPurpose, LaneHunt};
 use super::{
-    log, make_udp_socket, ClientConfig, ClientSession, HandshakeState, OldPathDrain,
-    PendingReconnect,
+    cancel_standby_for_client, log, make_udp_socket, record_client_media_bytes, ClientConfig,
+    ClientDownlink, ClientSession, HandshakeState, OldPathDrain, PendingReconnect, KA_MAX_RETRIES,
 };
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, DTLS_IO_BUF_LEN,
-    LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP, SOCK_BUF_8MIB, SRTP_DATA_MIN_WIRE_LEN,
-    TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
+    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, SharedPoll,
+    CTRL_FRAME_BUF_LEN, DTLS_IO_BUF_LEN, LISTEN_TOKEN, MAX_INNER_UDP_LEN, MIO_EVENTS_CAP,
+    POST_BYE_CLOSING_DRAIN_MS, REV_OP_HELLO, REV_PROTO_VERSION, SOCK_BUF_8MIB,
+    SRTP_DATA_MIN_WIRE_LEN, TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
     detect_cpu_accel, is_shutdown_requested, register_shutdown_poll, stun_hmac_key, CertCache,
@@ -28,11 +29,12 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-pub(super) struct ClientWorker {
+pub(crate) struct ClientWorker {
     pub(super) worker_id: usize,
     pub(super) cfg: ClientConfig,
-    pub(super) poll: Poll,
-    pub(super) listen_sock: MioUdpSocket,
+    pub(super) poll: SharedPoll,
+    pub(super) listen_sock: Option<MioUdpSocket>,
+    pub(super) reverse_agent: bool,
     pub(super) sessions_by_token: HashMap<Token, ClientSession>,
     pub(super) token_by_client: HashMap<SocketAddr, Token>,
     pub(super) standby_by_client: HashMap<SocketAddr, Token>,
@@ -80,7 +82,7 @@ pub(super) fn run_client_worker(
     telemetry: Option<Arc<TelemetryHub>>,
 ) -> std::io::Result<()> {
     super::CLIENT_QUIET.with(|q| q.set(cfg.quiet));
-    let poll = Poll::new()?;
+    let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, cfg.quiet, cfg.stop.is_some());
 
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
@@ -119,11 +121,13 @@ pub(super) fn run_client_worker(
     let batch_enabled = is_udp_batch_active(cfg.udp_batch);
     let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
     let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
+    let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
     let mut worker = ClientWorker {
         worker_id,
         cfg,
-        poll,
-        listen_sock,
+        poll: shared_poll,
+        listen_sock: Some(listen_sock),
+        reverse_agent: false,
         sessions_by_token: HashMap::new(),
         token_by_client: HashMap::new(),
         standby_by_client: HashMap::new(),
@@ -165,11 +169,11 @@ pub(super) fn run_client_worker(
     if worker.cfg.lane_hunt.enabled {
         let _ = worker.start_lane_hunt(HuntPurpose::PreWarm, now, VecDeque::new(), 0);
     }
-    worker.run()
+    worker.run(&mut poll)
 }
 
 impl ClientWorker {
-    fn run(&mut self) -> std::io::Result<()> {
+    fn run(&mut self, poll: &mut Poll) -> std::io::Result<()> {
         let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
             if is_shutdown_requested(self.cfg.stop.as_ref(), self.cfg.quiet) {
@@ -187,7 +191,7 @@ impl ClientWorker {
             if self.cfg.stop.is_some() && self.cfg.quiet && wait > quiet_cap {
                 wait = quiet_cap;
             }
-            if let Err(e) = self.poll.poll(&mut events, Some(wait)) {
+            if let Err(e) = poll.poll(&mut events, Some(wait)) {
                 if e.kind() == ErrorKind::Interrupted {
                     continue;
                 }
@@ -208,18 +212,24 @@ impl ClientWorker {
                 if ev.token() == LISTEN_TOKEN {
                     self.handle_listen_readable(now);
                 } else if self.old_path_drains.contains_key(&ev.token()) {
-                    self.handle_old_path_drain(ev.token(), now, &mut graceful_reconnects);
+                    self.handle_old_path_drain_with(
+                        ev.token(),
+                        now,
+                        &mut graceful_reconnects,
+                        None,
+                    );
                 } else if !self.hunt_tok_to_id.is_empty()
                     && self.hunt_tok_to_id.contains_key(&ev.token())
                 {
                     self.handle_hunt_readable(ev.token(), now, &mut standby_ready);
                 } else {
-                    self.handle_upstream_readable(
+                    self.handle_upstream_readable_with(
                         ev.token(),
                         now,
                         &mut standby_ready,
                         &mut standby_promoted,
                         &mut graceful_reconnects,
+                        None,
                     );
                 }
             }
@@ -230,7 +240,426 @@ impl ClientWorker {
         }
     }
 
-    fn graceful_shutdown_all(&mut self) {
+    pub(crate) fn new_for_relay(
+        worker_id: usize,
+        cfg: ClientConfig,
+        dtls_pool: DtlsConfigPool,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> Self {
+        super::CLIENT_QUIET.with(|q| q.set(cfg.quiet));
+        let stun_mi_key = stun_hmac_key(&cfg.psk);
+        let max_inner_pending = if cfg.wan_mtu > 0 {
+            cfg.wan_mtu
+                .saturating_sub(outer_udp_hdr_len(cfg.server_addr) + SRTP_DATA_MIN_WIRE_LEN)
+                .min(MAX_INNER_UDP_LEN)
+        } else {
+            MAX_INNER_UDP_LEN
+        };
+        let cpu = detect_cpu_accel();
+        let retry_dur = Duration::from_millis(cfg.retry_ms);
+        let ka_base_ms = cfg.keepalive_secs * 1000;
+        let idle_dur = Duration::from_secs(cfg.idle_timeout_secs);
+        let stats_dur = Duration::from_secs(cfg.stats_interval_secs);
+        let telemetry_dur = telemetry
+            .as_ref()
+            .map(|th| th.interval())
+            .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
+        let now = Instant::now();
+        let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
+        let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
+        let batch_enabled = is_udp_batch_active(cfg.udp_batch);
+        let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
+        let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
+        let mut worker = ClientWorker {
+            worker_id,
+            cfg,
+            poll,
+            listen_sock: None,
+            reverse_agent: false,
+            sessions_by_token: HashMap::new(),
+            token_by_client: HashMap::new(),
+            standby_by_client: HashMap::new(),
+            old_path_drains: HashMap::new(),
+            pending_reconnects: HashMap::new(),
+            last_rotation_by_client: HashMap::new(),
+            lane_hunts: HashMap::new(),
+            hunt_tok_to_id: HashMap::new(),
+            next_hunt_id: 1,
+            prewarm_tok: None,
+            next_prewarm_at: None,
+            best_observed_rtt_ms: None,
+            consecutive_trial_failures: 0,
+            next_token_id: 1,
+            cert_cache: CertCache::new(),
+            dtls_pool,
+            stun_mi_key,
+            max_inner_pending,
+            telemetry,
+            rbuf: vec![0u8; rbuf_len],
+            wbuf: vec![0u8; wbuf_len],
+            dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
+            rx_batch,
+            tx_batch,
+            cpu,
+            retry_dur,
+            ka_base_ms,
+            idle_dur,
+            stats_dur,
+            last_stats: now,
+            telemetry_dur,
+            last_telemetry: now,
+            closed_tx_bytes: 0,
+            closed_rx_bytes: 0,
+            closed_tx_pkts: 0,
+            closed_rx_pkts: 0,
+            closed_auth_drops: 0,
+        };
+        if worker.cfg.lane_hunt.enabled {
+            let _ = worker.start_lane_hunt(HuntPurpose::PreWarm, now, VecDeque::new(), 0);
+        }
+        worker
+    }
+
+    #[inline]
+    pub(crate) fn ready_upstream_tok(&self, client_addr: SocketAddr) -> Option<Token> {
+        if self.pending_reconnects.contains_key(&client_addr) {
+            return None;
+        }
+        let tok = *self.token_by_client.get(&client_addr)?;
+        self.sessions_by_token
+            .get(&tok)
+            .is_some_and(|s| s.state == HandshakeState::Ready)
+            .then_some(tok)
+    }
+
+    #[inline]
+    pub(crate) fn wrap_uplink_into_slot(
+        &mut self,
+        tok: Token,
+        plaintext: &[u8],
+        slot: &mut [u8],
+        now: Instant,
+    ) -> Option<usize> {
+        let sess = self.sessions_by_token.get_mut(&tok)?;
+        sess.last_data_active = now;
+        sess.cipher.as_mut()?.wrap_into(plaintext, slot)
+    }
+
+    #[inline]
+    pub(crate) fn flush_batched_uplink(
+        &mut self,
+        tok: Token,
+        tx_batch: &mut UdpSendBatch,
+        now: Instant,
+    ) -> (usize, u64) {
+        if tx_batch.is_empty() {
+            return (0, 0);
+        }
+        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+            let (sp, sb) = tx_batch.flush_connected(&sess.upstream);
+            if sp > 0 {
+                sess.tx_pkts += sp as u64;
+                sess.tx_bytes += sb;
+                record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
+            }
+            (sp, sb)
+        } else {
+            tx_batch.clear();
+            (0, 0)
+        }
+    }
+
+    pub(crate) fn send_uplink_single(
+        &mut self,
+        client_addr: SocketAddr,
+        payload: &[u8],
+        now: Instant,
+    ) -> bool {
+        if payload.is_empty()
+            || payload.len() > MAX_INNER_UDP_LEN
+            || payload.len() > self.rbuf.len()
+        {
+            return false;
+        }
+        let n = payload.len();
+        self.rbuf[..n].copy_from_slice(payload);
+        self.dispatch_listen_packet(n, client_addr, now);
+        true
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_event_relay(
+        &mut self,
+        tok: Token,
+        ingress: &mut crate::server::ServerWorker,
+        now: Instant,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        if self.old_path_drains.contains_key(&tok) {
+            self.handle_old_path_drain_with(
+                tok,
+                now,
+                graceful_reconnects,
+                Some(ClientDownlink::Relay(ingress)),
+            );
+        } else if !self.hunt_tok_to_id.is_empty() && self.hunt_tok_to_id.contains_key(&tok) {
+            self.handle_hunt_readable(tok, now, standby_ready);
+        } else {
+            self.handle_upstream_readable_with(
+                tok,
+                now,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+                Some(ClientDownlink::Relay(ingress)),
+            );
+        }
+    }
+
+    pub(crate) fn new_for_reverse_agent(
+        worker_id: usize,
+        cfg: ClientConfig,
+        dtls_pool: DtlsConfigPool,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+        tunnel_key: SocketAddr,
+    ) -> Self {
+        let mut w = Self::new_for_relay(worker_id, cfg, dtls_pool, poll, telemetry);
+        w.reverse_agent = true;
+        // Cancel generic PreWarm hunt from new_for_relay and immediately dial the primary reverse tunnel.
+        for (_, mut hunt) in w.lane_hunts.drain() {
+            for mut c in hunt.candidates.drain(..) {
+                let _ = w.poll.registry().deregister(&mut c.sock);
+            }
+            if let Some(mut fb) = hunt.best_fallback.take() {
+                let _ = w.poll.registry().deregister(&mut fb.sock);
+            }
+        }
+        w.hunt_tok_to_id.clear();
+        w.ensure_reverse_tunnel(tunnel_key, Instant::now());
+        w
+    }
+
+    pub(crate) fn ensure_reverse_tunnel(&mut self, tunnel_key: SocketAddr, now: Instant) {
+        if self.token_by_client.contains_key(&tunnel_key)
+            || self.pending_reconnects.contains_key(&tunnel_key)
+        {
+            return;
+        }
+        let has_active_hunt = self.lane_hunts.values().any(|h| {
+            matches!(
+                h.purpose,
+                HuntPurpose::NewPrimary { client_addr, .. } if client_addr == tunnel_key
+            )
+        });
+        if has_active_hunt {
+            return;
+        }
+        if self.cfg.lane_hunt.enabled {
+            let _ = self.start_lane_hunt(
+                HuntPurpose::NewPrimary {
+                    client_addr: tunnel_key,
+                    ka_max_retries: KA_MAX_RETRIES,
+                },
+                now,
+                VecDeque::new(),
+                0,
+            );
+        } else {
+            let _ = spawn_client_session(
+                self.worker_id,
+                tunnel_key,
+                &self.cfg,
+                &mut self.poll,
+                &mut self.sessions_by_token,
+                &mut self.token_by_client,
+                &mut self.standby_by_client,
+                &mut self.next_token_id,
+                &mut self.dtls_buf,
+                now,
+                self.retry_dur,
+                self.ka_base_ms,
+                self.idle_dur,
+                KA_MAX_RETRIES,
+                None,
+            );
+        }
+    }
+
+    pub(crate) fn drive_reverse_persistence(&mut self, tunnel_key: SocketAddr, now: Instant) {
+        if let Some(&tok) = self.token_by_client.get(&tunnel_key) {
+            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                if sess.state == HandshakeState::Ready
+                    && !sess.is_standby
+                    && !sess.is_prewarm
+                    && !sess.rev_registered
+                    && sess.next_rev_hello_at.is_none_or(|t| now >= t)
+                {
+                    let hello = [REV_OP_HELLO, REV_PROTO_VERSION];
+                    let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
+                    if let Some(ref mut cipher) = sess.cipher {
+                        if let Some(wn) = cipher.wrap_reverse_ctrl_into(&hello, &mut cbuf) {
+                            if sess.upstream.send(&cbuf[..wn]).is_ok() {
+                                sess.tx_pkts += 1;
+                            }
+                        }
+                    }
+                    sess.next_rev_hello_at = Some(now + Duration::from_millis(300));
+                }
+            }
+            return;
+        }
+        self.ensure_reverse_tunnel(tunnel_key, now);
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_event_reverse(
+        &mut self,
+        tok: Token,
+        mux: &mut crate::reverse::ReverseAgentMux,
+        now: Instant,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        if self.old_path_drains.contains_key(&tok) {
+            self.handle_old_path_drain_with(
+                tok,
+                now,
+                graceful_reconnects,
+                Some(ClientDownlink::ReverseAgent(mux)),
+            );
+        } else if !self.hunt_tok_to_id.is_empty() && self.hunt_tok_to_id.contains_key(&tok) {
+            self.handle_hunt_readable(tok, now, standby_ready);
+        } else {
+            self.handle_upstream_readable_with(
+                tok,
+                now,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+                Some(ClientDownlink::ReverseAgent(mux)),
+            );
+        }
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_reverse_uplink_into_slot(
+        &mut self,
+        tunnel_key: SocketAddr,
+        flow_id: u32,
+        plaintext: &[u8],
+        slot: &mut [u8],
+        now: Instant,
+    ) -> Option<usize> {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return None;
+        }
+        let &tok = self.token_by_client.get(&tunnel_key)?;
+        let sess = self.sessions_by_token.get_mut(&tok)?;
+        if sess.state != HandshakeState::Ready {
+            return None;
+        }
+        sess.last_data_active = now;
+        sess.cipher
+            .as_mut()?
+            .wrap_reverse_data_into(flow_id, plaintext, slot)
+    }
+
+    #[inline]
+    pub(crate) fn flush_reverse_uplink_batch(
+        &mut self,
+        tunnel_key: SocketAddr,
+        tx_batch: &mut UdpSendBatch,
+        now: Instant,
+    ) -> (usize, u64) {
+        if tx_batch.is_empty() {
+            return (0, 0);
+        }
+        let Some(&tok) = self.token_by_client.get(&tunnel_key) else {
+            tx_batch.clear();
+            return (0, 0);
+        };
+        self.flush_batched_uplink(tok, tx_batch, now)
+    }
+
+    pub(crate) fn send_reverse_uplink_single(
+        &mut self,
+        tunnel_key: SocketAddr,
+        flow_id: u32,
+        plaintext: &[u8],
+        now: Instant,
+    ) -> bool {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return false;
+        }
+        let Some(&tok) = self.token_by_client.get(&tunnel_key) else {
+            return false;
+        };
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return false;
+        };
+        if sess.state != HandshakeState::Ready {
+            return false;
+        }
+        let mut sent = 0u64;
+        if let Some(ref mut cipher) = sess.cipher {
+            sess.last_data_active = now;
+            if let Some(wn) = cipher.wrap_reverse_data_into(flow_id, plaintext, &mut self.wbuf) {
+                if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
+                    sess.tx_pkts += 1;
+                    sess.tx_bytes += plaintext.len() as u64;
+                    sent = plaintext.len() as u64;
+                }
+            }
+        }
+        if sent > 0 {
+            record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sent);
+        }
+        sent > 0
+    }
+
+    pub(crate) fn close_flow(&mut self, client_addr: SocketAddr, now: Instant) {
+        self.pending_reconnects.remove(&client_addr);
+        self.cancel_hunts_for_client(client_addr);
+        cancel_standby_for_client(
+            client_addr,
+            &mut self.standby_by_client,
+            &mut self.sessions_by_token,
+            &mut self.dtls_buf,
+            now,
+        );
+        if let Some(tok) = self.token_by_client.remove(&client_addr) {
+            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                graceful_teardown_client(sess, &mut self.dtls_buf);
+                sess.state =
+                    HandshakeState::Closing(now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS));
+            }
+        }
+    }
+
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn process_timers_relay(
+        &mut self,
+        now: Instant,
+    ) -> (Duration, Vec<(Token, SocketAddr)>, Vec<(Token, SocketAddr)>) {
+        self.process_timers(now)
+    }
+
+    pub(crate) fn process_post_events_relay(
+        &mut self,
+        now: Instant,
+        standby_ready: Vec<(Token, SocketAddr)>,
+        standby_promoted: Vec<(Token, SocketAddr)>,
+        graceful_reconnects: Vec<(Token, SocketAddr)>,
+    ) {
+        self.process_post_events(now, standby_ready, standby_promoted, graceful_reconnects);
+    }
+
+    pub(crate) fn graceful_shutdown_all(&mut self) {
         for (_, mut hunt) in self.lane_hunts.drain() {
             for mut c in hunt.candidates.drain(..) {
                 let _ = self.poll.registry().deregister(&mut c.sock);
@@ -263,78 +692,79 @@ impl ClientWorker {
         }
     }
 
+    pub(crate) fn build_worker_snapshot(&self) -> WorkerSnapshot {
+        let mut snap = WorkerSnapshot {
+            tx_bytes_total: self.closed_tx_bytes,
+            rx_bytes_total: self.closed_rx_bytes,
+            tx_pkts_total: self.closed_tx_pkts,
+            rx_pkts_total: self.closed_rx_pkts,
+            auth_drops_total: self.closed_auth_drops,
+            lane_best_rtt_ms: self.best_observed_rtt_ms,
+            dtls_version: "none",
+            cipher: "none",
+            ..Default::default()
+        };
+        let mut has_primary_metrics = false;
+        for sess in self.sessions_by_token.values() {
+            snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+            snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+            snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+            snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+            snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+            match sess.state {
+                HandshakeState::Ready if !sess.is_standby => {
+                    snap.active_sessions += 1;
+                    if snap.active_up_sport == 0 || (!has_primary_metrics && !sess.is_prewarm) {
+                        snap.active_up_sport = sess.local_port;
+                        snap.data_loss_pct = (sess.lane_data_loss_rate * 100.0).clamp(0.0, 100.0);
+                        snap.lane_score = sess.lane_score;
+                        snap.lane_confirmed = sess.lane_confirmed;
+                        if !sess.is_prewarm {
+                            has_primary_metrics = true;
+                        }
+                    }
+                    if snap.cipher == "none" {
+                        if let Some(c) = sess.active_cipher {
+                            snap.cipher = c.name();
+                        }
+                    }
+                    if snap.dtls_version == "none" {
+                        snap.dtls_version =
+                            match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
+                                Some(ProtocolVersion::DTLS1_3) => {
+                                    snap.dual_ssrc = true;
+                                    "1.3"
+                                }
+                                Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                _ if self.cfg.dtls_decoy => "1.3",
+                                _ => "none",
+                            };
+                    }
+                }
+                HandshakeState::Migrating => {
+                    snap.migrating_sessions += 1;
+                    if snap.active_up_sport == 0 {
+                        snap.active_up_sport = sess.local_port;
+                    }
+                }
+                HandshakeState::StunWait
+                | HandshakeState::DtlsHandshake
+                | HandshakeState::HandoverWait
+                    if !sess.is_standby =>
+                {
+                    snap.handshaking_sessions += 1;
+                }
+                _ => {}
+            }
+        }
+        snap
+    }
+
     fn maybe_report_telemetry(&mut self, now: Instant) {
         if let Some(ref th) = self.telemetry {
             if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
                 self.last_telemetry = now;
-                let mut snap = WorkerSnapshot {
-                    tx_bytes_total: self.closed_tx_bytes,
-                    rx_bytes_total: self.closed_rx_bytes,
-                    tx_pkts_total: self.closed_tx_pkts,
-                    rx_pkts_total: self.closed_rx_pkts,
-                    auth_drops_total: self.closed_auth_drops,
-                    lane_best_rtt_ms: self.best_observed_rtt_ms,
-                    dtls_version: "none",
-                    cipher: "none",
-                    ..Default::default()
-                };
-                let mut has_primary_metrics = false;
-                for sess in self.sessions_by_token.values() {
-                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
-                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
-                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
-                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
-                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
-                    match sess.state {
-                        HandshakeState::Ready if !sess.is_standby => {
-                            snap.active_sessions += 1;
-                            if snap.active_up_sport == 0
-                                || (!has_primary_metrics && !sess.is_prewarm)
-                            {
-                                snap.active_up_sport = sess.local_port;
-                                snap.data_loss_pct =
-                                    (sess.lane_data_loss_rate * 100.0).clamp(0.0, 100.0);
-                                snap.lane_score = sess.lane_score;
-                                snap.lane_confirmed = sess.lane_confirmed;
-                                if !sess.is_prewarm {
-                                    has_primary_metrics = true;
-                                }
-                            }
-                            if snap.cipher == "none" {
-                                if let Some(c) = sess.active_cipher {
-                                    snap.cipher = c.name();
-                                }
-                            }
-                            if snap.dtls_version == "none" {
-                                snap.dtls_version =
-                                    match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
-                                        Some(ProtocolVersion::DTLS1_3) => {
-                                            snap.dual_ssrc = true;
-                                            "1.3"
-                                        }
-                                        Some(ProtocolVersion::DTLS1_2) => "1.2",
-                                        _ if self.cfg.dtls_decoy => "1.3",
-                                        _ => "none",
-                                    };
-                            }
-                        }
-                        HandshakeState::Migrating => {
-                            snap.migrating_sessions += 1;
-                            if snap.active_up_sport == 0 {
-                                snap.active_up_sport = sess.local_port;
-                            }
-                        }
-                        HandshakeState::StunWait
-                        | HandshakeState::DtlsHandshake
-                        | HandshakeState::HandoverWait
-                            if !sess.is_standby =>
-                        {
-                            snap.handshaking_sessions += 1;
-                        }
-                        _ => {}
-                    }
-                }
-                th.update_worker(self.worker_id, snap);
+                th.update_worker(self.worker_id, self.build_worker_snapshot());
             }
         }
     }

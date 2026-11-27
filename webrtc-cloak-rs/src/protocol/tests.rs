@@ -64,6 +64,10 @@ fn v31_full_security_and_protocol_invariants() {
         arch: "mips",
         features: vec![],
         has_hw_aes_gcm: false,
+        aes_backend: "soft",
+        gcm_polyval_backend: "soft",
+        chacha20_backend: "soft",
+        poly1305_backend: "radix26-u32",
         recommended: CipherSuite::ChaCha20Poly1305,
     };
     let cli_cfg = build_dimpl_config(CipherPref::Auto, &fake_no_aes, true);

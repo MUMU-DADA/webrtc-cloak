@@ -226,6 +226,12 @@ impl UdpSendBatch {
         self.count >= self.cap
     }
 
+    /// 清空尚未刷新的待发送槽位（用于极少数会话已失效的防御性清理）。
+    #[inline]
+    pub fn clear(&mut self) {
+        self.count = 0;
+    }
+
     /// 获取下一个可写槽位切片；若未调用 `commit_slot`，该槽位可被下次直接复用。
     #[inline]
     pub fn next_slot_mut(&mut self) -> Option<&mut [u8]> {

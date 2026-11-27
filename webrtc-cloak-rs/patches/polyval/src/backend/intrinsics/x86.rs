@@ -52,6 +52,18 @@ impl InitToken {
     }
 }
 
+/// Returns the active x86 POLYVAL backend name at runtime.
+#[inline]
+pub(super) fn backend_name() -> &'static str {
+    if clmul_avx::get() {
+        "avx+pclmulqdq"
+    } else if clmul_sse::get() {
+        "sse2+pclmulqdq"
+    } else {
+        "soft"
+    }
+}
+
 /// Byte array which is the inner type of `FieldElement`
 type ByteArray = [u8; 16];
 

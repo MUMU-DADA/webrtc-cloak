@@ -31,6 +31,16 @@ const P1: u64 = 0xC200000000000000;
 cpufeatures::new!(pmull, "aes");
 pub(crate) use pmull::InitToken;
 
+/// Returns the active AArch64 POLYVAL backend name at runtime.
+#[inline]
+pub(super) fn backend_name() -> &'static str {
+    if pmull::get() {
+        "armv8-pmull"
+    } else {
+        "soft"
+    }
+}
+
 /// Byte array which is the inner type of `FieldElement`
 type ByteArray = [u8; 16];
 

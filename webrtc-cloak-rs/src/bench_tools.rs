@@ -21,6 +21,10 @@ pub(crate) fn print_cpu_info() {
         }
     );
     println!("hw_aes_gcm  : {}", info.has_hw_aes_gcm);
+    println!(
+        "backends    : aes={} gcm={} chacha20={} poly1305={}",
+        info.aes_backend, info.gcm_polyval_backend, info.chacha20_backend, info.poly1305_backend
+    );
     println!("recommended : {}", info.recommended.name());
 }
 

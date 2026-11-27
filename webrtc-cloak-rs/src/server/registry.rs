@@ -177,13 +177,13 @@ struct WorkerInbox {
     waker: Mutex<Option<Arc<Waker>>>,
 }
 
-pub(super) struct SharedV4Registry {
+pub(crate) struct SharedV4Registry {
     ufrag_index: Mutex<HashMap<String, ActiveSessionMeta>>,
     inboxes: Vec<WorkerInbox>,
 }
 
 impl SharedV4Registry {
-    pub(super) fn new(workers: usize) -> Self {
+    pub(crate) fn new(workers: usize) -> Self {
         let mut inboxes = Vec::with_capacity(workers);
         for _ in 0..workers {
             inboxes.push(WorkerInbox {
@@ -197,7 +197,7 @@ impl SharedV4Registry {
         }
     }
 
-    pub(super) fn set_waker(&self, worker_id: usize, waker: Arc<Waker>) {
+    pub(crate) fn set_waker(&self, worker_id: usize, waker: Arc<Waker>) {
         if let Some(inbox) = self.inboxes.get(worker_id) {
             if let Ok(mut g) = inbox.waker.lock() {
                 *g = Some(waker);

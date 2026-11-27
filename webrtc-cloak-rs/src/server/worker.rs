@@ -3,16 +3,18 @@
 use super::handlers::{drain_server_dtls, graceful_teardown_server, process_ready_srtp};
 use super::registry::{SeenTxidCache, SharedV4Registry, WorkerCmd};
 use super::{
-    cleanup_session_routes, log, make_udp_socket, ServerConfig, ServerSession, ServerState,
-    WireAudit, SERVER_SRTCP_ACTIVE_MAX_MS, SERVER_SRTCP_ACTIVE_MIN_MS,
+    cleanup_session_routes, log, make_udp_socket, record_server_media_bytes, RelayState,
+    ServerConfig, ServerHook, ServerSession, ServerState, WireAudit, SERVER_SRTCP_ACTIVE_MAX_MS,
+    SERVER_SRTCP_ACTIVE_MIN_MS,
 };
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, CLOSING_DRAIN_MS,
-    DTLS_IO_BUF_LEN, LISTEN_TOKEN, MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT,
-    PROBE_IO_BUF_LEN, SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
-    SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS,
+    outer_udp_hdr_len, worker_udp_recv_buf_len, worker_udp_write_buf_len, SharedPoll,
+    CLOSING_DRAIN_MS, CTRL_FRAME_BUF_LEN, DTLS_IO_BUF_LEN, LISTEN_TOKEN, MAX_INNER_UDP_LEN,
+    MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT, PROBE_IO_BUF_LEN, REV_OP_FLOW_CLOSE,
+    SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS, SRTCP_IDLE_MIN_MS,
+    SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS,
     TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS, WAKE_TOKEN, WORKER_ACTIVE_POLL_SECS,
     WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
     WORKER_QUIET_STOP_POLL_MS,
@@ -39,11 +41,12 @@ const SERVER_LONG_TRICKLE_SECS: u64 = 60;
 /// 服务端处于长细流静默期时的 SRTCP 状态复检间隔（秒）。
 const SERVER_LONG_TRICKLE_RECHECK_SECS: u64 = 10;
 
-pub(super) struct ServerWorker {
+pub(crate) struct ServerWorker {
     pub(super) worker_id: usize,
     pub(super) cfg: ServerConfig,
-    pub(super) poll: Poll,
-    pub(super) listen_sock: MioUdpSocket,
+    pub(super) poll: SharedPoll,
+    pub(super) relay: RelayState,
+    pub(crate) listen_sock: MioUdpSocket,
     pub(super) sessions_by_token: HashMap<Token, ServerSession>,
     pub(super) token_by_peer: HashMap<SocketAddr, Token>,
     pub(super) token_by_ufrag: HashMap<String, Token>,
@@ -88,7 +91,7 @@ pub(super) fn run_server_worker(
     telemetry: Option<Arc<TelemetryHub>>,
 ) -> std::io::Result<()> {
     super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
-    let poll = Poll::new()?;
+    let mut poll = Poll::new()?;
     if cfg.workers > 1 {
         if let Ok(waker) = Waker::new(poll.registry(), WAKE_TOKEN) {
             registry.set_waker(worker_id, Arc::new(waker));
@@ -96,84 +99,152 @@ pub(super) fn run_server_worker(
     }
     register_shutdown_poll(&poll, cfg.quiet, cfg.stop.is_some());
 
-    let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
-    poll.registry()
-        .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
-
-    let stun_mi_key = stun_hmac_key(&cfg.psk);
-    let max_early_srtp_len = if cfg.wan_mtu > 0 {
-        cfg.wan_mtu
-            .saturating_sub(outer_udp_hdr_len(cfg.listen_addr))
-            .clamp(MIN_WIRE_UDP_MTU, PROBE_IO_BUF_LEN)
-    } else {
-        PROBE_IO_BUF_LEN
-    };
-    let audit = WireAudit::new(cfg.wire_audit_file.as_ref())?;
-    let cpu = detect_cpu_accel();
-    log(
-        worker_id,
-        &format!(
-            "listening on {} -> backend {} (reuse_port={}, cipher_pref={:?}, dtls_required={}, max_sessions={})",
-            cfg.listen_addr, cfg.backend_addr, reuse_port, cfg.cipher_pref, cfg.dtls_required, cfg.max_sessions
-        ),
-    );
-
-    let idle_dur = Duration::from_secs(cfg.idle_timeout_secs);
-    let stats_dur = Duration::from_secs(cfg.stats_interval_secs);
-    let telemetry_dur = telemetry
-        .as_ref()
-        .map(|th| th.interval())
-        .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
-    let now = Instant::now();
-
-    let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
-    let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
-    let batch_enabled = is_udp_batch_active(cfg.udp_batch);
-    let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
-    let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
-    let mut worker = ServerWorker {
+    let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
+    let mut worker = ServerWorker::new_internal(
         worker_id,
         cfg,
-        poll,
-        listen_sock,
-        sessions_by_token: HashMap::new(),
-        token_by_peer: HashMap::new(),
-        token_by_ufrag: HashMap::new(),
-        local_mig_pending: HashMap::new(),
-        cross_worker_pending: HashMap::new(),
-        cmd_buf: Vec::new(),
-        next_token_id: 1,
-        cert_cache: CertCache::new(),
+        reuse_port,
+        false,
+        false,
         dtls_pool,
-        stun_mi_key,
-        max_early_srtp_len,
         seen_txids,
         registry,
+        shared_poll,
         telemetry,
-        audit,
-        unauth_drops: 0,
-        closed_tx_bytes: 0,
-        closed_rx_bytes: 0,
-        closed_tx_pkts: 0,
-        closed_rx_pkts: 0,
-        closed_auth_drops: 0,
-        rbuf: vec![0u8; rbuf_len],
-        wbuf: vec![0u8; wbuf_len],
-        dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
-        rx_batch,
-        tx_batch,
-        cpu,
-        idle_dur,
-        stats_dur,
-        last_stats: now,
-        telemetry_dur,
-        last_telemetry: now,
-    };
-    worker.run()
+    )?;
+    worker.run(&mut poll)
 }
 
 impl ServerWorker {
-    fn run(&mut self) -> std::io::Result<()> {
+    #[allow(clippy::too_many_arguments)]
+    fn new_internal(
+        worker_id: usize,
+        cfg: ServerConfig,
+        reuse_port: bool,
+        relay_mode: bool,
+        reverse_entry: bool,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
+        let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
+        poll.registry()
+            .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
+
+        let stun_mi_key = stun_hmac_key(&cfg.psk);
+        let max_early_srtp_len = if cfg.wan_mtu > 0 {
+            cfg.wan_mtu
+                .saturating_sub(outer_udp_hdr_len(cfg.listen_addr))
+                .clamp(MIN_WIRE_UDP_MTU, PROBE_IO_BUF_LEN)
+        } else {
+            PROBE_IO_BUF_LEN
+        };
+        let audit = WireAudit::new(cfg.wire_audit_file.as_ref())?;
+        let cpu = detect_cpu_accel();
+        if !relay_mode && !reverse_entry {
+            log(
+                worker_id,
+                &format!(
+                    "listening on {} -> backend {} (reuse_port={}, cipher_pref={:?}, dtls_required={}, max_sessions={})",
+                    cfg.listen_addr, cfg.backend_addr, reuse_port, cfg.cipher_pref, cfg.dtls_required, cfg.max_sessions
+                ),
+            );
+        }
+
+        let idle_dur = Duration::from_secs(cfg.idle_timeout_secs);
+        let stats_dur = Duration::from_secs(cfg.stats_interval_secs);
+        let telemetry_dur = telemetry
+            .as_ref()
+            .map(|th| th.interval())
+            .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
+        let now = Instant::now();
+
+        let rbuf_len = worker_udp_recv_buf_len(cfg.wan_mtu);
+        let wbuf_len = worker_udp_write_buf_len(cfg.wan_mtu);
+        let batch_enabled = is_udp_batch_active(cfg.udp_batch);
+        let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
+        let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
+        Ok(ServerWorker {
+            worker_id,
+            cfg,
+            poll,
+            relay: RelayState {
+                enabled: relay_mode,
+                reverse_entry,
+                ..Default::default()
+            },
+            listen_sock,
+            sessions_by_token: HashMap::new(),
+            token_by_peer: HashMap::new(),
+            token_by_ufrag: HashMap::new(),
+            local_mig_pending: HashMap::new(),
+            cross_worker_pending: HashMap::new(),
+            cmd_buf: Vec::new(),
+            next_token_id: 1,
+            cert_cache: CertCache::new(),
+            dtls_pool,
+            stun_mi_key,
+            max_early_srtp_len,
+            seen_txids,
+            registry,
+            telemetry,
+            audit,
+            unauth_drops: 0,
+            closed_tx_bytes: 0,
+            closed_rx_bytes: 0,
+            closed_tx_pkts: 0,
+            closed_rx_pkts: 0,
+            closed_auth_drops: 0,
+            rbuf: vec![0u8; rbuf_len],
+            wbuf: vec![0u8; wbuf_len],
+            dtls_buf: vec![0u8; DTLS_IO_BUF_LEN],
+            rx_batch,
+            tx_batch,
+            cpu,
+            idle_dur,
+            stats_dur,
+            last_stats: now,
+            telemetry_dur,
+            last_telemetry: now,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_relay(
+        worker_id: usize,
+        cfg: ServerConfig,
+        reuse_port: bool,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        Self::new_internal(
+            worker_id, cfg, reuse_port, true, false, dtls_pool, seen_txids, registry, poll,
+            telemetry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_reverse_entry(
+        worker_id: usize,
+        cfg: ServerConfig,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        Self::new_internal(
+            worker_id, cfg, false, false, true, dtls_pool, seen_txids, registry, poll, telemetry,
+        )
+    }
+
+    fn run(&mut self, poll: &mut Poll) -> std::io::Result<()> {
         let mut events = Events::with_capacity(MIO_EVENTS_CAP);
         loop {
             if is_shutdown_requested(self.cfg.stop.as_ref(), self.cfg.quiet) {
@@ -182,8 +253,8 @@ impl ServerWorker {
             }
 
             let now = Instant::now();
-            self.drain_worker_cmds(now);
-            let mut wait = self.process_timers(now);
+            self.drain_worker_cmds_with(now, None);
+            let mut wait = self.process_timers_with(now, None);
 
             if self.telemetry.is_some() && wait > self.telemetry_dur {
                 wait = self.telemetry_dur;
@@ -192,7 +263,7 @@ impl ServerWorker {
             if self.cfg.stop.is_some() && self.cfg.quiet && wait > quiet_cap {
                 wait = quiet_cap;
             }
-            if let Err(e) = self.poll.poll(&mut events, Some(wait)) {
+            if let Err(e) = poll.poll(&mut events, Some(wait)) {
                 if e.kind() == ErrorKind::Interrupted {
                     continue;
                 }
@@ -209,7 +280,7 @@ impl ServerWorker {
                     continue;
                 }
                 if ev.token() == LISTEN_TOKEN {
-                    self.handle_listen_readable(now);
+                    self.handle_listen_readable_with(now, None);
                 } else {
                     self.handle_backend_readable(ev.token(), now);
                 }
@@ -220,7 +291,7 @@ impl ServerWorker {
         }
     }
 
-    fn graceful_shutdown_all(&mut self) {
+    pub(crate) fn graceful_shutdown_all(&mut self) {
         let mut torn = 0usize;
         for sess in self.sessions_by_token.values_mut() {
             if sess.state == ServerState::Ready {
@@ -244,7 +315,11 @@ impl ServerWorker {
         }
     }
 
-    fn process_timers(&mut self, now: Instant) -> Duration {
+    pub(crate) fn process_timers_with(
+        &mut self,
+        now: Instant,
+        mut hook: Option<ServerHook<'_>>,
+    ) -> Duration {
         // Expire stale local & cross-worker pending migration lookups
         if !self.local_mig_pending.is_empty() {
             self.local_mig_pending.retain(|_, (_, exp)| now <= *exp);
@@ -333,7 +408,10 @@ impl ServerWorker {
                         .as_ref()
                         .map(|c| c.is_seq_exhausted())
                         .unwrap_or(false);
-                    if seq_exhausted || now.duration_since(sess.last_data_active) > self.idle_dur {
+                    if seq_exhausted
+                        || (!sess.is_reverse_agent
+                            && now.duration_since(sess.last_data_active) > self.idle_dur)
+                    {
                         graceful_teardown_server(
                             sess,
                             &self.listen_sock,
@@ -430,6 +508,8 @@ impl ServerWorker {
                     &mut self.token_by_ufrag,
                     &mut self.local_mig_pending,
                     &self.poll,
+                    &mut self.relay,
+                    &mut hook,
                     &self.listen_sock,
                     &self.cfg,
                     &self.registry,
@@ -453,6 +533,7 @@ impl ServerWorker {
                     tok,
                     &mut sess,
                     &self.poll,
+                    &mut self.relay,
                     &mut self.token_by_peer,
                     &mut self.token_by_ufrag,
                     &mut self.local_mig_pending,
@@ -471,58 +552,268 @@ impl ServerWorker {
         wait
     }
 
+    #[inline]
+    pub(crate) fn encrypt_downlink_into_slot(
+        &mut self,
+        flow_addr: SocketAddr,
+        plaintext: &[u8],
+        slot: &mut [u8],
+        now: Instant,
+    ) -> Option<(usize, SocketAddr)> {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return None;
+        }
+        let &tok = self.relay.flow_to_ingress.get(&flow_addr)?;
+        let sess = self.sessions_by_token.get_mut(&tok)?;
+        let can_tx = matches!(
+            sess.state,
+            ServerState::Ready | ServerState::Closing(_, true)
+        );
+        if !can_tx {
+            return None;
+        }
+        if sess.state == ServerState::Ready {
+            sess.last_data_active = now;
+        }
+        let wn = sess.cipher.as_mut()?.wrap_into(plaintext, slot)?;
+        self.audit.record(1, &slot[..wn]);
+        Some((wn, sess.peer_addr))
+    }
+
+    #[inline]
+    pub(crate) fn record_downlink_sent(
+        &mut self,
+        flow_addr: SocketAddr,
+        pkts: usize,
+        bytes: u64,
+        now: Instant,
+    ) {
+        if pkts == 0 {
+            return;
+        }
+        if let Some(&tok) = self.relay.flow_to_ingress.get(&flow_addr) {
+            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                sess.tx_pkts += pkts as u64;
+                sess.tx_bytes += bytes;
+                if sess.state == ServerState::Ready {
+                    record_server_media_bytes(sess, now, bytes);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn deliver_downlink_single(
+        &mut self,
+        flow_addr: SocketAddr,
+        plaintext: &[u8],
+        now: Instant,
+    ) -> bool {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return false;
+        }
+        let Some(&tok) = self.relay.flow_to_ingress.get(&flow_addr) else {
+            return false;
+        };
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return false;
+        };
+        let can_tx = matches!(
+            sess.state,
+            ServerState::Ready | ServerState::Closing(_, true)
+        );
+        if !can_tx {
+            return false;
+        }
+        let mut sent_bytes = 0u64;
+        if let Some(ref mut cipher) = sess.cipher {
+            if sess.state == ServerState::Ready {
+                sess.last_data_active = now;
+            }
+            if let Some(wn) = cipher.wrap_into(plaintext, &mut self.wbuf) {
+                self.audit.record(1, &self.wbuf[..wn]);
+                if self
+                    .listen_sock
+                    .send_to(&self.wbuf[..wn], sess.peer_addr)
+                    .is_ok()
+                {
+                    sess.tx_pkts += 1;
+                    sess.tx_bytes += plaintext.len() as u64;
+                    sent_bytes = plaintext.len() as u64;
+                }
+            }
+        }
+        if sent_bytes > 0 && sess.state == ServerState::Ready {
+            record_server_media_bytes(sess, now, sent_bytes);
+        }
+        sent_bytes > 0
+    }
+
+    pub(crate) fn drain_closed_relay_flows(&mut self) -> Vec<SocketAddr> {
+        std::mem::take(&mut self.relay.closed_flows)
+    }
+
+    pub(crate) fn drain_closed_reverse_tokens(&mut self) -> Vec<Token> {
+        std::mem::take(&mut self.relay.closed_reverse_tokens)
+    }
+
+    #[inline]
+    pub(crate) fn encrypt_reverse_into_slot(
+        &mut self,
+        tok: Token,
+        flow_id: u32,
+        plaintext: &[u8],
+        slot: &mut [u8],
+        now: Instant,
+    ) -> Option<(usize, SocketAddr)> {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return None;
+        }
+        let sess = self.sessions_by_token.get_mut(&tok)?;
+        if sess.state != ServerState::Ready {
+            return None;
+        }
+        sess.last_data_active = now;
+        let wn = sess
+            .cipher
+            .as_mut()?
+            .wrap_reverse_data_into(flow_id, plaintext, slot)?;
+        self.audit.record(1, &slot[..wn]);
+        Some((wn, sess.peer_addr))
+    }
+
+    #[inline]
+    pub(crate) fn record_reverse_tx(&mut self, tok: Token, pkts: usize, bytes: u64, now: Instant) {
+        if pkts == 0 {
+            return;
+        }
+        if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+            sess.tx_pkts += pkts as u64;
+            sess.tx_bytes += bytes;
+            if sess.state == ServerState::Ready {
+                record_server_media_bytes(sess, now, bytes);
+            }
+        }
+    }
+
+    pub(crate) fn send_reverse_data_single(
+        &mut self,
+        tok: Token,
+        flow_id: u32,
+        plaintext: &[u8],
+        now: Instant,
+    ) -> bool {
+        if plaintext.is_empty() || plaintext.len() > MAX_INNER_UDP_LEN {
+            return false;
+        }
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return false;
+        };
+        if sess.state != ServerState::Ready {
+            return false;
+        }
+        let mut sent = 0u64;
+        if let Some(ref mut cipher) = sess.cipher {
+            sess.last_data_active = now;
+            if let Some(wn) = cipher.wrap_reverse_data_into(flow_id, plaintext, &mut self.wbuf) {
+                self.audit.record(1, &self.wbuf[..wn]);
+                if self
+                    .listen_sock
+                    .send_to(&self.wbuf[..wn], sess.peer_addr)
+                    .is_ok()
+                {
+                    sess.tx_pkts += 1;
+                    sess.tx_bytes += plaintext.len() as u64;
+                    sent = plaintext.len() as u64;
+                }
+            }
+        }
+        if sent > 0 {
+            record_server_media_bytes(sess, now, sent);
+        }
+        sent > 0
+    }
+
+    pub(crate) fn send_reverse_flow_close(&mut self, tok: Token, flow_id: u32) {
+        let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
+            return;
+        };
+        if sess.state != ServerState::Ready {
+            return;
+        }
+        let mut payload = [0u8; 5];
+        payload[0] = REV_OP_FLOW_CLOSE;
+        payload[1..5].copy_from_slice(&flow_id.to_be_bytes());
+        let mut cbuf = [0u8; CTRL_FRAME_BUF_LEN];
+        if let Some(ref mut cipher) = sess.cipher {
+            if let Some(wn) = cipher.wrap_reverse_ctrl_into(&payload, &mut cbuf) {
+                self.audit.record(1, &cbuf[..wn]);
+                if self
+                    .listen_sock
+                    .send_to(&cbuf[..wn], sess.peer_addr)
+                    .is_ok()
+                {
+                    sess.tx_pkts += 1;
+                }
+            }
+        }
+    }
+
+    pub(crate) fn build_worker_snapshot(&self) -> WorkerSnapshot {
+        let mut snap = WorkerSnapshot {
+            tx_bytes_total: self.closed_tx_bytes,
+            rx_bytes_total: self.closed_rx_bytes,
+            tx_pkts_total: self.closed_tx_pkts,
+            rx_pkts_total: self.closed_rx_pkts,
+            auth_drops_total: self.closed_auth_drops,
+            unauth_drops_total: self.unauth_drops,
+            dtls_version: "none",
+            cipher: "none",
+            ..Default::default()
+        };
+        for sess in self.sessions_by_token.values() {
+            snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
+            snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
+            snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
+            snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
+            snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
+            match sess.state {
+                ServerState::Ready => {
+                    snap.active_sessions += 1;
+                    if snap.active_backend_sport == 0 && sess.backend_lport != 0 {
+                        snap.active_backend_sport = sess.backend_lport;
+                    }
+                    if snap.cipher == "none" {
+                        if let Some(c) = sess.negotiated_cipher {
+                            snap.cipher = c.name();
+                        }
+                    }
+                    if snap.dtls_version == "none" {
+                        snap.dtls_version =
+                            match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
+                                Some(ProtocolVersion::DTLS1_3) => {
+                                    snap.dual_ssrc = true;
+                                    "1.3"
+                                }
+                                Some(ProtocolVersion::DTLS1_2) => "1.2",
+                                _ if self.cfg.dtls_required => "1.3",
+                                _ => "none",
+                            };
+                    }
+                }
+                ServerState::DtlsHandshake => {
+                    snap.handshaking_sessions += 1;
+                }
+                ServerState::Closing(_, _) => {}
+            }
+        }
+        snap
+    }
+
     fn maybe_report_telemetry(&mut self, now: Instant) {
         if let Some(ref th) = self.telemetry {
             if now.duration_since(self.last_telemetry) >= self.telemetry_dur {
                 self.last_telemetry = now;
-                let mut snap = WorkerSnapshot {
-                    tx_bytes_total: self.closed_tx_bytes,
-                    rx_bytes_total: self.closed_rx_bytes,
-                    tx_pkts_total: self.closed_tx_pkts,
-                    rx_pkts_total: self.closed_rx_pkts,
-                    auth_drops_total: self.closed_auth_drops,
-                    unauth_drops_total: self.unauth_drops,
-                    dtls_version: "none",
-                    cipher: "none",
-                    ..Default::default()
-                };
-                for sess in self.sessions_by_token.values() {
-                    snap.tx_bytes_total = snap.tx_bytes_total.saturating_add(sess.tx_bytes);
-                    snap.rx_bytes_total = snap.rx_bytes_total.saturating_add(sess.rx_bytes);
-                    snap.tx_pkts_total = snap.tx_pkts_total.saturating_add(sess.tx_pkts);
-                    snap.rx_pkts_total = snap.rx_pkts_total.saturating_add(sess.rx_pkts);
-                    snap.auth_drops_total = snap.auth_drops_total.saturating_add(sess.auth_drops);
-                    match sess.state {
-                        ServerState::Ready => {
-                            snap.active_sessions += 1;
-                            if snap.active_backend_sport == 0 && sess.backend_lport != 0 {
-                                snap.active_backend_sport = sess.backend_lport;
-                            }
-                            if snap.cipher == "none" {
-                                if let Some(c) = sess.negotiated_cipher {
-                                    snap.cipher = c.name();
-                                }
-                            }
-                            if snap.dtls_version == "none" {
-                                snap.dtls_version =
-                                    match sess.dtls.as_ref().and_then(|d| d.protocol_version()) {
-                                        Some(ProtocolVersion::DTLS1_3) => {
-                                            snap.dual_ssrc = true;
-                                            "1.3"
-                                        }
-                                        Some(ProtocolVersion::DTLS1_2) => "1.2",
-                                        _ if self.cfg.dtls_required => "1.3",
-                                        _ => "none",
-                                    };
-                            }
-                        }
-                        ServerState::DtlsHandshake => {
-                            snap.handshaking_sessions += 1;
-                        }
-                        ServerState::Closing(_, _) => {}
-                    }
-                }
-                th.update_worker(self.worker_id, snap);
+                th.update_worker(self.worker_id, self.build_worker_snapshot());
             }
         }
     }

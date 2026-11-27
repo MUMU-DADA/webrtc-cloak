@@ -7,8 +7,8 @@ use super::{
     CLIENT_SRTCP_INIT_MIN_MS, MAX_DRAINING_SESSIONS, TRICKLE_WINDOW_5MIN_SECS,
 };
 use crate::constants::{
-    unspecified_addr_for, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO, DTLS_PLAINTEXT_HDR_LEN,
-    SOCK_BUF_8MIB, TRICKLE_WINDOW_15S_SECS,
+    unspecified_addr_for, SharedPoll, DTLS_CT_HANDSHAKE, DTLS_HS_CLIENT_HELLO,
+    DTLS_PLAINTEXT_HDR_LEN, SOCK_BUF_8MIB, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
     build_ice_stun_request, combine_session_key, derive_ice_migration_key, derive_stun_material,
@@ -18,7 +18,7 @@ use crate::protocol::{
 };
 use dimpl::{Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
-use mio::{Interest, Poll, Token};
+use mio::{Interest, Token};
 use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -206,7 +206,7 @@ pub(super) fn spawn_client_session(
     worker_id: usize,
     client_addr: SocketAddr,
     cfg: &ClientConfig,
-    poll: &mut Poll,
+    poll: &mut SharedPoll,
     sessions_by_token: &mut HashMap<Token, ClientSession>,
     token_by_client: &mut HashMap<SocketAddr, Token>,
     standby_by_client: &mut HashMap<SocketAddr, Token>,
@@ -342,6 +342,8 @@ pub(super) fn spawn_client_session(
         dtls_next_timeout: None,
         is_standby,
         is_prewarm: false,
+        rev_registered: false,
+        next_rev_hello_at: None,
         next_keepwarm_at: None,
         lane_rtt_ewma_ms: None,
         lane_rtt_last_ms: None,
@@ -475,6 +477,8 @@ pub(super) fn build_session_after_stun(
         dtls_next_timeout: None,
         is_standby,
         is_prewarm,
+        rev_registered: false,
+        next_rev_hello_at: None,
         next_keepwarm_at,
         lane_rtt_ewma_ms: Some(rtt_ms),
         lane_rtt_last_ms: Some(rtt_ms),

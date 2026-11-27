@@ -13,6 +13,7 @@ pub(crate) use self::lane_hunt::compute_lane_score;
 pub use self::lane_hunt::{
     LaneHuntConfig, DEFAULT_LANE_DEGRADE_COOLDOWN_SECS, DEFAULT_LANE_PROBES, DEFAULT_LANE_ROUNDS,
 };
+pub(crate) use self::worker::ClientWorker;
 
 use self::dtls::graceful_teardown_client;
 use self::worker::run_client_worker;
@@ -100,12 +101,23 @@ pub struct ClientConfig {
     pub stop: Option<Arc<AtomicBool>>,
 }
 
+pub(crate) enum ClientDownlink<'a> {
+    Relay(&'a mut crate::server::ServerWorker),
+    ReverseAgent(&'a mut crate::reverse::ReverseAgentMux),
+}
+
+/// 反向隧道 Agent 本地后端套接字保留令牌基址（与 `ClientWorker` 自身会话令牌严格隔离）。
+pub(crate) const REV_BACKEND_TOK_BASE: usize = 1usize << (usize::BITS - 2);
+
 #[inline]
 pub(super) fn alloc_token(next_id: &mut usize) -> Token {
     loop {
         let id = *next_id;
         *next_id = next_id.wrapping_add(1);
-        if id != 0 && id != usize::MAX && id != usize::MAX - 1 {
+        if *next_id >= REV_BACKEND_TOK_BASE {
+            *next_id = 1;
+        }
+        if id != 0 && id < REV_BACKEND_TOK_BASE {
             return Token(id);
         }
     }
@@ -160,6 +172,8 @@ pub(super) struct ClientSession {
     pub(super) dtls_next_timeout: Option<Instant>,
     pub(super) is_standby: bool,
     pub(super) is_prewarm: bool,
+    pub(super) rev_registered: bool,
+    pub(super) next_rev_hello_at: Option<Instant>,
     pub(super) next_keepwarm_at: Option<Instant>,
     pub(super) lane_rtt_ewma_ms: Option<f64>,
     pub(super) lane_rtt_last_ms: Option<f64>,

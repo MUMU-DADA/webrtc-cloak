@@ -12,6 +12,7 @@ mod tests;
 mod worker;
 
 use self::worker::run_bypass_worker;
+pub(crate) use self::worker::BypassWorker;
 use crate::client::LaneHuntConfig;
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;

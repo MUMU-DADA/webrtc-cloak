@@ -7,8 +7,8 @@ use super::handlers::{
 use super::registry::WorkerCmd;
 use super::worker::ServerWorker;
 use super::{
-    alloc_token, deregister_backend, log, record_server_media_bytes, BackendPipe, ServerState,
-    MAX_FORWARD_HOPS, OLD_PEER_DRAIN_TTL,
+    alloc_token, deregister_backend, log, record_server_media_bytes, BackendPipe, ServerHook,
+    ServerState, MAX_FORWARD_HOPS, OLD_PEER_DRAIN_TTL,
 };
 use crate::constants::{PATH_CHALLENGE_OP_RESP, PATH_CHALLENGE_PAYLOAD_LEN};
 use crate::protocol::{compute_handover_proof, SrtpFrame};
@@ -18,7 +18,11 @@ use std::time::Instant;
 use subtle::ConstantTimeEq;
 
 impl ServerWorker {
-    pub(super) fn drain_worker_cmds(&mut self, now: Instant) {
+    pub(crate) fn drain_worker_cmds_with(
+        &mut self,
+        now: Instant,
+        mut hook: Option<ServerHook<'_>>,
+    ) {
         // Drain cross-worker V4 control commands (0 lock on SRTP hot path!)
         self.cmd_buf.clear();
         self.registry.drain_cmds(self.worker_id, &mut self.cmd_buf);
@@ -167,8 +171,11 @@ impl ServerWorker {
                             MAX_FORWARD_HOPS,
                             &mut self.sessions_by_token,
                             &self.poll,
+                            &mut self.relay,
+                            &mut hook,
                             self.cfg.backend_addr,
                             &self.registry,
+                            now,
                         );
                         if ok {
                             if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
@@ -180,7 +187,7 @@ impl ServerWorker {
                     }
                     if should_move {
                         if let Some(mut sess) = self.sessions_by_token.remove(&tok) {
-                            deregister_backend(&self.poll, &mut sess.backend);
+                            deregister_backend(&self.poll, tok, &mut sess.backend, &mut self.relay);
                             self.token_by_ufrag.remove(&sess.username);
                             if let Some((old_p, _)) = sess.old_peer_addr.take() {
                                 if self.token_by_peer.get(&old_p) == Some(&tok) {
@@ -267,6 +274,19 @@ impl ServerWorker {
                                                 let _ = self.poll.registry().deregister(&mut sock);
                                                 extracted = Some((sock, lport));
                                             }
+                                            BackendPipe::RelayFlow(flow_addr) => {
+                                                // Cross-worker handover of an in-process relay flow cannot
+                                                // move worker-local egress state across threads; revert and
+                                                // return negative ack so client opens cleanly on target worker.
+                                                old_s.backend = BackendPipe::RelayFlow(flow_addr);
+                                                old_s.handed_over_to = None;
+                                                ok = false;
+                                            }
+                                            BackendPipe::ReverseAgent => {
+                                                old_s.backend = BackendPipe::ReverseAgent;
+                                                old_s.handed_over_to = None;
+                                                ok = false;
+                                            }
                                             // P1-1: Even if Unbound, old_s stays ForwardRemote!
                                             BackendPipe::Unbound => {}
                                             other => {
@@ -300,7 +320,12 @@ impl ServerWorker {
                     if let Some(&new_tok) = self.token_by_ufrag.get(&new_ufrag) {
                         if let Some(new_s) = self.sessions_by_token.get_mut(&new_tok) {
                             if new_s.state == ServerState::Ready {
-                                deregister_backend(&self.poll, &mut new_s.backend);
+                                deregister_backend(
+                                    &self.poll,
+                                    new_tok,
+                                    &mut new_s.backend,
+                                    &mut self.relay,
+                                );
                                 if self
                                     .poll
                                     .registry()
@@ -358,8 +383,11 @@ impl ServerWorker {
                             hops_left,
                             &mut self.sessions_by_token,
                             &self.poll,
+                            &mut self.relay,
+                            &mut hook,
                             self.cfg.backend_addr,
                             &self.registry,
+                            now,
                         );
                     } else if hops_left > 0 {
                         if let Some(meta) = self.registry.lookup_ufrag(&target_ufrag) {
@@ -388,6 +416,8 @@ impl ServerWorker {
                             &mut self.token_by_ufrag,
                             &mut self.local_mig_pending,
                             &self.poll,
+                            &mut self.relay,
+                            &mut hook,
                             &self.listen_sock,
                             &self.cfg,
                             &self.registry,
