@@ -66,6 +66,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
                 backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
                 psk: srv_psk,
+                stun_scope: None,
                 cipher_pref: CipherPref::Auto,
                 dtls_required: true,
                 dtls_min_version: DtlsMinVersion::V13Only,
@@ -162,6 +163,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
                 server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
                 psk: cli_psk,
+                stun_scope: Some(server_port.to_string()),
                 cipher_pref: CipherPref::Auto,
                 dtls_decoy: true,
                 dtls_min_version: DtlsMinVersion::V13Only,
@@ -269,6 +271,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
                 backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
                 psk: srv_psk,
+                stun_scope: None,
                 cipher_pref: CipherPref::Auto,
                 dtls_required: true,
                 dtls_min_version: DtlsMinVersion::V13Only,
@@ -292,7 +295,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
         let r_mig = Arc::clone(&mig_port_seen);
         let r_latest = Arc::clone(&latest_port);
         let r_stop = Arc::clone(&stop_all);
-        let relay_psk = psk.clone();
+        let relay_psk = crate::protocol::derive_stun_scope_key(&psk, server_port).to_vec();
 
         let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
         relay_front.set_nonblocking(true).unwrap();
@@ -349,6 +352,7 @@ fn v40_p0_dropped_challenge_reordered_stun_and_legacy_pending_fallback() {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
                 server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
                 psk: cli_psk,
+                stun_scope: Some(server_port.to_string()),
                 cipher_pref: CipherPref::Auto,
                 dtls_decoy: true,
                 dtls_min_version: DtlsMinVersion::V13Only,
@@ -481,6 +485,7 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -545,6 +550,7 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -694,4 +700,266 @@ fn v41_outer_health_telemetry_file_and_http_live_migration() {
     thread::sleep(Duration::from_millis(100));
     let _ = std::fs::remove_file(&cli_status_file);
     let _ = std::fs::remove_file(&srv_status_file);
+}
+
+/// v0.7 P1-2 & P2-1 adversarial regression test:
+/// 1) Cross-port STUN replay (same PSK, different dst port): 0/4 replies.
+/// 2) Intercepted sibling `lane_hunt` probe (`USE-CANDIDATE=false` sharing winner's `ufrag`):
+///    instantly invalidated once winner nominates (`USE-CANDIDATE=true`) -> 0/4 replies from any IP/port.
+/// 3) Ready-state initial STUN replay (same 5-tuple AFTER DTLS starts): 0/8 replies (zero step oracle).
+/// 4) Corrupted ServerHello injection during handshake -> client+server fast DTLS reset recovers in <3s!
+#[test]
+fn v70_redteam_stun_scope_hunt_lock_ready_replay_and_serverhello_reset() {
+    use crate::protocol::{
+        build_dimpl_config_pool, build_ice_stun_request, derive_stun_scope_key, detect_cpu_accel,
+        generate_ephemeral_webrtc_cert, new_dtls_instance, SessionIceParams,
+    };
+    use dimpl::Output as DtlsOutput;
+
+    let psk = b"v70-redteam-replay-and-sh-reset-psk".to_vec();
+    let backend_port = reserve_free_port();
+    let server_port = reserve_free_port();
+    let relay_port = reserve_free_port();
+    let client_port = reserve_free_port();
+    let stop_all = Arc::new(AtomicBool::new(false));
+
+    let echo = UdpSocket::bind(("127.0.0.1", backend_port)).unwrap();
+    echo.set_read_timeout(Some(Duration::from_millis(40)))
+        .unwrap();
+    let s_e = Arc::clone(&stop_all);
+    thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !s_e.load(Ordering::Relaxed) {
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        }
+    });
+
+    let srv_psk = psk.clone();
+    let s_srv = Arc::clone(&stop_all);
+    thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
+            psk: srv_psk,
+            stun_scope: None,
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 64,
+            wan_mtu: 1488,
+            udp_batch: 0,
+            idle_timeout_secs: 120,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(s_srv),
+        });
+    });
+    thread::sleep(Duration::from_millis(80));
+
+    let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
+    let scoped_psk = derive_stun_scope_key(&psk, server_port);
+    let wrong_port_psk = derive_stun_scope_key(&psk, server_port.wrapping_add(1));
+    let mut rbuf = [0u8; 2048];
+
+    // 1. Cross-port STUN replay MUST get 0 replies
+    let atk = UdpSocket::bind("127.0.0.1:0").unwrap();
+    atk.set_read_timeout(Some(Duration::from_millis(80)))
+        .unwrap();
+    let cross_ice = SessionIceParams::generate();
+    let (cross_stun, _) = build_ice_stun_request(&wrong_port_psk, &cross_ice, None, true);
+    for _ in 0..4 {
+        let _ = atk.send_to(&cross_stun, srv_addr);
+        assert!(
+            atk.recv_from(&mut rbuf).is_err(),
+            "Cross-port scoped STUN MUST be 100% silently dropped!"
+        );
+    }
+
+    // 2. Sibling lane_hunt probe (`USE-CANDIDATE=false`) gets reply BEFORE nomination, then
+    //    is IMMEDIATELY burned (0/4 replies) once winner nominates (`USE-CANDIDATE=true`)!
+    let shared_ice = SessionIceParams::generate();
+    let sibling_ice = shared_ice.with_candidate_index(1);
+    let winner_ice = shared_ice.with_candidate_index(0);
+    let (sibling_probe, _) = build_ice_stun_request(&scoped_psk, &sibling_ice, None, false);
+    let (winner_probe, _) = build_ice_stun_request(&scoped_psk, &winner_ice, None, false);
+
+    let win_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    win_sock
+        .set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    win_sock.send_to(&winner_probe, srv_addr).unwrap();
+    assert!(
+        win_sock.recv_from(&mut rbuf).is_ok(),
+        "Pre-nomination hunt probe should receive STUN Success"
+    );
+
+    // Winner nominates with USE-CANDIDATE=true -> locks `shared_ice.username()` for 90s!
+    let (nom_stun, _) = build_ice_stun_request(&scoped_psk, &winner_ice, None, true);
+    win_sock.send_to(&nom_stun, srv_addr).unwrap();
+    assert!(win_sock.recv_from(&mut rbuf).is_ok());
+
+    // Now replay intercepted sibling probe from a different port -> MUST be 0/4 replies!
+    let sib_replay_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    sib_replay_sock
+        .set_read_timeout(Some(Duration::from_millis(80)))
+        .unwrap();
+    for _ in 0..4 {
+        let _ = sib_replay_sock.send_to(&sibling_probe, srv_addr);
+        assert!(
+            sib_replay_sock.recv_from(&mut rbuf).is_err(),
+            "Intercepted sibling hunt probe MUST be burned after winner nomination!"
+        );
+    }
+
+    // 3. Complete DTLS 1.3 handshake on `win_sock` to Ready -> burns `initial_stun_txid`;
+    //    replaying `nom_stun` 8x on the SAME 5-tuple MUST get 0/8 STUN replies!
+    let cpu = detect_cpu_accel();
+    let dcfg = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, 1488).pick();
+    let mut dtls = new_dtls_instance(
+        DtlsMinVersion::V13Only,
+        dcfg,
+        generate_ephemeral_webrtc_cert(),
+        Instant::now(),
+    );
+    dtls.set_active(true);
+    let _ = dtls.handle_timeout(Instant::now());
+    let mut dbuf = vec![0u8; 4096];
+    let mut dtls_connected = false;
+    let t_hs = Instant::now();
+    while !dtls_connected && t_hs.elapsed() < Duration::from_secs(3) {
+        loop {
+            match dtls.poll_output(&mut dbuf) {
+                DtlsOutput::Packet(p) => {
+                    let _ = win_sock.send_to(p, srv_addr);
+                }
+                DtlsOutput::Connected => dtls_connected = true,
+                DtlsOutput::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        if !dtls_connected {
+            if let Ok((rn, _)) = win_sock.recv_from(&mut rbuf) {
+                if demux_rfc7983(&rbuf[..rn]) == PacketKind::Dtls {
+                    let _ = dtls.handle_packet(&rbuf[..rn]);
+                }
+            }
+        }
+    }
+    assert!(dtls_connected, "DTLS 1.3 handshake should reach Ready");
+    // Drain server DTLS 1.3 ACK
+    win_sock
+        .set_read_timeout(Some(Duration::from_millis(80)))
+        .unwrap();
+    while win_sock.recv_from(&mut rbuf).is_ok() {}
+    for _ in 0..8 {
+        let _ = win_sock.send_to(&nom_stun, srv_addr);
+        while let Ok((rn, _)) = win_sock.recv_from(&mut rbuf) {
+            assert_ne!(
+                demux_rfc7983(&rbuf[..rn]),
+                PacketKind::Stun,
+                "Initial STUN txid MUST be burned once DTLS starts (0/8 STUN replay oracle)!"
+            );
+        }
+    }
+
+    // 4. P2-1 Corrupted ServerHello injection: proxy corrupts the FIRST ServerHello once;
+    //    client + server fast DTLS reset MUST recover and pass traffic in < 3s (not 15s deadlock!).
+    let corrupted_once = Arc::new(AtomicBool::new(false));
+    let corr_c = Arc::clone(&corrupted_once);
+    let s_rel = Arc::clone(&stop_all);
+    let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
+    relay_front.set_nonblocking(true).unwrap();
+    thread::spawn(move || {
+        let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+        let mut buf = [0u8; 4096];
+        while !s_rel.load(Ordering::Relaxed) {
+            while let Ok((n, caddr)) = relay_front.recv_from(&mut buf) {
+                let entry = upstreams.entry(caddr.port()).or_insert_with(|| {
+                    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    s.set_nonblocking(true).unwrap();
+                    s.connect(srv_addr).unwrap();
+                    (s, caddr)
+                });
+                let _ = entry.0.send(&buf[..n]);
+            }
+            for (usock, caddr) in upstreams.values() {
+                while let Ok(n) = usock.recv(&mut buf) {
+                    // Corrupt the first DTLS ServerHello record once on the wire!
+                    if n >= 30
+                        && buf[0] == 22
+                        && buf[13] == 2
+                        && !corr_c.swap(true, Ordering::SeqCst)
+                    {
+                        buf[20] ^= 0xFF;
+                        buf[21] ^= 0xFF;
+                    }
+                    let _ = relay_front.send_to(&buf[..n], *caddr);
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    let cli_psk = psk.clone();
+    let s_cli = Arc::clone(&stop_all);
+    thread::spawn(move || {
+        let _ = run_client(ClientConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
+            psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
+            cipher_pref: CipherPref::Auto,
+            dtls_decoy: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            rotate_interval_secs: 0,
+            rotate_max_bytes: 0,
+            rotate_cooldown_secs: 60,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: 1488,
+            udp_batch: 0,
+            retry_ms: 150,
+            max_retries: 8,
+            keepalive_secs: 5,
+            idle_timeout_secs: 120,
+            stats_interval_secs: 3600,
+            lane_hunt: Default::default(),
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(s_cli),
+        });
+    });
+    thread::sleep(Duration::from_millis(80));
+
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(200)))
+        .unwrap();
+    app.connect(("127.0.0.1", client_port)).unwrap();
+    let t0 = Instant::now();
+    let mut recovered = false;
+    while t0.elapsed() < Duration::from_secs(3) {
+        let _ = app.send(b"RECOVER_CORRUPTED_SH");
+        if let Ok(n) = app.recv(&mut rbuf) {
+            if &rbuf[..n] == b"RECOVER_CORRUPTED_SH" {
+                recovered = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        corrupted_once.load(Ordering::SeqCst),
+        "test must have actually injected corrupted ServerHello"
+    );
+    assert!(
+        recovered,
+        "Client+Server MUST recover from corrupted ServerHello via fast DTLS reset in <3s!"
+    );
+
+    stop_all.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(80));
 }

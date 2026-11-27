@@ -140,16 +140,33 @@ impl SrtpCloakCipher {
             self.fill_fast_random(&mut body[start..]);
         }
 
-        // Subpacket 2: strictly RFC 3550 §6.5 compliant SDES (PT=202) with session-constant CNAME + 0x00 END
-        // Layout: [4B hdr] [4B SSRC] [1B type=1] [1B len=13] [13B ASCII CNAME] [1B END=0x00] = 24B (6 words -> len=5)
-        let sdes_len_words: u16 = 5;
+        // Subpacket 2: strictly RFC 3550 §6.5 compliant SDES (PT=202) with session-constant CNAME
+        // plus optional encrypted SDES TOOL/NOTE item on non-BYE packets (0..=7 extra 32-bit words)
+        // to eliminate constant 52B idle SRTCP spikes while remaining 100% RFC 3550 / v0.6.0 compatible.
+        let extra_sdes_words: u16 = if !include_bye && !has_rx_media {
+            (self.next_rng() as u16) % 8 // 0..=28B -> idle SRTCP spreads smoothly across 52..=80B (4B aligned)
+        } else {
+            0
+        };
+        let sdes_len_words: u16 = 5 + extra_sdes_words;
         body.extend_from_slice(&[RTP_V2_BITS | 1, RTCP_PT_SDES]);
         body.extend_from_slice(&sdes_len_words.to_be_bytes());
         body.extend_from_slice(&report_ssrc.to_be_bytes());
         body.push(1); // CNAME item type
         body.push(RTCP_CNAME_LEN as u8);
         body.extend_from_slice(&self.cname);
-        body.push(0); // RFC 3550 §6.5 END item (32-bit aligned at 24B)
+        if extra_sdes_words > 0 {
+            let item_data_len = (extra_sdes_words as usize) * 4 - 2; // +2B TLV header, leaves trailing 1B END + pad
+            body.push(6); // RFC 3550 §6.5.6 TOOL item
+            body.push((item_data_len - 1) as u8);
+            let s = body.len();
+            body.resize(s + item_data_len - 1, 0);
+            self.fill_fast_random(&mut body[s..]);
+            body.push(0); // END item (32-bit aligned)
+            body.push(0); // 1B trailing zero pad to exact 32-bit boundary
+        } else {
+            body.push(0); // RFC 3550 §6.5 END item (32-bit aligned at 24B)
+        }
 
         // Optional Subpacket 3: Transport-CC (205) / PSFB (206) smooth randomized length (~87.5%)
         // ONLY when media was actually received since the last RTCP (`has_rx_media`) and not BYE!

@@ -14,11 +14,14 @@ pub use dtls::{
     new_dtls_instance, resolve_srtp_suite, validate_dtls_datagram, CertCache, DtlsConfigPool,
 };
 pub use srtp::{combine_session_key, derive_stun_material, SrtpCloakCipher};
+#[cfg(test)]
+pub use stun::build_stun_success_response;
 pub use stun::{
-    build_ice_stun_request, build_ice_stun_request_with_key, build_stun_success_response,
+    build_bypass_stun_request, build_ice_stun_request, build_ice_stun_request_with_key,
     build_stun_success_response_with_key, compute_handover_proof, derive_ice_migration_key,
-    make_fresh_stun_txid, parse_stun, parse_stun_with_key, peek_stun_request_username,
-    stun_hmac_key, SessionIceParams,
+    derive_stun_scope_key, derive_stun_scope_key_for, make_fresh_stun_txid, parse_stun,
+    parse_stun_with_key, peek_stun_request_username, set_global_stun_scope, stun_hmac_key,
+    SessionIceParams,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -574,7 +577,7 @@ impl RollingByteWindow {
     }
 }
 
-/// Chrome/libwebrtc 4-char ICE ufrag from the 64-char Base64 alphabet (zero modulo bias).
+/// Standard Chrome/Safari libwebrtc ICE ufrag: exact 4 Base64 chars (never non-browser 5/6/7 chars).
 pub fn rand_ufrag_chrome() -> String {
     let mut raw = [0u8; 4];
     fill_random(&mut raw);

@@ -50,7 +50,7 @@ impl Default for SelftestOptions {
             server_label: None,
             psk: None,
             cipher_pref: CipherPref::Auto,
-            dtls_min_version: DtlsMinVersion::Auto,
+            dtls_min_version: DtlsMinVersion::V13Only,
             wan_mtu: DEFAULT_WAN_MTU,
             probe_count: DEFAULT_SELFTEST_PROBE_COUNT,
             active_probes: true,

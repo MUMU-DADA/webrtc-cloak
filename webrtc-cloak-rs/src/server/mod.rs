@@ -94,6 +94,8 @@ pub struct ServerConfig {
     pub listen_addr: SocketAddr,
     pub backend_addr: SocketAddr,
     pub psk: Vec<u8>,
+    /// Optional explicit v0.7 STUN scope tag (`--stun-scope`); defaults to listen port.
+    pub stun_scope: Option<String>,
     pub cipher_pref: CipherPref,
     pub dtls_required: bool,
     pub dtls_min_version: DtlsMinVersion,
@@ -122,7 +124,12 @@ pub(super) enum ServerState {
 
 pub(crate) enum ServerHook<'a> {
     Relay(&'a mut crate::relay::RelayEgress),
+    RelayReversePeer(&'a mut ServerWorker),
     ReverseEntry(&'a mut crate::reverse::ReverseEntryHub),
+    #[cfg(feature = "embedded-proxy")]
+    Proxy(&'a mut crate::proxy::ProxyServerEngine),
+    #[cfg(feature = "embedded-proxy")]
+    ProxyClient(&'a mut crate::proxy::ProxyClientEngine),
 }
 
 pub(super) enum BackendPipe {
@@ -204,6 +211,10 @@ pub(super) struct ServerSession {
     pub(super) mig_challenge_cnt: u8,
     pub(super) ssrc_c2s: u32,
     pub(super) ssrc_s2c: u32,
+    /// Initial nominating STUN txid (burned on first DTLS packet to block Ready-state replay oracle).
+    pub(super) initial_stun_txid: [u8; 12],
+    /// True once the first valid DTLS datagram has been received on this session.
+    pub(super) dtls_started: bool,
     pub(super) dtls: Option<Box<Dtls>>,
     pub(super) dtls_resets: u8,
     pub(super) dtls_next_timeout: Option<Instant>,
@@ -217,6 +228,7 @@ pub(super) struct ServerSession {
     pub(super) last_peer_rx: Instant,
     pub(super) last_active_burst: Instant,
     pub(super) next_srtcp_at: Instant,
+    pub(super) pending_close_notify_at: Option<Instant>,
     pub(super) rate_15s: RollingByteWindow,
     pub(super) rx_pkts: u64,
     pub(super) rx_pkts_at_last_rtcp: u64,

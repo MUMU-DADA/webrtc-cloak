@@ -8,7 +8,7 @@ use crate::constants::{
 };
 use crate::protocol::{
     build_dimpl_config_pool_for, build_ice_stun_request, combine_session_key, demux_rfc7983,
-    derive_stun_material, detect_cpu_accel, extract_dtls_server_hello_suite,
+    derive_stun_material, derive_stun_scope_key, detect_cpu_accel, extract_dtls_server_hello_suite,
     generate_ephemeral_webrtc_cert, make_fresh_stun_txid, new_dtls_instance, parse_stun,
     resolve_srtp_suite, validate_dtls_datagram, CipherPref, CipherSuite, DtlsMinVersion,
     PacketKind, SessionIceParams, SrtpCloakCipher, SrtpFrame,
@@ -30,6 +30,7 @@ pub(super) struct LiveStunOk {
 
 pub(super) struct LiveReadySession {
     pub(super) sock: UdpSocket,
+    pub(super) stun_auth_psk: [u8; 32],
     pub(super) ice: SessionIceParams,
     pub(super) dtls: Dtls,
     pub(super) dtls_next_timeout: Option<Instant>,
@@ -54,8 +55,9 @@ pub(super) fn remote_stun_handshake(
         .map_err(|e| format!("connect {}: {}", server_addr, e))?;
 
     let ice = SessionIceParams::generate();
-    let txid = make_fresh_stun_txid(psk);
-    let (req, _) = build_ice_stun_request(psk, &ice, Some(txid), true);
+    let stun_auth_psk = derive_stun_scope_key(psk, server_addr.port());
+    let txid = make_fresh_stun_txid(&stun_auth_psk);
+    let (req, _) = build_ice_stun_request(&stun_auth_psk, &ice, Some(txid), true);
     let mut rbuf = [0u8; PROBE_IO_BUF_LEN];
 
     for _ in 0..4 {
@@ -66,7 +68,7 @@ pub(super) fn remote_stun_handshake(
                 Ok(n) => {
                     let pkt = &rbuf[..n];
                     if demux_rfc7983(pkt) == PacketKind::Stun {
-                        if let Some(p) = parse_stun(pkt, psk) {
+                        if let Some(p) = parse_stun(pkt, &stun_auth_psk) {
                             if p.authenticated
                                 && p.msg_type == STUN_BINDING_SUCCESS
                                 && p.txid == txid
@@ -191,16 +193,18 @@ pub(super) fn remote_dtls_handshake(
 
     let is_dtls13 = dtls.protocol_version() == Some(ProtocolVersion::DTLS1_3);
     let uname = stun.ice.username();
-    let (stun_key, s_c2s, s_s2c) = derive_stun_material(psk, &stun.txid, &uname);
+    let stun_auth_psk = derive_stun_scope_key(psk, stun.server_addr.port());
+    let (stun_key, s_c2s, s_s2c) = derive_stun_material(&stun_auth_psk, &stun.txid, &uname);
     let suite = resolve_srtp_suite(cipher_pref, dtls_suite_id, &cpu, false);
     let final_key = combine_session_key(&stun_key, Some(km));
     let mut cipher = SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, suite);
     cipher.set_wan_mtu_for(wan_mtu, outer_hdr);
-    cipher.set_dual_ssrc(is_dtls13);
+    cipher.set_dual_ssrc(true);
 
     Ok((
         LiveReadySession {
             sock,
+            stun_auth_psk,
             ice: stun.ice,
             dtls,
             dtls_next_timeout,
@@ -264,11 +268,11 @@ impl LiveReadySession {
 
     pub(super) fn send_stun_consent(
         &mut self,
-        psk: &[u8],
+        _psk: &[u8],
         timeout_ms: u64,
     ) -> Option<StunConsentReply> {
         self.pump_dtls(None);
-        let (req, txid) = build_ice_stun_request(psk, &self.ice, None, false);
+        let (req, txid) = build_ice_stun_request(&self.stun_auth_psk, &self.ice, None, false);
         let _ = self.sock.set_read_timeout(Some(Duration::from_millis(40)));
         let ts = Instant::now();
         let _ = self.sock.send(&req);
@@ -280,7 +284,7 @@ impl LiveReadySession {
                     let pkt = &rbuf[..n];
                     match demux_rfc7983(pkt) {
                         PacketKind::Stun => {
-                            if let Some(p) = parse_stun(pkt, psk) {
+                            if let Some(p) = parse_stun(pkt, &self.stun_auth_psk) {
                                 if p.authenticated
                                     && p.msg_type == STUN_BINDING_SUCCESS
                                     && p.txid == txid
@@ -316,7 +320,7 @@ impl LiveReadySession {
         &mut self,
         raw_req: &[u8],
         expected_txid: [u8; 12],
-        psk: &[u8],
+        _psk: &[u8],
         timeout_ms: u64,
     ) -> Option<(f64, Vec<u8>)> {
         self.pump_dtls(None);
@@ -331,7 +335,7 @@ impl LiveReadySession {
                     let pkt = &rbuf[..n];
                     match demux_rfc7983(pkt) {
                         PacketKind::Stun => {
-                            if let Some(p) = parse_stun(pkt, psk) {
+                            if let Some(p) = parse_stun(pkt, &self.stun_auth_psk) {
                                 if p.authenticated
                                     && p.msg_type == STUN_BINDING_SUCCESS
                                     && p.txid == expected_txid

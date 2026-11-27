@@ -37,6 +37,8 @@ pub enum RelayUpstreamConfig {
     Bypass(BypassConfig),
     /// 完整二跳 DTLS 1.3 + SRTP 伪装隧道（同进程 L1 缓存直连解密→再加密，零回环）。
     Cloak(ClientConfig),
+    /// 反向会合二跳 DTLS 1.3 + SRTP 隧道（公网监听等待 NAT 后反向出口主动连入，零回环内存直连）。
+    Reverse(ServerConfig),
 }
 
 /// 原生单进程零回环中继节点配置（`webrtc-cloak relay`）。
@@ -53,7 +55,13 @@ pub(super) fn log(worker_id: usize, msg: &str) {
 }
 
 /// 启动原生单进程零回环中继（支持单线程或 `SO_REUSEPORT` 多工作线程）。
-pub fn run_relay(cfg: RelayConfig) -> std::io::Result<()> {
+pub fn run_relay(mut cfg: RelayConfig) -> std::io::Result<()> {
+    if matches!(cfg.upstream, RelayUpstreamConfig::Reverse(_)) && cfg.ingress.workers > 1 {
+        if !cfg.ingress.quiet {
+            eprintln!("[relay-rs] WARN: --upstream-mode reverse runs in single-thread rendezvous mode; clamping --workers to 1.");
+        }
+        cfg.ingress.workers = 1;
+    }
     let workers = cfg.ingress.workers.max(1);
     let cpu = detect_cpu_accel();
     let ingress_dtls_pool = build_dimpl_config_pool_for(
@@ -115,6 +123,25 @@ pub fn run_relay(cfg: RelayConfig) -> std::io::Result<()> {
                     c.cipher_pref,
                     c.server_addr,
                     lh_desc
+                ),
+            )
+        }
+        RelayUpstreamConfig::Reverse(r) => {
+            let pool = build_dimpl_config_pool_for(
+                r.cipher_pref,
+                &cpu,
+                false,
+                r.wan_mtu,
+                outer_udp_hdr_len(r.listen_addr),
+            );
+            (
+                "relay-reverse",
+                Some(pool),
+                format!(
+                    "reverse(dtls-{}, cipher={:?} <- listen {})",
+                    r.dtls_min_version.as_str(),
+                    r.cipher_pref,
+                    r.listen_addr
                 ),
             )
         }

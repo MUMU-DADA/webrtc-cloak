@@ -35,8 +35,16 @@ const RTP_MARKER_BIT: u8 = 0x80;
 const RTP_ONE_BYTE_EXT_MAGIC_HI: u8 = 0xBE;
 /// RFC 8285 One-Byte Header 魔数低字节（0xDE）。
 const RTP_ONE_BYTE_EXT_MAGIC_LO: u8 = 0xDE;
+/// RFC 8285 ssrc-audio-level 扩展元素头字节（ID=1, L=0 即 1 字节值）。
+const RTP_AUDIO_LEVEL_EXT_ID_LEN: u8 = 0x10;
+/// RFC 8285 abs-send-time 扩展元素头字节（ID=2, L=2 即 3 字节 6.18 定点时钟）。
+const RTP_ABS_SEND_TIME_EXT_ID_LEN: u8 = 0x22;
 /// RFC 8285 transport-wide-cc 扩展元素头字节（ID=3, L=1 即 2 字节值）。
 const RTP_TWCC_EXT_ID_LEN: u8 = 0x31;
+/// RFC 8285 sdes:mid 扩展元素头字节（ID=4, L=0 即 1 字节字符）。
+const RTP_MID_EXT_ID_LEN: u8 = 0x40;
+/// RFC 3550 RTP 填充标志位（P=1，使首字节呈 0xB0 与 0x90 混合，贴合 Chrome BWE 分布）。
+const RTP_PADDING_FLAG_BIT: u8 = 0x20;
 /// 带内控制帧加密区前缀长度（2B 控制魔数 + 2B 控制负载长度）。
 const SRTP_CTRL_PREFIX_LEN: usize = 4;
 /// 反向隧道多路复用数据帧加密区前缀长度（2B 魔数 `0xFFFB` + 2B 负载长度 + 4B `flow_id`）。
@@ -47,8 +55,12 @@ const SRTP_MAX_CTRL_PAYLOAD_LEN: usize = 1460;
 const SRTP_PAD_LARGE_PKT_THRESHOLD: usize = 1340;
 /// 大包允许的最大随机填充字节数（0..=7B）。
 const SRTP_PAD_LARGE_MAX: usize = 7;
-/// 常规包允许的最大随机填充字节数（0..=31B）。
-const SRTP_PAD_NORMAL_MAX: usize = 31;
+/// 常规包允许的最大随机填充字节数（0..=63B，打破 1200B QUIC 形成的 32B 矩形窄箱）。
+const SRTP_PAD_NORMAL_MAX: usize = 63;
+/// 溢入视频 SSRC (`PT=96`) 的微小包（如高频 QUIC ACK）触发真实视频分片展宽的明文长度阈值（字节）。
+const SRTP_PAD_TINY_VIDEO_THRESHOLD: usize = 160;
+/// 溢入视频 SSRC 的微小包最大展宽上限（字节，用于无 MTU 限制时估算 headroom）。
+const SRTP_PAD_TINY_VIDEO_MAX: usize = 1040;
 /// SRTP 48 位扩展序列号硬上限（触及前强制轮换密钥，杜绝 Nonce 回绕）。
 const MAX_SRTP_EXT_SEQ: u64 = 0xFFFF_FFFF_FF00;
 /// SRTCP 31 位索引硬上限（触及前强制轮换密钥，杜绝 Nonce 回绕）。
@@ -75,20 +87,24 @@ const AUDIO_SPLIT_BASE_LEN: usize = 180;
 const AUDIO_SPLIT_JITTER_MASK: usize = 0x7F;
 /// 视频流标准 RTP 时钟频率（90 kHz）。
 const VIDEO_CLOCK_KHZ: u128 = 90;
-/// 视频单包成帧或提前收尾的小包负载阈值（字节）。
+/// 视频单包成帧或判定大流帧的负载阈值（字节）。
 const VIDEO_SMALL_PKT_THRESHOLD: usize = 1100;
 /// 稀疏小包独立成帧（立即置 `M=1`）的最小时间间隔（90 kHz ticks，约 28ms）。
 const VIDEO_SPARSE_GAP_90K: u64 = 2500;
-/// 打开中的视频帧最大空闲年龄（90 kHz ticks，约 66ms），超时后放弃旧帧另起新帧。
+/// 打开中的视频帧最大空闲年龄（90 kHz ticks，约 66ms），超时后另起新帧。
 const VIDEO_MAX_FRAME_AGE_90K: u64 = 6000;
-/// 打开中的视频帧强制封帧（置 `M=1`）年龄阈值（90 kHz ticks，约 32ms，约 30 fps）。
-const VIDEO_FORCE_CLOSE_90K: u64 = 2900;
-/// 打开中的视频帧软封帧年龄阈值（90 kHz ticks，约 16.7ms，配合小包或包数预算提前封帧）。
-const VIDEO_SOFT_CLOSE_90K: u64 = 1500;
-/// 单个视频帧随机包数预算下限（8..=18 包）。
-const VIDEO_FRAME_PKT_BUDGET_MIN: u16 = 8;
-/// 单个视频帧随机包数预算跨度（模 11 得到 0..=10 增量）。
-const VIDEO_FRAME_PKT_BUDGET_SPAN: u16 = 11;
+/// 标准 30 FPS 视频帧步进（90 kHz ticks = 33.3ms）。
+const VIDEO_FRAME_STEP_30FPS_90K: u64 = 3000;
+/// 标准 60 FPS 视频帧步进（90 kHz ticks = 16.7ms）。
+const VIDEO_FRAME_STEP_60FPS_90K: u64 = 1500;
+/// 真实摄像头采集时间戳半抖动幅值（±180 ticks = ±2ms，严格保证帧间步进 >= 1320 ticks <= 68 FPS）。
+const VIDEO_FRAME_JITTER_HALF_90K: u64 = 180;
+/// 含大包视频帧的随机每帧包数上限范围（18..=56 包，匹配 720p/1080p P/I 帧）。
+const VIDEO_LARGE_FRAME_PKTS_MIN: u16 = 18;
+const VIDEO_LARGE_FRAME_PKTS_SPAN: u16 = 39;
+/// 纯小包溢出视频帧的随机每帧包数上限范围（6..=19 包，彻底消除 3 包机械微帧）。
+const VIDEO_SMALL_FRAME_PKTS_MIN: u16 = 6;
+const VIDEO_SMALL_FRAME_PKTS_SPAN: u16 = 14;
 /// SplitMix64 伪随机数增量常量（黄金比例 64 位常数）。
 const SPLITMIX64_GAMMA: u64 = 0x9E37_79B9_7F4A_7C15;
 /// SplitMix64 第一阶段混合乘数。
@@ -179,17 +195,23 @@ pub struct SrtpCloakCipher {
     pub(super) tx_dir: u8,
     pub(super) rx_dir: u8,
     pub tx_ext_seq: u64,
+    pub(super) tx_video_init_seq: u64,
     pub(super) audio_tx_ext_seq: u64,
+    pub(super) tx_audio_init_seq: u64,
     pub(super) tx_twcc_seq: u16,
     pub(super) pad_rng: u64,
     pub(super) ts_base: u32,
     pub(super) audio_ts_base: u32,
     pub(super) t0: Instant,
+    pub(super) video_frame_step_90k: u64,
     pub(super) video_frame_open: bool,
     pub(super) cur_video_ts: u64,
+    pub(super) cur_frame_opened_wall_90k: u64,
+    pub(super) cur_frame_close_age_90k: u64,
+    pub(super) cur_frame_has_large: bool,
     pub(super) last_closed_video_ts: u64,
     pub(super) frame_pkt_count: u16,
-    pub(super) frame_pkt_budget: u16,
+    pub(super) cur_frame_max_pkts: u16,
     pub(super) last_audio_frame: u64,
     pub(super) last_audio_wall_ms: u64,
     pub(super) video_tx_since_rtcp: u64,
@@ -264,8 +286,14 @@ impl SrtpCloakCipher {
         let pad_rng = u64::from_ne_bytes(r[8..16].try_into().unwrap()) | 1;
         let audio_init_seq = (u16::from_be_bytes([r[16], r[17]]) & 0x7FFF) as u64;
         let audio_ts_base = u32::from_be_bytes([r[18], r[19], r[20], r[21]]);
-        let init_budget =
-            VIDEO_FRAME_PKT_BUDGET_MIN + ((r[22] as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
+        let init_max_pkts =
+            VIDEO_LARGE_FRAME_PKTS_MIN + ((r[22] as u16) % VIDEO_LARGE_FRAME_PKTS_SPAN);
+        // 60% 30 FPS (3000 ticks), 40% 60 FPS (1500 ticks) — realistic WebRTC camera profile
+        let video_frame_step_90k = if (r[23] % 5) < 3 {
+            VIDEO_FRAME_STEP_30FPS_90K
+        } else {
+            VIDEO_FRAME_STEP_60FPS_90K
+        };
         let mut cname = [0u8; RTCP_CNAME_LEN];
         for i in 0..RTCP_CNAME_LEN {
             cname[i] = BASE64_ALPHABET[(r[24 + i] as usize) & 63];
@@ -284,17 +312,23 @@ impl SrtpCloakCipher {
             tx_dir: if is_client { DIR_C2S } else { DIR_S2C },
             rx_dir: if is_client { DIR_S2C } else { DIR_C2S },
             tx_ext_seq: init_seq,
+            tx_video_init_seq: init_seq,
             audio_tx_ext_seq: audio_init_seq,
+            tx_audio_init_seq: audio_init_seq,
             tx_twcc_seq,
             pad_rng,
             ts_base,
             audio_ts_base,
             t0: Instant::now(),
+            video_frame_step_90k,
             video_frame_open: false,
             cur_video_ts: 0,
+            cur_frame_opened_wall_90k: 0,
+            cur_frame_close_age_90k: video_frame_step_90k,
+            cur_frame_has_large: false,
             last_closed_video_ts: u64::MAX,
             frame_pkt_count: 0,
-            frame_pkt_budget: init_budget,
+            cur_frame_max_pkts: init_max_pkts,
             last_audio_frame: u64::MAX,
             last_audio_wall_ms: u64::MAX,
             video_tx_since_rtcp: 0,
@@ -578,55 +612,108 @@ impl SrtpCloakCipher {
         } else {
             SRTP_DATA_PREFIX_LEN
         };
-        let fixed_overhead = RTP_FULL_HDR_LEN + prefix_len + SRTP_TAG_LEN;
-        let base_total = fixed_overhead.saturating_add(plaintext.len());
-        if plaintext.len() > MAX_INNER_UDP_LEN
-            || base_total > out.len()
-            || base_total > MAX_IPV4_UDP_PAYLOAD
-            || (self.max_wire_udp > 0 && base_total > self.max_wire_udp)
-        {
-            return None; // Prevents IPv4 fragmentation & guides inner QUIC DPLPMTUD cleanly
-        }
-        let headroom = if self.max_wire_udp > 0 {
-            self.max_wire_udp - base_total
-        } else {
-            SRTP_PAD_NORMAL_MAX
-        };
-        let eff_len = plaintext.len() + if is_control { SRTP_DATA_PREFIX_LEN } else { 0 };
-        let max_pad = if no_pad {
-            0
-        } else if eff_len >= SRTP_PAD_LARGE_PKT_THRESHOLD {
-            headroom.min(SRTP_PAD_LARGE_MAX)
-        } else {
-            headroom.min(SRTP_PAD_NORMAL_MAX)
-        };
-        let rnd = self.next_rng();
-        let pad_len: usize = if max_pad == 0 {
-            0
-        } else {
-            (rnd as usize) % (max_pad + 1)
-        };
-        let ct_len = prefix_len + plaintext.len() + pad_len;
-        let total = RTP_FULL_HDR_LEN + ct_len + SRTP_TAG_LEN;
-        if total > out.len() || total > MAX_IPV4_UDP_PAYLOAD {
+        if plaintext.len() > MAX_INNER_UDP_LEN {
             return None;
         }
-
         if self.tx_ext_seq >= MAX_SRTP_EXT_SEQ || self.audio_tx_ext_seq >= MAX_SRTP_EXT_SEQ {
             return None; // Never wrap 48-bit SRTP sequence (RFC 3711 / RFC 7714)
         }
 
+        let rnd = self.next_rng();
         let elapsed = self.t0.elapsed();
         let wall_ms = elapsed.as_millis() as u64;
         let audio_frame = wall_ms / AUDIO_FRAME_MS;
         // Jittered audio/video split threshold (180..=307B) + strict RFC 7587 <=50pps Opus cap
         // (max 1 PT=111 packet per 20ms frame; bursty QUIC ACKs cleanly spill onto PT=96 Video).
-        // Applies uniformly to Data and 0xFFFE Probe frames for zero selftest fingerprint delta.
         let audio_thresh =
             AUDIO_SPLIT_BASE_LEN + (((rnd >> 24) as usize) & AUDIO_SPLIT_JITTER_MASK);
         let use_audio = self.dual_ssrc
             && plaintext.len() < audio_thresh
             && audio_frame != self.last_audio_frame;
+
+        // Multi-element RFC 8285 One-Byte RTP Header Extensions matching Chrome libwebrtc:
+        //   Audio (PT=111): ID=1 (ssrc-audio-level) + ID=3 (twcc) [+ ID=4 (sdes:mid="0") on opening pkts] -> 24B
+        //   Video (PT=96) : ID=2 (abs-send-time)    + ID=3 (twcc) [+ ID=4 (sdes:mid="1") on opening/keyframe pkts] -> 24B / 28B
+        // Automatically degrades 28B -> 24B -> 20B (TWCC-only) when an external tunnel packet is right at MTU.
+        let want_mid = if use_audio {
+            self.audio_tx_ext_seq.saturating_sub(self.tx_audio_init_seq) < 12
+        } else {
+            self.tx_ext_seq.saturating_sub(self.tx_video_init_seq) < 16
+                || (!self.video_frame_open && ((rnd >> 44) & 0x0F) == 0)
+        };
+        let desired_hdr_len: usize = if !use_audio && want_mid { 28 } else { 24 };
+        let max_allowed = {
+            let cap_out = out.len().min(MAX_IPV4_UDP_PAYLOAD);
+            if self.max_wire_udp > 0 {
+                cap_out.min(self.max_wire_udp)
+            } else {
+                cap_out
+            }
+        };
+        let hdr_len: usize = if desired_hdr_len + prefix_len + SRTP_TAG_LEN + plaintext.len()
+            <= max_allowed
+        {
+            desired_hdr_len
+        } else if 24 + prefix_len + SRTP_TAG_LEN + plaintext.len() <= max_allowed {
+            24
+        } else if RTP_FULL_HDR_LEN + prefix_len + SRTP_TAG_LEN + plaintext.len() <= max_allowed {
+            RTP_FULL_HDR_LEN
+        } else {
+            return None; // Prevents IPv4 fragmentation & guides inner QUIC DPLPMTUD cleanly
+        };
+        let base_total = hdr_len + prefix_len + SRTP_TAG_LEN + plaintext.len();
+        let headroom = if self.max_wire_udp > 0 {
+            self.max_wire_udp.saturating_sub(base_total)
+        } else {
+            SRTP_PAD_TINY_VIDEO_MAX
+        }
+        .min(out.len().saturating_sub(base_total))
+        .min(MAX_IPV4_UDP_PAYLOAD.saturating_sub(base_total));
+        let eff_len = plaintext.len() + if is_control { SRTP_DATA_PREFIX_LEN } else { 0 };
+
+        let pad_len: usize = if no_pad || headroom == 0 {
+            0
+        } else if !use_audio && !is_control && eff_len < SRTP_PAD_TINY_VIDEO_THRESHOLD {
+            // Tiny packets spilling past the 50pps Opus audio cap onto Video PT=96 (e.g. high-rate
+            // QUIC ACKs): widen into realistic video slice sizes (5% short 70..180B, 70% medium
+            // triangular 160..660B, 25% large video slice 580..1040B) so PT=96 never produces
+            // sub-MTU 3-packet micro-frames or <150B razor spikes.
+            let bucket = (rnd >> 52) % 100;
+            let (raw_min, raw_max) = if bucket < 5 {
+                (70usize, 180usize)
+            } else if bucket < 75 {
+                (160usize, 660usize)
+            } else {
+                (580usize, SRTP_PAD_TINY_VIDEO_MAX)
+            };
+            let max_p = headroom.min(raw_max);
+            let min_p = max_p.min(raw_min);
+            let span = max_p.saturating_sub(min_p);
+            if span == 0 {
+                min_p
+            } else {
+                let half = (span / 2).max(1);
+                let u1 = ((rnd >> 8) as usize) % (half + 1);
+                let u2 = ((rnd >> 32) as usize) % (span - half + 1);
+                min_p + u1 + u2
+            }
+        } else {
+            let max_pad = if eff_len >= SRTP_PAD_LARGE_PKT_THRESHOLD {
+                headroom.min(SRTP_PAD_LARGE_MAX)
+            } else {
+                headroom.min(SRTP_PAD_NORMAL_MAX)
+            };
+            if max_pad == 0 {
+                0
+            } else {
+                (rnd as usize) % (max_pad + 1)
+            }
+        };
+        let ct_len = prefix_len + plaintext.len() + pad_len;
+        let total = hdr_len + ct_len + SRTP_TAG_LEN;
+        if total > out.len() || total > MAX_IPV4_UDP_PAYLOAD {
+            return None;
+        }
         let (ext_seq, active_ssrc, pt, ts, marker, tx_domain_dir) = if use_audio {
             let es = self.audio_tx_ext_seq;
             self.audio_tx_ext_seq += 1;
@@ -657,53 +744,77 @@ impl SrtpCloakCipher {
             let es = self.tx_ext_seq;
             self.tx_ext_seq += 1;
             self.video_tx_since_rtcp += 1;
-            // Exact 90,000 Hz wall-clock video framing with STRICT RFC 3550 M=1 causality:
-            // once a packet emits M=1 for timestamp T, NO subsequent packet EVER reuses T!
+            // v0.7 Quantized 30/60 FPS 90 kHz virtual video frame clock with STRICT RFC 3550 M=1
+            // causality: consecutive video frames ALWAYS advance by >= 1320 ticks (<= 68 FPS,
+            // 0.00% >200 FPS or +1/+2 tick bursts), and frame boundaries close on frame-slot age
+            // or varied per-frame packet caps (6..19 small / 18..56 large) — zero 3-pkt micro-frames!
             let wall_90k: u64 = ((elapsed.as_nanos() * VIDEO_CLOCK_KHZ) / 1_000_000) as u64;
+            let jitter_span = VIDEO_FRAME_JITTER_HALF_90K * 2 + 1;
+            let min_step = self
+                .video_frame_step_90k
+                .saturating_sub(VIDEO_FRAME_JITTER_HALF_90K)
+                + ((rnd >> 16) % jitter_span);
+            let is_large_pkt = plaintext.len() >= VIDEO_SMALL_PKT_THRESHOLD;
             let (frame_ts, m): (u64, u8) = if !self.video_frame_open {
                 let start_ts = if self.last_closed_video_ts == u64::MAX {
                     wall_90k
                 } else {
-                    wall_90k.max(self.last_closed_video_ts.wrapping_add(1))
+                    wall_90k.max(self.last_closed_video_ts.wrapping_add(min_step))
                 };
-                // Sparse small packet after >=28ms gap -> clean single-packet frame (M=1 & close)
+                // Sparse small packet after >=28ms quiet gap -> clean single-packet frame (M=1)
                 let sparse_gap = self.last_closed_video_ts == u64::MAX
-                    || start_ts.saturating_sub(self.last_closed_video_ts) >= VIDEO_SPARSE_GAP_90K;
-                if plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD && sparse_gap {
+                    || wall_90k.saturating_sub(self.cur_frame_opened_wall_90k)
+                        >= VIDEO_SPARSE_GAP_90K;
+                if !is_large_pkt && sparse_gap {
                     self.last_closed_video_ts = start_ts;
+                    self.cur_frame_opened_wall_90k = wall_90k;
                     self.frame_pkt_count = 0;
                     (start_ts, RTP_MARKER_BIT)
                 } else {
                     self.video_frame_open = true;
                     self.cur_video_ts = start_ts;
+                    self.cur_frame_opened_wall_90k = wall_90k;
+                    self.cur_frame_close_age_90k = min_step;
+                    self.cur_frame_has_large = is_large_pkt;
                     self.frame_pkt_count = 1;
-                    self.frame_pkt_budget = VIDEO_FRAME_PKT_BUDGET_MIN
-                        + (((rnd >> 8) as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
+                    self.cur_frame_max_pkts = if is_large_pkt {
+                        VIDEO_LARGE_FRAME_PKTS_MIN
+                            + (((rnd >> 8) as u16) % VIDEO_LARGE_FRAME_PKTS_SPAN)
+                    } else {
+                        VIDEO_SMALL_FRAME_PKTS_MIN
+                            + (((rnd >> 8) as u16) % VIDEO_SMALL_FRAME_PKTS_SPAN)
+                    };
                     (start_ts, 0x00)
                 }
             } else {
-                let age_90k = wall_90k.saturating_sub(self.cur_video_ts);
-                if age_90k >= VIDEO_MAX_FRAME_AGE_90K {
-                    // Long idle gap (>66ms): abandon old open frame cleanly & start fresh at wall_90k
-                    let start_ts = wall_90k.max(self.cur_video_ts.wrapping_add(1));
-                    if plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD {
+                if is_large_pkt && !self.cur_frame_has_large {
+                    self.cur_frame_has_large = true;
+                    self.cur_frame_max_pkts = VIDEO_LARGE_FRAME_PKTS_MIN
+                        + (((rnd >> 8) as u16) % VIDEO_LARGE_FRAME_PKTS_SPAN);
+                }
+                let wall_age_90k = wall_90k.saturating_sub(self.cur_frame_opened_wall_90k);
+                if wall_age_90k >= VIDEO_MAX_FRAME_AGE_90K {
+                    // Long idle gap (>66ms): start fresh frame cleanly >= min_step ahead
+                    let start_ts = wall_90k.max(self.cur_video_ts.wrapping_add(min_step));
+                    self.cur_frame_opened_wall_90k = wall_90k;
+                    if !is_large_pkt {
                         self.video_frame_open = false;
                         self.last_closed_video_ts = start_ts;
                         self.frame_pkt_count = 0;
                         (start_ts, RTP_MARKER_BIT)
                     } else {
                         self.cur_video_ts = start_ts;
+                        self.cur_frame_close_age_90k = min_step;
+                        self.cur_frame_has_large = true;
                         self.frame_pkt_count = 1;
-                        self.frame_pkt_budget = VIDEO_FRAME_PKT_BUDGET_MIN
-                            + (((rnd >> 8) as u16) % VIDEO_FRAME_PKT_BUDGET_SPAN);
+                        self.cur_frame_max_pkts = VIDEO_LARGE_FRAME_PKTS_MIN
+                            + (((rnd >> 8) as u16) % VIDEO_LARGE_FRAME_PKTS_SPAN);
                         (start_ts, 0x00)
                     }
-                } else if age_90k >= VIDEO_FORCE_CLOSE_90K
-                    || (age_90k >= VIDEO_SOFT_CLOSE_90K
-                        && (plaintext.len() < VIDEO_SMALL_PKT_THRESHOLD
-                            || self.frame_pkt_count >= self.frame_pkt_budget))
+                } else if wall_age_90k >= self.cur_frame_close_age_90k
+                    || self.frame_pkt_count >= self.cur_frame_max_pkts
                 {
-                    // Close current frame with M=1 as its FINAL packet; next packet MUST advance TS!
+                    // Close current frame with M=1 as its FINAL packet; next frame advances >= min_step!
                     let close_ts = self.cur_video_ts;
                     self.video_frame_open = false;
                     self.last_closed_video_ts = close_ts;
@@ -723,65 +834,109 @@ impl SrtpCloakCipher {
         let twcc = self.tx_twcc_seq;
         self.tx_twcc_seq = self.tx_twcc_seq.wrapping_add(1);
 
-        // 12B standard Chrome RTP header: 0x90 (V=2, P=0, X=1, CC=0)
-        out[0] = RTP_V2_EXT_BYTE;
+        // 12B standard Chrome RTP header: 0x90 (V=2, P=0, X=1, CC=0), or ~12.5% 0xB0 (P=1) when padded
+        let use_rtp_pad_bit = !no_pad && pad_len >= 4 && ((rnd >> 48) & 0x07) == 0;
+        out[0] = if use_rtp_pad_bit {
+            RTP_V2_EXT_BYTE | RTP_PADDING_FLAG_BIT
+        } else {
+            RTP_V2_EXT_BYTE
+        };
         out[1] = marker | pt;
         out[2..4].copy_from_slice(&seq16.to_be_bytes());
         out[4..8].copy_from_slice(&ts.to_be_bytes());
         out[8..12].copy_from_slice(&active_ssrc.to_be_bytes());
 
-        // 8B RFC 8285 One-Byte Extension Header (0xBEDE, len=1 word, ID=3 L=1 transport-wide-cc)
+        // RFC 8285 One-Byte Extension Header (dynamic 20B / 24B / 28B Chrome layout)
         out[12] = RTP_ONE_BYTE_EXT_MAGIC_HI;
         out[13] = RTP_ONE_BYTE_EXT_MAGIC_LO;
-        out[14] = 0x00;
-        out[15] = 0x01;
-        out[16] = RTP_TWCC_EXT_ID_LEN;
-        out[17..19].copy_from_slice(&twcc.to_be_bytes());
-        out[19] = 0x00;
+        let ext_words = ((hdr_len - RTP_FIXED_HDR_LEN - 4) / 4) as u16;
+        out[14..16].copy_from_slice(&ext_words.to_be_bytes());
+        if hdr_len == RTP_FULL_HDR_LEN {
+            // Minimal MTU-constrained fallback: ID=3 L=1 transport-wide-cc
+            out[16] = RTP_TWCC_EXT_ID_LEN;
+            out[17..19].copy_from_slice(&twcc.to_be_bytes());
+            out[19] = 0x00;
+        } else if use_audio {
+            // Audio (24B): ID=1 ssrc-audio-level (V=1 + 20..55 dBov) + ID=3 twcc [+ ID=4 mid="0"]
+            let audio_level = 0x80u8 | (20 + (((rnd >> 40) as u8) % 36));
+            out[16] = RTP_AUDIO_LEVEL_EXT_ID_LEN;
+            out[17] = audio_level;
+            out[18] = RTP_TWCC_EXT_ID_LEN;
+            out[19..21].copy_from_slice(&twcc.to_be_bytes());
+            if want_mid {
+                out[21] = RTP_MID_EXT_ID_LEN;
+                out[22] = b'0';
+                out[23] = 0x00;
+            } else {
+                out[21] = 0x00;
+                out[22] = 0x00;
+                out[23] = 0x00;
+            }
+        } else {
+            // Video (24B or 28B): ID=2 abs-send-time (24-bit 6.18 fixed-point seconds) + ID=3 twcc
+            let ast24 = (((elapsed.as_nanos() << 18) / 1_000_000_000) as u32) & 0x00FF_FFFF;
+            out[16] = RTP_ABS_SEND_TIME_EXT_ID_LEN;
+            out[17] = ((ast24 >> 16) & 0xFF) as u8;
+            out[18] = ((ast24 >> 8) & 0xFF) as u8;
+            out[19] = (ast24 & 0xFF) as u8;
+            out[20] = RTP_TWCC_EXT_ID_LEN;
+            out[21..23].copy_from_slice(&twcc.to_be_bytes());
+            if hdr_len == 28 {
+                out[23] = RTP_MID_EXT_ID_LEN;
+                out[24] = b'1';
+                out[25] = 0x00;
+                out[26] = 0x00;
+                out[27] = 0x00;
+            } else {
+                out[23] = 0x00;
+            }
+        }
 
         // Inner encrypted payload:
         //   Data       : [inner_len: u16 BE] || [plaintext] || [random pad]
         //   Control    : [magic: u16 BE (0xFFFE/0xFFFD/0xFFFC/0xFFFA)] || [len: u16 BE] || [payload] || [random pad]
         //   ReverseData: [0xFFFB: u16 BE] || [len: u16 BE] || [flow_id: u32 BE] || [plaintext] || [random pad]
-        let ct_end = RTP_FULL_HDR_LEN + ct_len;
+        let ct_end = hdr_len + ct_len;
         if let Some(magic) = control_magic {
-            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2].copy_from_slice(&magic.to_be_bytes());
-            out[RTP_FULL_HDR_LEN + 2..RTP_FULL_HDR_LEN + 4]
-                .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+            out[hdr_len..hdr_len + 2].copy_from_slice(&magic.to_be_bytes());
+            out[hdr_len + 2..hdr_len + 4].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
             if let Some(fid) = rev_flow_id {
-                out[RTP_FULL_HDR_LEN + 4..RTP_FULL_HDR_LEN + 8].copy_from_slice(&fid.to_be_bytes());
+                out[hdr_len + 4..hdr_len + 8].copy_from_slice(&fid.to_be_bytes());
             }
         } else {
-            out[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 2]
-                .copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
+            out[hdr_len..hdr_len + 2].copy_from_slice(&(plaintext.len() as u16).to_be_bytes());
         }
-        out[RTP_FULL_HDR_LEN + prefix_len..RTP_FULL_HDR_LEN + prefix_len + plaintext.len()]
+        out[hdr_len + prefix_len..hdr_len + prefix_len + plaintext.len()]
             .copy_from_slice(plaintext);
         if pad_len > 0 {
-            let p_start = RTP_FULL_HDR_LEN + prefix_len + plaintext.len();
+            let p_start = hdr_len + prefix_len + plaintext.len();
             let mut st = rnd ^ PAD_LCG_SEED_XOR;
             for b in &mut out[p_start..ct_end] {
                 st = st.wrapping_mul(PAD_LCG_MUL).wrapping_add(1);
                 *b = (st >> 56) as u8;
             }
+            if use_rtp_pad_bit {
+                out[ct_end - 1] = pad_len.min(255) as u8;
+            }
         }
 
-        let mut aad = [0u8; RTP_FULL_HDR_LEN + 4];
-        aad[..RTP_FULL_HDR_LEN].copy_from_slice(&out[..RTP_FULL_HDR_LEN]);
-        aad[RTP_FULL_HDR_LEN..RTP_FULL_HDR_LEN + 4].copy_from_slice(&roc.to_be_bytes());
+        let mut aad = [0u8; 32];
+        aad[..hdr_len].copy_from_slice(&out[..hdr_len]);
+        aad[hdr_len..hdr_len + 4].copy_from_slice(&roc.to_be_bytes());
+        let aad_slice = &aad[..hdr_len + 4];
 
         match self.backend {
             CipherBackend::Aes128Gcm(ref aes_gcm) => {
                 let iv = GcmNonce::from(self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq));
                 let tag = aes_gcm
-                    .encrypt_inout_detached(&iv, &aad, (&mut out[RTP_FULL_HDR_LEN..ct_end]).into())
+                    .encrypt_inout_detached(&iv, aad_slice, (&mut out[hdr_len..ct_end]).into())
                     .expect("AES-GCM encrypt");
                 out[ct_end..total].copy_from_slice(&tag);
             }
             CipherBackend::ChaCha20Poly1305(ref chacha) => {
                 let iv = ChaNonce::from(self.gcm_nonce(tx_domain_dir, active_ssrc, ext_seq));
                 let tag = chacha
-                    .encrypt_inout_detached(&iv, &aad, (&mut out[RTP_FULL_HDR_LEN..ct_end]).into())
+                    .encrypt_inout_detached(&iv, aad_slice, (&mut out[hdr_len..ct_end]).into())
                     .expect("ChaCha20-Poly1305 encrypt");
                 out[ct_end..total].copy_from_slice(&tag);
             }
@@ -794,13 +949,13 @@ impl SrtpCloakCipher {
                     tx_domain_dir,
                     active_ssrc,
                     ext_seq,
-                    &mut out[RTP_FULL_HDR_LEN..ct_end],
+                    &mut out[hdr_len..ct_end],
                 );
                 let tag = Self::auth_tag(
                     mac_key,
                     tx_domain_dir,
-                    &out[..RTP_FULL_HDR_LEN],
-                    &out[RTP_FULL_HDR_LEN..ct_end],
+                    &out[..hdr_len],
+                    &out[hdr_len..ct_end],
                     roc,
                 );
                 out[ct_end..total].copy_from_slice(&tag);

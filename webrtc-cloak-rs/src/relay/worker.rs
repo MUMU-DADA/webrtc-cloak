@@ -6,8 +6,8 @@ use crate::client::ClientWorker;
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
-    SharedPoll, LISTEN_TOKEN, MIO_EVENTS_CAP, TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN,
-    WORKER_QUIET_STOP_POLL_MS,
+    SharedPoll, LISTEN_TOKEN, MIO_EVENTS_CAP, REVERSE_LISTEN_TOKEN,
+    TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{is_shutdown_requested, register_shutdown_poll, DtlsConfigPool};
 use crate::server::{SeenTxidCache, ServerHook, ServerWorker, SharedV4Registry};
@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 pub(crate) enum RelayEgress {
     Bypass(BypassWorker),
     Cloak(ClientWorker),
+    Reverse(Box<ServerWorker>),
 }
 
 impl RelayEgress {
@@ -35,6 +36,9 @@ impl RelayEgress {
         match self {
             RelayEgress::Bypass(b) => b.send_uplink_single(flow_addr, payload, now),
             RelayEgress::Cloak(c) => c.send_uplink_single(flow_addr, payload, now),
+            RelayEgress::Reverse(rev) => rev
+                .active_ready_relay_flow()
+                .is_some_and(|dst| rev.deliver_downlink_single(dst, payload, now)),
         }
     }
 
@@ -42,6 +46,7 @@ impl RelayEgress {
         match self {
             RelayEgress::Bypass(b) => b.close_flow(flow_addr),
             RelayEgress::Cloak(c) => c.close_flow(flow_addr, now),
+            RelayEgress::Reverse(_) => {}
         }
     }
 
@@ -49,6 +54,7 @@ impl RelayEgress {
         match self {
             RelayEgress::Bypass(b) => b.shutdown_all(),
             RelayEgress::Cloak(c) => c.graceful_shutdown_all(),
+            RelayEgress::Reverse(rev) => rev.graceful_shutdown_all(),
         }
     }
 
@@ -56,6 +62,7 @@ impl RelayEgress {
         match self {
             RelayEgress::Bypass(b) => b.build_worker_snapshot(),
             RelayEgress::Cloak(c) => c.build_worker_snapshot(),
+            RelayEgress::Reverse(rev) => rev.build_worker_snapshot(),
         }
     }
 }
@@ -119,10 +126,12 @@ pub(super) fn run_relay_worker(
     let upstream_addr = match &cfg.upstream {
         RelayUpstreamConfig::Bypass(b) => b.server_addr,
         RelayUpstreamConfig::Cloak(c) => c.server_addr,
+        RelayUpstreamConfig::Reverse(r) => r.listen_addr,
     };
     let mode_tag = match &cfg.upstream {
         RelayUpstreamConfig::Bypass(_) => "bypass",
         RelayUpstreamConfig::Cloak(_) => "cloak",
+        RelayUpstreamConfig::Reverse(_) => "reverse",
     };
 
     RELAY_QUIET.with(|q| q.set(quiet));
@@ -165,6 +174,22 @@ pub(super) fn run_relay_worker(
                 telemetry.clone(),
             ))
         }
+        RelayUpstreamConfig::Reverse(rcfg) => {
+            let dp = egress_dtls_pool.expect("egress DTLS pool must exist for relay reverse mode");
+            let rev_seen = Arc::new(Mutex::new(SeenTxidCache::new()));
+            let rev_reg = Arc::new(SharedV4Registry::new(1));
+            RelayEgress::Reverse(Box::new(ServerWorker::new_for_relay_with_token(
+                worker_id,
+                rcfg,
+                false,
+                REVERSE_LISTEN_TOKEN,
+                dp,
+                rev_seen,
+                rev_reg,
+                egress_poll,
+                None,
+            )?))
+        }
     };
 
     log(
@@ -201,6 +226,13 @@ pub(super) fn run_relay_worker(
                 (b.next_poll_timeout_relay(now), Vec::new(), Vec::new())
             }
             RelayEgress::Cloak(ref mut c) => c.process_timers_relay(now),
+            RelayEgress::Reverse(ref mut rev) => {
+                rev.drain_worker_cmds_with(now, Some(ServerHook::RelayReversePeer(&mut ingress)));
+                let w =
+                    rev.process_timers_with(now, Some(ServerHook::RelayReversePeer(&mut ingress)));
+                let _ = rev.drain_closed_relay_flows();
+                (w, Vec::new(), Vec::new())
+            }
         };
 
         let mut wait = w_in.min(w_out);
@@ -208,7 +240,7 @@ pub(super) fn run_relay_worker(
             wait = telemetry_dur;
         }
         let quiet_cap = Duration::from_millis(WORKER_QUIET_STOP_POLL_MS);
-        if stop.is_some() && wait > quiet_cap {
+        if stop.is_some() && quiet && wait > quiet_cap {
             wait = quiet_cap;
         }
 
@@ -235,6 +267,13 @@ pub(super) fn run_relay_worker(
             }
             if tok == LISTEN_TOKEN {
                 ingress.handle_listen_readable_with(now, Some(ServerHook::Relay(&mut egress)));
+            } else if tok == REVERSE_LISTEN_TOKEN {
+                if let RelayEgress::Reverse(ref mut rev) = egress {
+                    rev.handle_listen_readable_with(
+                        now,
+                        Some(ServerHook::RelayReversePeer(&mut ingress)),
+                    );
+                }
             } else {
                 match egress {
                     RelayEgress::Bypass(ref mut b) => {
@@ -250,6 +289,7 @@ pub(super) fn run_relay_worker(
                             &mut graceful_reconnects,
                         );
                     }
+                    RelayEgress::Reverse(_) => {}
                 }
             }
         }
@@ -269,6 +309,9 @@ pub(super) fn run_relay_worker(
                     standby_promoted,
                     graceful_reconnects,
                 );
+            }
+            RelayEgress::Reverse(ref mut rev) => {
+                let _ = rev.drain_closed_relay_flows();
             }
         }
 

@@ -9,7 +9,8 @@ use crate::constants::{
     PROBE_IO_BUF_LEN, SRTP_DATA_MIN_WIRE_LEN, STUN_HDR_LEN,
 };
 use crate::protocol::{
-    build_ice_stun_request, demux_rfc7983, fill_random, PacketKind, SessionIceParams, SrtpFrame,
+    build_ice_stun_request, demux_rfc7983, derive_stun_scope_key, fill_random, PacketKind,
+    SessionIceParams, SrtpFrame,
 };
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -446,13 +447,16 @@ pub(super) fn run_remote_steps_06_to_09(
         forged_dtls[12] = 51;
         forged_dtls[13] = DTLS_HS_CLIENT_HELLO;
 
+        let scoped_psk = derive_stun_scope_key(psk, server_addr.port());
+        let wrong_port_psk = derive_stun_scope_key(psk, server_addr.port().wrapping_add(1));
+
         let (wrong_psk_stun, _) = build_ice_stun_request(b"wrong-attacker-psk", &ice, None, true);
 
-        let (mut tampered_mi_stun, _) = build_ice_stun_request(psk, &ice, None, true);
+        let (mut tampered_mi_stun, _) = build_ice_stun_request(&scoped_psk, &ice, None, true);
         let mi_idx = tampered_mi_stun.len().saturating_sub(14);
         tampered_mi_stun[mi_idx] ^= 0x01;
 
-        let (mut smuggled_stun, _) = build_ice_stun_request(psk, &ice, None, true);
+        let (mut smuggled_stun, _) = build_ice_stun_request(&scoped_psk, &ice, None, true);
         smuggled_stun.extend_from_slice(&[0x80, 0x22, 0x00, 0x04, b'E', b'V', b'I', b'L']);
         let new_len = (smuggled_stun.len() - STUN_HDR_LEN) as u16;
         smuggled_stun[2..4].copy_from_slice(&new_len.to_be_bytes());
@@ -463,7 +467,7 @@ pub(super) fn run_remote_steps_06_to_09(
         } else {
             captured_stun
         };
-        let (orphan_ka_stun, _) = build_ice_stun_request(psk, &ice, None, false);
+        let (orphan_ka_stun, _) = build_ice_stun_request(&wrong_port_psk, &ice, None, true);
 
         let probes: Vec<(&'static str, Vec<u8>)> = vec![
             ("junk", rand_junk),

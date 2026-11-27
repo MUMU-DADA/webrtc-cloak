@@ -40,6 +40,7 @@ fn bypass_selects_fast_lane_forwards_raw_payload_and_heals_blackhole() {
     let resp_cfg = BypassResponderConfig {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], resp_port)),
         psk: psk.clone(),
+        stun_scope: None,
         workers: 1,
         wan_mtu: DEFAULT_WAN_MTU,
         udp_batch: 0,
@@ -146,6 +147,7 @@ fn bypass_selects_fast_lane_forwards_raw_payload_and_heals_blackhole() {
         listen_addr: SocketAddr::from(([127, 0, 0, 1], bypass_port)),
         server_addr: mux_addr,
         psk: psk.clone(),
+        stun_scope: Some(resp_port.to_string()),
         rotate_interval_secs: 0,
         workers: 1,
         max_sessions: 64,
@@ -269,14 +271,19 @@ fn bypass_ipv6_loopback_batch_roundtrip() {
     let stop_e = Arc::clone(&stop);
     let psk_e = psk.clone();
     let eh = thread::spawn(move || {
+        let scoped_psk =
+            crate::protocol::derive_stun_scope_key_for(&psk_e, echo_addr.port(), None, true);
         let mut buf = [0u8; 2048];
         while !stop_e.load(Ordering::Acquire) {
             if let Ok((n, peer)) = echo.recv_from(&mut buf) {
                 if n >= STUN_HDR_LEN && buf[0] <= 3 {
-                    if let Some(p) = crate::protocol::parse_stun(&buf[..n], &psk_e) {
+                    if let Some(p) = crate::protocol::parse_stun(&buf[..n], &scoped_psk) {
                         if p.authenticated {
-                            let resp =
-                                crate::protocol::build_stun_success_response(&p.txid, peer, &psk_e);
+                            let resp = crate::protocol::build_stun_success_response(
+                                &p.txid,
+                                peer,
+                                &scoped_psk,
+                            );
                             let _ = echo.send_to(&resp, peer);
                         }
                     }
@@ -296,6 +303,7 @@ fn bypass_ipv6_loopback_batch_roundtrip() {
             listen_addr: listen_v6,
             server_addr: echo_addr,
             psk,
+            stun_scope: None,
             rotate_interval_secs: 0,
             workers: 1,
             max_sessions: 16,

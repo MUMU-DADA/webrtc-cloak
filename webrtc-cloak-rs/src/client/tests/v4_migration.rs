@@ -82,6 +82,7 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -145,6 +146,7 @@ fn v40_strict_pinned_udp_backend_survives_mbb_handover_and_1rtt_blackhole_migrat
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -329,6 +331,7 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -422,6 +425,7 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -480,7 +484,8 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
     let mut evil_ice = SessionIceParams::generate();
     evil_ice.ufrag_remote = parts[0].to_string();
     evil_ice.ufrag_local = parts[1].to_string();
-    let (forged_mig, _) = build_ice_stun_request(&psk, &evil_ice, None, true);
+    let scoped_psk = crate::protocol::derive_stun_scope_key(&psk, server_port);
+    let (forged_mig, _) = build_ice_stun_request(&scoped_psk, &evil_ice, None, true);
     let _ = evil_sock.send(&forged_mig);
     assert!(
         evil_sock.recv(&mut rbuf).is_err(),
@@ -489,10 +494,10 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
 
     // Attack 2b: Same-PSK attacker opens a real DTLS session and sends encrypted 0xFFFC handover with forged proof!
     let evil_ice2 = SessionIceParams::generate();
-    let (evil_stun, evil_txid) = build_ice_stun_request(&psk, &evil_ice2, None, true);
+    let (evil_stun, evil_txid) = build_ice_stun_request(&scoped_psk, &evil_ice2, None, true);
     let _ = evil_sock.send(&evil_stun);
     let sn = evil_sock.recv(&mut rbuf).expect("evil legit STUN");
-    let parsed_e = parse_stun(&rbuf[..sn], &psk).unwrap();
+    let parsed_e = parse_stun(&rbuf[..sn], &scoped_psk).unwrap();
     assert!(parsed_e.authenticated);
     // Complete evil DTLS 1.3 handshake to get real encrypted SRTP channel
     let cpu = detect_cpu_accel();
@@ -530,7 +535,8 @@ fn v40_redteam_spoofed_ip_reflection_and_same_psk_hijack_blocked() {
         }
     }
     assert!(e_conn && ekm.is_some());
-    let (esk, es_c2s, es_s2c) = derive_stun_material(&psk, &evil_txid, &evil_ice2.username());
+    let (esk, es_c2s, es_s2c) =
+        derive_stun_material(&scoped_psk, &evil_txid, &evil_ice2.username());
     let efk = combine_session_key(&esk, ekm.as_deref());
     let mut ecipher = SrtpCloakCipher::new(&efk, es_c2s, es_s2c, true, CipherSuite::Aes128Gcm);
     ecipher.set_dual_ssrc(true);

@@ -1,6 +1,9 @@
 //! 服务端 mio 工作线程状态容器、主事件循环与定时任务及遥测上报。
 
-use super::handlers::{drain_server_dtls, graceful_teardown_server, process_ready_srtp};
+use super::handlers::{
+    drain_server_dtls, process_ready_srtp, send_server_dtls_close_notify,
+    send_server_srtcp_bye_only,
+};
 use super::registry::{SeenTxidCache, SharedV4Registry, WorkerCmd};
 use super::{
     cleanup_session_routes, log, make_udp_socket, record_server_media_bytes, RelayState,
@@ -14,14 +17,14 @@ use crate::constants::{
     CLOSING_DRAIN_MS, CTRL_FRAME_BUF_LEN, DTLS_IO_BUF_LEN, LISTEN_TOKEN, MAX_INNER_UDP_LEN,
     MIN_WIRE_UDP_MTU, MIO_EVENTS_CAP, PEER_CONSENT_TIMEOUT, PROBE_IO_BUF_LEN, REV_OP_FLOW_CLOSE,
     SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS, SRTCP_IDLE_MIN_MS,
-    SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS,
-    TRICKLE_RATE_15S_BYTES, TRICKLE_WINDOW_15S_SECS, WAKE_TOKEN, WORKER_ACTIVE_POLL_SECS,
-    WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
-    WORKER_QUIET_STOP_POLL_MS,
+    SRTCP_LONG_TRICKLE_MAX_MS, SRTCP_LONG_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS,
+    SRTCP_TRICKLE_MIN_MS, TELEMETRY_DEFAULT_INTERVAL_SECS, TRICKLE_RATE_15S_BYTES,
+    TRICKLE_WINDOW_15S_SECS, WAKE_TOKEN, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
+    WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    detect_cpu_accel, is_shutdown_requested, rand_duration_range_ms, register_shutdown_poll,
-    stun_hmac_key, CertCache, CpuAccelInfo, DtlsConfigPool,
+    derive_stun_scope_key_for, detect_cpu_accel, is_shutdown_requested, rand_duration_range_ms,
+    register_shutdown_poll, stun_hmac_key, CertCache, CpuAccelInfo, DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use crate::udp_batch::{is_udp_batch_active, UdpRecvBatch, UdpSendBatch};
@@ -36,10 +39,11 @@ use std::time::{Duration, Instant};
 
 /// 服务端 DTLS 握手阶段无进展时的超时清理阈值（秒）。
 const SERVER_DTLS_HS_TIMEOUT_SECS: u64 = 15;
-/// 服务端连续细流超过该时长（秒）后暂停主动下行 SRTCP 心跳。
+/// 服务端连续细流超过该时长（秒）后进入极低频（25..45s）对称 RTCP RR 节奏。
 const SERVER_LONG_TRICKLE_SECS: u64 = 60;
-/// 服务端处于长细流静默期时的 SRTCP 状态复检间隔（秒）。
-const SERVER_LONG_TRICKLE_RECHECK_SECS: u64 = 10;
+/// 服务端优雅关闭时 `SRTCP BYE` 与 `DTLS close_notify` 之间的异步随机间隔（毫秒）。
+const SERVER_BYE_TO_CLOSE_NOTIFY_MIN_MS: u64 = 18;
+const SERVER_BYE_TO_CLOSE_NOTIFY_MAX_MS: u64 = 95;
 
 pub(crate) struct ServerWorker {
     pub(super) worker_id: usize,
@@ -56,6 +60,7 @@ pub(crate) struct ServerWorker {
     pub(super) next_token_id: usize,
     pub(super) cert_cache: CertCache,
     pub(super) dtls_pool: DtlsConfigPool,
+    pub(super) stun_auth_psk: [u8; 32],
     pub(super) stun_mi_key: [u8; 32],
     pub(super) max_early_srtp_len: usize,
     pub(super) seen_txids: Arc<Mutex<SeenTxidCache>>,
@@ -74,6 +79,10 @@ pub(crate) struct ServerWorker {
     pub(super) rx_batch: Option<UdpRecvBatch>,
     pub(super) tx_batch: Option<UdpSendBatch>,
     pub(super) cpu: CpuAccelInfo,
+    /// True for always-on embedded proxy tunnels (`proxy --server`, `proxy --client --reverse`):
+    /// exempts sessions from data-inactivity `idle_dur` teardown so idle SSH/TCP flows stay alive
+    /// without needing periodic inner QUIC keepalive beacons (liveness relies on 45s ICE consent).
+    pub(super) persistent_tunnel: bool,
     pub(super) idle_dur: Duration,
     pub(super) stats_dur: Duration,
     pub(super) last_stats: Instant,
@@ -106,6 +115,7 @@ pub(super) fn run_server_worker(
         reuse_port,
         false,
         false,
+        LISTEN_TOKEN,
         dtls_pool,
         seen_txids,
         registry,
@@ -123,6 +133,7 @@ impl ServerWorker {
         reuse_port: bool,
         relay_mode: bool,
         reverse_entry: bool,
+        listen_token: Token,
         dtls_pool: DtlsConfigPool,
         seen_txids: Arc<Mutex<SeenTxidCache>>,
         registry: Arc<SharedV4Registry>,
@@ -132,9 +143,15 @@ impl ServerWorker {
         super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
         let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
         poll.registry()
-            .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
+            .register(&mut listen_sock, listen_token, Interest::READABLE)?;
 
-        let stun_mi_key = stun_hmac_key(&cfg.psk);
+        let actual_port = listen_sock
+            .local_addr()
+            .map(|a| a.port())
+            .unwrap_or(cfg.listen_addr.port());
+        let stun_auth_psk =
+            derive_stun_scope_key_for(&cfg.psk, actual_port, cfg.stun_scope.as_deref(), false);
+        let stun_mi_key = stun_hmac_key(&stun_auth_psk);
         let max_early_srtp_len = if cfg.wan_mtu > 0 {
             cfg.wan_mtu
                 .saturating_sub(outer_udp_hdr_len(cfg.listen_addr))
@@ -186,6 +203,7 @@ impl ServerWorker {
             next_token_id: 1,
             cert_cache: CertCache::new(),
             dtls_pool,
+            stun_auth_psk,
             stun_mi_key,
             max_early_srtp_len,
             seen_txids,
@@ -204,12 +222,18 @@ impl ServerWorker {
             rx_batch,
             tx_batch,
             cpu,
+            persistent_tunnel: false,
             idle_dur,
             stats_dur,
             last_stats: now,
             telemetry_dur,
             last_telemetry: now,
         })
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    pub(crate) fn set_persistent_tunnel(&mut self, enabled: bool) {
+        self.persistent_tunnel = enabled;
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -224,7 +248,43 @@ impl ServerWorker {
         telemetry: Option<Arc<TelemetryHub>>,
     ) -> std::io::Result<Self> {
         Self::new_internal(
-            worker_id, cfg, reuse_port, true, false, dtls_pool, seen_txids, registry, poll,
+            worker_id,
+            cfg,
+            reuse_port,
+            true,
+            false,
+            LISTEN_TOKEN,
+            dtls_pool,
+            seen_txids,
+            registry,
+            poll,
+            telemetry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_relay_with_token(
+        worker_id: usize,
+        cfg: ServerConfig,
+        reuse_port: bool,
+        listen_token: Token,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        Self::new_internal(
+            worker_id,
+            cfg,
+            reuse_port,
+            true,
+            false,
+            listen_token,
+            dtls_pool,
+            seen_txids,
+            registry,
+            poll,
             telemetry,
         )
     }
@@ -240,8 +300,81 @@ impl ServerWorker {
         telemetry: Option<Arc<TelemetryHub>>,
     ) -> std::io::Result<Self> {
         Self::new_internal(
-            worker_id, cfg, false, false, true, dtls_pool, seen_txids, registry, poll, telemetry,
+            worker_id,
+            cfg,
+            false,
+            false,
+            true,
+            LISTEN_TOKEN,
+            dtls_pool,
+            seen_txids,
+            registry,
+            poll,
+            telemetry,
         )
+    }
+
+    /// 返回当前最新活跃且已处于 `Ready` 状态会话对应的零回环 `RelayFlow` 标识；
+    /// 若对端（如反向内嵌代理出口）刚完成 DTLS 握手尚未发业务首包，则主动为其分配 `RelayFlow`。
+    /// MBB `0xFFFC` 交接时会原子转移同一 `flow_addr`，因此返回值在热切换期间保持不变。
+    pub(crate) fn active_ready_relay_flow(&mut self) -> Option<SocketAddr> {
+        if !self.relay.enabled {
+            return None;
+        }
+        let now = Instant::now();
+        // Prefer an already-bound `RelayFlow` session over a brand-new `Unbound` Ready session
+        // so an in-flight MBB standby completing DTLS Flight 5 before its `0xFFFC` handover frame
+        // arrives NEVER gets prematurely allocated a distinct flow_addr (which would reset inner QUIC!).
+        // If an `Unbound` session has stayed Ready for >= 1.5s without sending `0xFFFC` (e.g. a
+        // fresh reverse agent replacing a SIGKILL'd peer before consent timeout), promote it cleanly.
+        let mut best_bound: Option<(Token, Instant)> = None;
+        let mut best_unbound: Option<(Token, Instant, bool)> = None;
+        for (&tok, sess) in &self.sessions_by_token {
+            if sess.state != ServerState::Ready {
+                continue;
+            }
+            match sess.backend {
+                super::BackendPipe::ForwardLocal { .. }
+                | super::BackendPipe::ForwardRemote { .. } => continue,
+                super::BackendPipe::RelayFlow(_) => {
+                    let ts = sess.last_peer_rx.max(sess.last_data_active);
+                    if best_bound.is_none_or(|(_, b)| ts >= b) {
+                        best_bound = Some((tok, ts));
+                    }
+                }
+                super::BackendPipe::Unbound => {
+                    let ts = sess.last_peer_rx.max(sess.last_data_active);
+                    let mature = sess.ready_at.is_some_and(|r| {
+                        now.saturating_duration_since(r) >= Duration::from_millis(1500)
+                    });
+                    if best_unbound.is_none_or(|(_, b, _)| ts >= b) {
+                        best_unbound = Some((tok, ts, mature));
+                    }
+                }
+                _ => continue,
+            }
+        }
+        let tok = match (best_bound, best_unbound) {
+            (Some((_, bts)), Some((ut, uts, true))) if uts > bts => ut,
+            (Some((bt, _)), _) => bt,
+            (None, Some((ut, _, _))) => ut,
+            (None, None) => return None,
+        };
+        let sess = self.sessions_by_token.get_mut(&tok)?;
+        if matches!(sess.backend, super::BackendPipe::Unbound) {
+            let _ = super::ensure_owned_backend(
+                self.worker_id,
+                tok,
+                sess,
+                self.cfg.backend_addr,
+                &self.poll,
+                &mut self.relay,
+            );
+        }
+        match sess.backend {
+            super::BackendPipe::RelayFlow(flow_addr) => Some(flow_addr),
+            _ => None,
+        }
     }
 
     fn run(&mut self, poll: &mut Poll) -> std::io::Result<()> {
@@ -295,16 +428,24 @@ impl ServerWorker {
         let mut torn = 0usize;
         for sess in self.sessions_by_token.values_mut() {
             if sess.state == ServerState::Ready {
-                graceful_teardown_server(
-                    sess,
-                    &self.listen_sock,
-                    &mut self.dtls_buf,
-                    &mut self.audit,
-                );
+                send_server_srtcp_bye_only(sess, &self.listen_sock, &mut self.audit);
                 torn += 1;
             }
         }
         if torn > 0 {
+            // R2-P2-4: Separate SIGTERM SRTCP BYE and DTLS close_notify by 22..65ms
+            // to match runtime async teardown spacing instead of back-to-back <0.1ms burst.
+            std::thread::sleep(rand_duration_range_ms(22, 65));
+            for sess in self.sessions_by_token.values_mut() {
+                if sess.state == ServerState::Ready {
+                    send_server_dtls_close_notify(
+                        sess,
+                        &self.listen_sock,
+                        &mut self.dtls_buf,
+                        &mut self.audit,
+                    );
+                }
+            }
             log(
                 self.worker_id,
                 &format!(
@@ -408,16 +549,25 @@ impl ServerWorker {
                         .as_ref()
                         .map(|c| c.is_seq_exhausted())
                         .unwrap_or(false);
+                    // Exempt always-on tunnels (reverse agent / embedded proxy) and pure unused
+                    // pre-warmed standbys (`rx_pkts == 0 && tx_pkts == 0`, still bound by 45s ICE
+                    // consent + max_sessions eviction) so PreWarm needs zero `0xFFFE` probes!
+                    let idle_exempt = sess.is_reverse_agent
+                        || self.persistent_tunnel
+                        || (sess.rx_pkts == 0 && sess.tx_pkts == 0);
                     if seq_exhausted
-                        || (!sess.is_reverse_agent
+                        || (!idle_exempt
                             && now.duration_since(sess.last_data_active) > self.idle_dur)
                     {
-                        graceful_teardown_server(
-                            sess,
-                            &self.listen_sock,
-                            &mut self.dtls_buf,
-                            &mut self.audit,
+                        send_server_srtcp_bye_only(sess, &self.listen_sock, &mut self.audit);
+                        let cn_delay = rand_duration_range_ms(
+                            SERVER_BYE_TO_CLOSE_NOTIFY_MIN_MS,
+                            SERVER_BYE_TO_CLOSE_NOTIFY_MAX_MS,
                         );
+                        sess.pending_close_notify_at = Some(now + cn_delay);
+                        if cn_delay < wait {
+                            wait = cn_delay.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                        }
                         sess.state = ServerState::Closing(
                             now + Duration::from_millis(CLOSING_DRAIN_MS),
                             false,
@@ -433,39 +583,36 @@ impl ServerWorker {
                         let long_trickle = in_trickle
                             && now.duration_since(sess.last_active_burst)
                                 >= Duration::from_secs(SERVER_LONG_TRICKLE_SECS);
-                        if long_trickle {
-                            sess.next_srtcp_at =
-                                now + Duration::from_secs(SERVER_LONG_TRICKLE_RECHECK_SECS);
-                        } else {
-                            let is_active_media = !in_trickle
-                                && now.duration_since(sess.last_data_active)
-                                    <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
-                            let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
-                            let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
-                            sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
-                            sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
-                            if let Some(ref mut cipher) = sess.cipher {
-                                let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
-                                self.audit.record(1, &rtcp);
-                                if self.listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
-                                    sess.srtcp_tx += 1;
-                                }
+                        let is_active_media = !in_trickle
+                            && now.duration_since(sess.last_data_active)
+                                <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
+                        let sent_media = sess.tx_pkts > sess.tx_pkts_at_last_rtcp;
+                        let has_rx = sess.rx_pkts > sess.rx_pkts_at_last_rtcp;
+                        sess.tx_pkts_at_last_rtcp = sess.tx_pkts;
+                        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
+                        if let Some(ref mut cipher) = sess.cipher {
+                            let rtcp = cipher.build_srtcp(has_rx, sent_media, false);
+                            self.audit.record(1, &rtcp);
+                            if self.listen_sock.send_to(&rtcp, sess.peer_addr).is_ok() {
+                                sess.srtcp_tx += 1;
                             }
-                            sess.next_srtcp_at = now
-                                + if is_active_media {
-                                    rand_duration_range_ms(
-                                        SERVER_SRTCP_ACTIVE_MIN_MS,
-                                        SERVER_SRTCP_ACTIVE_MAX_MS,
-                                    )
-                                } else if !in_trickle {
-                                    rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
-                                } else {
-                                    rand_duration_range_ms(
-                                        SRTCP_TRICKLE_MIN_MS,
-                                        SRTCP_TRICKLE_MAX_MS,
-                                    )
-                                };
                         }
+                        sess.next_srtcp_at = now
+                            + if long_trickle {
+                                rand_duration_range_ms(
+                                    SRTCP_LONG_TRICKLE_MIN_MS,
+                                    SRTCP_LONG_TRICKLE_MAX_MS,
+                                )
+                            } else if is_active_media {
+                                rand_duration_range_ms(
+                                    SERVER_SRTCP_ACTIVE_MIN_MS,
+                                    SERVER_SRTCP_ACTIVE_MAX_MS,
+                                )
+                            } else if !in_trickle {
+                                rand_duration_range_ms(SRTCP_IDLE_MIN_MS, SRTCP_IDLE_MAX_MS)
+                            } else {
+                                rand_duration_range_ms(SRTCP_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS)
+                            };
                     } else {
                         let rem = sess.next_srtcp_at.saturating_duration_since(now);
                         if rem < wait {
@@ -474,7 +621,31 @@ impl ServerWorker {
                     }
                 }
                 ServerState::Closing(deadline, _) => {
+                    if let Some(cn_at) = sess.pending_close_notify_at {
+                        if now >= cn_at {
+                            sess.pending_close_notify_at = None;
+                            send_server_dtls_close_notify(
+                                sess,
+                                &self.listen_sock,
+                                &mut self.dtls_buf,
+                                &mut self.audit,
+                            );
+                        } else {
+                            let rem = cn_at.saturating_duration_since(now);
+                            if rem < wait {
+                                wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        }
+                    }
                     if now >= deadline {
+                        if sess.pending_close_notify_at.take().is_some() {
+                            send_server_dtls_close_notify(
+                                sess,
+                                &self.listen_sock,
+                                &mut self.dtls_buf,
+                                &mut self.audit,
+                            );
+                        }
                         to_close.push((tok, "graceful_close"));
                     } else {
                         let rem = deadline.saturating_duration_since(now);
@@ -819,7 +990,8 @@ impl ServerWorker {
     }
 
     fn maybe_log_stats(&mut self, now: Instant) {
-        if now.duration_since(self.last_stats) >= self.stats_dur {
+        if self.cfg.stats_interval_secs > 0 && now.duration_since(self.last_stats) >= self.stats_dur
+        {
             self.last_stats = now;
             for sess in self.sessions_by_token.values() {
                 if matches!(sess.state, ServerState::Closing(_, _)) {

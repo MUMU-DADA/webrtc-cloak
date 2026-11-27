@@ -7,9 +7,9 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag (e.g. v0.3.1)"
+        description: "Release tag (e.g. v0.7.0)"
         required: true
-        default: "v0.3.1"
+        default: "v0.7.0"
 
 permissions:
   contents: write
@@ -195,9 +195,11 @@ jobs:
           python3 - "$TAG" <<'PYEOF'
           import sys
           tag = sys.argv[1]
-          notes = f"""## WebRTC-Cloak {tag} (Production-Freeze)
+          notes = f"""## WebRTC-Cloak {tag}
 
-          Pure-Rust, zero-C-dependency RFC 7983 WebRTC (ICE STUN + DTLS 1.3/1.2 `dimpl` + Dual-SSRC Chrome `0x90` SRTP + Compound SRTCP) single-port UDP encapsulation research prototype.
+          Pure-Rust, zero-C-dependency RFC 7983 WebRTC (ICE STUN + Chrome/BoringSSL-aligned DTLS 1.3 `dimpl` + Dynamic RFC 8285 Dual-SSRC SRTP + Compound SRTCP) single-port UDP encapsulation and optional zero-loopback embedded proxy research prototype.
+
+          > **Breaking Wire Upgrade vs `v0.6.x`**: `v0.7.0` introduces endpoint-scoped STUN HKDF (`--stun-scope`), per-session DTLS-PFS `mi_key_mig` Ready keepalives, dynamic multi-element `24B/28B` RFC 8285 RTP headers, RFC 3550 `P=1` (`0xB0`) SRTP padding, and default `--dtls-min-version 1.3` (`V13Only`). Upgrade both endpoints together; behind DNAT / port-forwarding, pass matching `--stun-scope <TAG>`.
 
           ### Included Platforms (16 OS / Arch Builds)
           - **Linux Static musl (zero libc/C dependency)**: `x86_64`, `aarch64`, `armv7hf`, `armv7`, `armhf`, `arm`, `armv5te`, `i686`, `riscv64`, `loongarch64`, `powerpc64le`
@@ -205,46 +207,25 @@ jobs:
           - **Windows (MSVC)**: `x86_64`, `arm64`, `i686`
           - **Checksums**: `SHA256SUMS.txt`
 
-          ### Key Highlights
-          - **Native Single-Process Zero-Loopback Relay (`webrtc-cloak relay`, `v0.6.0`, 100% wire-compatible with `v0.4.x`/`v0.5.x`)**:
-            - Fuses ingress `ServerWorker` and egress `BypassWorker` (`--upstream-mode bypass`) or `ClientWorker` (`--upstream-mode cloak`) inside a single thread and single `mio::Poll`, eliminating localhost loopback sockets, redundant packet copies, and cross-process wakeups (macOS Release A/B: `-29% ~ -59%` CPU, `-68% ~ -79%` context switches, `-42% ~ -44%` RSS, `+16.8% ~ +20.3%` peak throughput)
-            - Supports independent ingress/egress PSKs (`--upstream-psk[-file]` / `WEBRTC_CLOAK_UPSTREAM_PSK`), independent cipher suites & DTLS minimum versions, Linux `--udp-batch` on both legs, and full MBB `0xFFFC` + 1-RTT `0xFFFD` resilience
-          - **Native Reverse Tunnel Mode (`webrtc-cloak reverse --entry | --agent`, `v0.6.0`)**:
-            - Zero inbound ports required on the NAT/agent side: `reverse --agent` dials outbound to `reverse --entry`, maintains a 24×7 persistent DTLS 1.3 + Dual-SSRC SRTP tunnel, and multiplexes arbitrary L4 UDP flows over encrypted `0xFFFB` frames (`flow_id: u32`) + `0xFFFA` control frames (`HELLO` / `HELLO_ACK` / `FLOW_CLOSE`)
-            - Preserves pinned per-flow backend source ports on Agent across `0xFFFC` MBB zero-loss rotations and `0xFFFD` 1-RTT blackhole escapes, buffers pre-connect packets on Entry (64 pkts / 3s TTL) for 0-RTT first-packet forwarding, supports IPv4/IPv6 cross-family bridging, `--lane-hunt`, Linux `--udp-batch`, and 0-byte Silent Drop
-          - **Full-Architecture SIMD Optimization & Ground-Truth CPU Backend Diagnostics (`v0.6.0`)**:
-            - Upgraded `poly1305` (`patches/poly1305`) to constant-time 64-bit 3-limb `radix-2^44` (`u64`/`u128`, 9 muls/block) across all 64-bit targets (`aarch64`, non-AVX2 `x86_64`, `riscv64`, `loongarch64`, `powerpc64le`), boosting Apple Silicon end-to-end `ChaCha20-Poly1305` SRTP throughput by `+23.5%` (`3,261 -> 4,027 Mbps`) while keeping `radix-2^26` on 32-bit targets
-            - Enabled runtime CPUID `AVX-512F+VL` 16-block `chacha20` (`--cfg chacha20_avx512`) across x86/x86_64 targets (automatic fallback to AVX2 -> SSE2 -> soft)
-            - Added `i686` hardware detection, grounded `--cipher auto` on actual active crate backends (`aes::hardware_accelerated() && polyval::hardware_accelerated()`, safely routing `windows-arm64` to NEON `ChaCha20-Poly1305`), and exposed live per-primitive backend names in `webrtc-cloak cpu`
-          - **Non-AVX x86/x86_64 Hardware `PCLMULQDQ` Two-Tier Dispatch (`v0.5.1`, 100% wire-compatible with `v0.4.x`/`v0.5.0`)**:
-            - Added a two-tier runtime `PCLMULQDQ` dispatcher (`avx`+`pclmulqdq` VEX Tier 1 and `sse2`+`pclmulqdq` Legacy SSE Tier 2) in `polyval` so x86/x86_64 processors with hardware `AES-NI` + `PCLMULQDQ` but without `AVX` (such as Jasper Lake / Silvermont / Goldmont / Tremont embedded & appliance CPUs) execute full 4-block aggregated hardware `PCLMULQDQ` GHASH instead of falling back to software bit-slicing
-          - **First-Class Out-of-Band ECMP Lane-Hunting Bypass Mode (`webrtc-cloak bypass`, `v0.5.0`)**:
-            - New top-level `bypass` forwarder mode and `bypass --responder` ultra-lightweight STUN responder mode alongside `client` and `server`
-            - Performs multi-candidate authenticated RFC 8445 ICE STUN ECMP lane hunting, continuous RTT/jitter guard, seamless NAT-rebinding port switch with 3s old-port drain overlap, and blackhole auto-escape on the exact same UDP 5-tuple while passing 100% of inner UDP payloads (e.g., QUIC) raw with zero framing overhead, zero double-encryption, and full kernel `UDP_SEGMENT` (UDP GSO) compatibility
-          - **Session Socket Burst-Buffer Sizing (`v0.4.7`, 100% wire-compatible with `v0.4.x`)**:
-            - Raised server per-session `backend_sock` kernel buffer ceiling from `512 KiB` to `4 MiB` and client upstream `up_sock` ceiling from `2 MiB` to `8 MiB` (matching `listen_sock`), eliminating `Udp: RcvbufErrors` during sub-vCPU hypervisor scheduling pauses and multi-hop L4 relay micro-bursts with zero idle RSS increase
-          - **Opt-In Linux UDP Batch I/O (`--udp-batch <0|2..64>`, `v0.4.6`, 100% wire-compatible with `v0.4.x`)**:
-            - Disabled by default (`--udp-batch 0`, zero extra buffer allocation, preserves exact single-packet path and ~2 MiB router footprint)
-            - When enabled on Linux (e.g. `--udp-batch 32`), accelerates all four hot loops (server/client uplink & downlink) with pre-allocated zero-copy `recvmmsg` / `sendmmsg` batching across IPv4 and IPv6, slashing syscall and KVM VM-exit/KPTI overhead by an order of magnitude while keeping strict control-frame ordering and exact byte/packet telemetry; non-Linux platforms safely fall back to single-packet I/O
-          - **Universal Multi-Metric Adaptive Lane Scoring & Continuous Reinforcement (`v0.4.5`, 100% wire-compatible with `v0.4.x`)**:
-            - **Zero-hardcoded-threshold cold-start calibration (`--lane-target-rtt 0`)**: automatically samples across multiple staggered STUN rounds (`>= 2` rounds / up to 3 rounds for background `PreWarm`) with universal early-settle `(best_rtt + 45ms).clamp(80, 550)` to lock onto the global minimum RTT across 5ms–250ms geographies
-            - **Zero-wire-overhead SRTP data-plane packet loss + composite lane score (`0–100`)**: `SrtpCloakCipher::rx_settled_stats()` tracks exact downlink loss across Video+Audio SSRCs while excluding the trailing 24-packet reorder tail (0% false loss under heavy ECMP reordering) and isolating 1-RTT migration gaps via `reset_rx_loss_epoch()`; catches low-RTT throttled/lossy ("fake-good") lanes (`>= 8%` loss) and escapes via 0ms MBB `0xFFFC` handover
-            - **Canary trial confirmation & anti-flap hysteresis**: new/switched lanes confirm after 2 clean windows (`lane_confirmed = true`) or fast-escape on trial failure with 2^k exponential backoff during network-wide congestion; strict target-vs-degrade hysteresis, smoothed EWMA downward reinforcement, and gentle upward baseline relaxation prevent trap-band loops
-            - **Extended telemetry**: exposes `data_loss_pct`, `lane_score`, `lane_best_rtt_ms`, and `lane_confirmed` in `/status` JSON and `/metrics` Prometheus
-          - **Full Dual-Stack IPv6 & Non-Blocking ECMP Fast-Lane Hunting (`v0.4.4`)**:
-            - End-to-end IPv4/IPv6 dual-stack support across `client`, `server`, `selftest`, and `bench_tools` (`RFC 5389 §15.2` IPv6 `XOR-MAPPED-ADDRESS`, 48B IPv6+UDP outer MTU/DTLS accounting, bracketed & raw IPv6 CLI parsing)
-            - Optional `--lane-hunt` non-blocking ECMP lane hunter (`--lane-probes`, `--lane-rounds`, `--lane-target-rtt`, `--lane-cooldown`): staggered multi-candidate startup STUN race with DTLS 1.3 pre-warm, continuous RTT-degradation guard triggering background MBB `0xFFFC` handover (0 backend port change), multi-candidate racing during scheduled rotations & 1-RTT blackhole migrations, and `lane_hunts_total` / `lane_switches_total` telemetry
-            - Fixed Linux `epoll` `mio::Waker` early-drop shutdown race in `TelemetryHub::shutdown()` so `--status-http` tears down deterministically across Linux, macOS, and Windows
-          - **Binary Size, Memory & Thread Footprint Optimization (`v0.4.3`)**:
-            - Aligned all RustCrypto crates (`aes-gcm`/`chacha20poly1305`/`sha1`/`sha2`/`blake2 0.11`, `p256 0.14`, `hmac 0.13`, `getrandom 0.4`) to the `dimpl 0.9.0` generation (37 duplicate crates → **0**) with `fat LTO`, `-C force-unwind-tables=no`, and hybrid `-O3`/`-Os` compilation (`linux-x86_64-musl` `2.78 → 1.95 MiB`, `linux-aarch64-musl` `2.31 → 1.62 MiB`, `macos-arm64` `2.08 → 1.49 MiB`, while accelerating single-core AEAD throughput)
-            - Replaced `tiny_http`, `serde`/`serde_json`, `crc32fast`, and Unix `ctrlc` with a zero-dependency single-thread `mio::Poll` HTTP telemetry server (64 KiB stack, 0 idle wakeups), hand-written RFC 8259 JSON, 64 B nibble-LUT IEEE CRC32, and async-signal-safe `sigaction` + self-pipe shutdown (`--workers 1` now runs in **1 OS thread** pure tunnel / **2 OS threads** with `--status-http`, down from 8)
-            - MTU-sized per-worker UDP buffers, lazy-growing `SeenTxidCache`/`SharedV4Registry`, single-suite `CipherBackend` enum, boxed `Dtls`, and immediate post-handshake key/buffer cleanup
-          - **V4.0 Seamless L4 UDP Carrier & Decoupled Health Telemetry (`v0.4.0`–`v0.4.2`)**:
-            - 1-RTT ICE path migration (`HKDF-SHA256` per-session `ice-pwd-v4` + unpadded `57B 0xFFFD` challenge `<= 1.32x` anti-reflection bound) and timed/byte-budget MBB rotation (`0xFFFC` encrypted atomic `backend_sock` handover, 0 backend source-port change across single/multi-worker)
-            - Strictly off-hot-path outer link telemetry via atomic `--status-file` JSON and read-only `--status-http` (`/status`, `/health`, `/healthz`, `/metrics`)
-          - **RFC 9147 DTLS 1.3 + DTLS 1.2 Auto-Sense (`dimpl 0.9.0`) & Dual-SSRC SRTP/SRTCP**:
-            - Encrypted mutual ECDSA P-256 certificates (`--dtls-min-version 1.3` anti-downgrade lock), dual-SSRC `PT=111` Opus (`<= 50 pps`) + `PT=96` Video with strict `M=1` causality, orthogonal AEAD nonce domains, 2048-packet RFC 6479 replay rings, and 100% 0-byte Silent Drop against active probes
-          - **Dual-mode 12-scenario `webrtc-cloak selftest` suite** (`--server-host` live remote mode with in-band `0xFFFE` SRTP probe echo + `--local` offline fault-injection sandbox + CPU crypto/P-256 benchmarks)
+          ### What's New in `v0.7.0`
+          - **Optional Zero-Loopback Embedded Hy2-Like Proxy (`webrtc-cloak proxy`, Cargo feature `embedded-proxy` default ON; omit via `--no-default-features`)**:
+            - Embeds Sans-IO `quinn-proto` inside the same single-thread `mio::Poll` loop with a custom No-op inner QUIC crypto provider (`tag_len == 0`, zero `rustls`, zero double AEAD; outer WebRTC-Cloak DTLS 1.3 PFS + SRTP provides full encryption), Hysteria 2-style Brutal loss-compensated congestion control (`--up`/`--down`/`--max-up`/`--max-down`), and RFC 9221 unreliable QUIC Datagram UDP forwarding (with automatic fragmentation/reassembly)
+            - Client exposes local SOCKS5 (`TCP CONNECT` + `UDP ASSOCIATE`, default `127.0.0.1:19548`, `--no-socks`) and repeatable L4 `--tcp-forward LOCAL=TARGET`; Server performs non-blocking `mio` TCP/UDP egress with a 2-thread async DNS pool and post-DNS CIDR ACL (`--acl-allow`/`--acl-deny`, private-IP deny by default unless `--allow-private`, `--outbound-ipv4-only`)
+            - Supports both **Forward** (`proxy --client` ↔ `proxy --server`) and **Reverse** (`proxy --client --reverse` listening for outbound `proxy --server --reverse`, NAT-to-NAT zero inbound port on exit) as well as 3-hop `relay --upstream-mode reverse` (`--reverse-listen-port`)
+            - Persistent idle tunnel (`132s` silence = `0` SRTP beacons, `0` DTLS teardowns), automatic orphan TCP/QUIC cleanup on reverse `NewConnection` after peer `SIGKILL`, and bidirectional bulk TCP→QUIC video-frame tail shaping (`~10.4–10.7%` packets in `[450, 1150]B`, `1.6–2.0 Gbps` loopback direct throughput, `0.1–0.4ms` interactive p95, zero multi-stream starvation)
+          - **Chrome/BoringSSL DTLS 1.3 Hardening (`patches/dimpl`)**:
+            - Default `--dtls-min-version 1.3` (`V13Only`, 0% MITM downgrade, 0 plaintext `CN=WebRTC` cert leakage; explicit `auto` retains RFC 8446 §4.1.3 `DOWNGRD\\x01` sentinel)
+            - 0% `HelloRetryRequest` after authenticated ICE STUN (1-RTT direct `ServerHello`), 0% `EXT_PADDING (0x0015)` zero-blob, single consistent per-process MTU, unified Chrome cipher-suite order & `use_srtp` `[0x0007, 0x0008, 0x0001]`, BoringSSL-pinned GREASE extension bookends (`exts[0]` empty, `exts[last]` `0x00`) with interior Fisher-Yates shuffle
+            - RFC 9147 §4.2 randomized inner plaintext padding on `Handshake`, `Ack`, and `Alert` records (eliminates static Flight-4/Flight-5/ACK/`close_notify` lengths), plus coalesced Flight-4 partial-handled tail recovery (`10/10` recover in `274–409ms`), `record_seq == 0` reset guard, and `< 9ms` client poisoned-`ServerHello` fast fail
+          - **Endpoint-Scoped STUN HKDF, Per-Session PFS Keepalives & Regular Nomination**:
+            - `derive_stun_scope_key_for` isolates ports and `cloak` vs `bypass` domains via HKDF-SHA256 (`0/8` cross-port / cross-mode replay; supports `--stun-scope <TAG>` and `--upstream-stun-scope <TAG>` for DNAT)
+            - Tightened STUN freshness to `±10s`, `SeenTxidCache` to `2.5s / 2x` pre-DTLS only (burned on DTLS start), and switched `Ready` RFC 7675 keepalives (req & resp) to per-session DTLS-PFS `mi_key_mig` with fresh `txid` per retry (eliminates post-`SIGKILL` false-64B zombie replies & `>90s` post-close replay; `--keepalive 0` guarded by `dl_deadlock`)
+            - RFC 8445 regular nomination for `--lane-hunt` (Chrome `4:4` Base64 `ufrag`, shared `tie_breaker`, decremented `PRIORITY`, `USE-CANDIDATE=false` probes → `true` winner) backed by `HuntUfragTable` (`4s` same-IP active / `20s` unnominated tombstone / `90s` locked & post-close tombstone); minimal `68B` RFC 5389 STUN for non-DPI `bypass`
+          - **Dynamic Multi-Element SRTP, Quantized 30/60 FPS Video Clock & Async Teardown**:
+            - Dynamic `24B/28B` RFC 8285 RTP headers (`abs-send-time`/`ssrc-audio-level` + `TWCC` + `MID`, graceful `20B` MTU-constrained fallback preserving `1422B` zero-frag under `1488B` PPPoE MTU), `~12.5%` RFC 3550 `P=1` (`0xB0`) padding when `pad_len >= 4`, `0..63B` regular padding, smooth widening for tiny spilled Video ACK packets
+            - 30/60 FPS quantized 90 kHz video clock (`min_dt >= 1320` ticks, `<= 60` pkts/frame, zero mechanical 3-pkt micro-frames), zero `0xFFFE` probes from idle `PreWarm`, symmetric `25–45s` long-trickle SRTCP RR, and asynchronous `SRTCP BYE → DTLS close_notify` teardown (`18..95ms` runtime / `22..65ms` `SIGTERM`)
+          - **Portable 32/64-bit & Full-Arch SIMD**:
+            - Portable `BrutalRateHandle` (lock-free `AtomicU64` on 64-bit, `Mutex<u64>` fallback on 32-bit `armv5te`), alongside `patches/polyval` (AVX + Legacy SSE2 `PCLMULQDQ`), `patches/poly1305` (64-bit `radix-2^44`), x86 `AVX-512` ChaCha20, Linux `--udp-batch`, and `56/56` tests passing (`46/46` with `--no-default-features`)
 
           > **Disclaimer**: Strictly for network protocol learning, academic research, and authorized testing under the MIT License.
           """

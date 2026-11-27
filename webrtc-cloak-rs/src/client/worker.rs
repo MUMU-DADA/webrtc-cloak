@@ -1,6 +1,9 @@
 //! 客户端 mio 工作线程状态容器、主事件循环与遥测上报。
 
-use super::dtls::{graceful_teardown_client, spawn_client_session};
+use super::dtls::{
+    schedule_async_teardown_client, send_client_dtls_close_notify, send_client_srtcp_bye_only,
+    spawn_client_session,
+};
 use super::lane_hunt::{HuntPurpose, LaneHunt};
 use super::{
     cancel_standby_for_client, log, make_udp_socket, record_client_media_bytes, ClientConfig,
@@ -15,8 +18,8 @@ use crate::constants::{
     SRTP_DATA_MIN_WIRE_LEN, TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    detect_cpu_accel, is_shutdown_requested, register_shutdown_poll, stun_hmac_key, CertCache,
-    CpuAccelInfo, DtlsConfigPool,
+    derive_stun_scope_key_for, detect_cpu_accel, is_shutdown_requested, rand_duration_range_ms,
+    register_shutdown_poll, stun_hmac_key, CertCache, CpuAccelInfo, DtlsConfigPool,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use crate::udp_batch::{is_udp_batch_active, UdpRecvBatch, UdpSendBatch};
@@ -34,7 +37,11 @@ pub(crate) struct ClientWorker {
     pub(super) cfg: ClientConfig,
     pub(super) poll: SharedPoll,
     pub(super) listen_sock: Option<MioUdpSocket>,
+    /// True ONLY for `reverse --agent` (sends `0xFFFA REV_OP_HELLO` registration).
     pub(super) reverse_agent: bool,
+    /// True for always-on persistent tunnels (`reverse --agent`, `proxy --client`, `proxy --server --reverse`):
+    /// disables idle-timeout teardown without triggering `reverse_agent` `REV_OP_HELLO` polling.
+    pub(super) persistent_tunnel: bool,
     pub(super) sessions_by_token: HashMap<Token, ClientSession>,
     pub(super) token_by_client: HashMap<SocketAddr, Token>,
     pub(super) standby_by_client: HashMap<SocketAddr, Token>,
@@ -46,11 +53,13 @@ pub(crate) struct ClientWorker {
     pub(super) next_hunt_id: usize,
     pub(super) prewarm_tok: Option<Token>,
     pub(super) next_prewarm_at: Option<Instant>,
+    pub(super) hunt_fail_streak: u8,
     pub(super) best_observed_rtt_ms: Option<f64>,
     pub(super) consecutive_trial_failures: u8,
     pub(super) next_token_id: usize,
     pub(super) cert_cache: CertCache,
     pub(super) dtls_pool: DtlsConfigPool,
+    pub(super) stun_auth_psk: [u8; 32],
     pub(super) stun_mi_key: [u8; 32],
     pub(super) max_inner_pending: usize,
     pub(super) telemetry: Option<Arc<TelemetryHub>>,
@@ -89,7 +98,13 @@ pub(super) fn run_client_worker(
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
 
-    let stun_mi_key = stun_hmac_key(&cfg.psk);
+    let stun_auth_psk = derive_stun_scope_key_for(
+        &cfg.psk,
+        cfg.server_addr.port(),
+        cfg.stun_scope.as_deref(),
+        false,
+    );
+    let stun_mi_key = stun_hmac_key(&stun_auth_psk);
     let max_inner_pending = if cfg.wan_mtu > 0 {
         cfg.wan_mtu
             .saturating_sub(outer_udp_hdr_len(cfg.server_addr) + SRTP_DATA_MIN_WIRE_LEN)
@@ -128,6 +143,7 @@ pub(super) fn run_client_worker(
         poll: shared_poll,
         listen_sock: Some(listen_sock),
         reverse_agent: false,
+        persistent_tunnel: false,
         sessions_by_token: HashMap::new(),
         token_by_client: HashMap::new(),
         standby_by_client: HashMap::new(),
@@ -139,11 +155,13 @@ pub(super) fn run_client_worker(
         next_hunt_id: 1,
         prewarm_tok: None,
         next_prewarm_at: None,
+        hunt_fail_streak: 0,
         best_observed_rtt_ms: None,
         consecutive_trial_failures: 0,
         next_token_id: 1,
         cert_cache: CertCache::new(),
         dtls_pool,
+        stun_auth_psk,
         stun_mi_key,
         max_inner_pending,
         telemetry,
@@ -247,8 +265,25 @@ impl ClientWorker {
         poll: SharedPoll,
         telemetry: Option<Arc<TelemetryHub>>,
     ) -> Self {
+        Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, true)
+    }
+
+    fn new_embedded(
+        worker_id: usize,
+        cfg: ClientConfig,
+        dtls_pool: DtlsConfigPool,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+        prewarm_on_start: bool,
+    ) -> Self {
         super::CLIENT_QUIET.with(|q| q.set(cfg.quiet));
-        let stun_mi_key = stun_hmac_key(&cfg.psk);
+        let stun_auth_psk = derive_stun_scope_key_for(
+            &cfg.psk,
+            cfg.server_addr.port(),
+            cfg.stun_scope.as_deref(),
+            false,
+        );
+        let stun_mi_key = stun_hmac_key(&stun_auth_psk);
         let max_inner_pending = if cfg.wan_mtu > 0 {
             cfg.wan_mtu
                 .saturating_sub(outer_udp_hdr_len(cfg.server_addr) + SRTP_DATA_MIN_WIRE_LEN)
@@ -277,6 +312,7 @@ impl ClientWorker {
             poll,
             listen_sock: None,
             reverse_agent: false,
+            persistent_tunnel: false,
             sessions_by_token: HashMap::new(),
             token_by_client: HashMap::new(),
             standby_by_client: HashMap::new(),
@@ -288,11 +324,13 @@ impl ClientWorker {
             next_hunt_id: 1,
             prewarm_tok: None,
             next_prewarm_at: None,
+            hunt_fail_streak: 0,
             best_observed_rtt_ms: None,
             consecutive_trial_failures: 0,
             next_token_id: 1,
             cert_cache: CertCache::new(),
             dtls_pool,
+            stun_auth_psk,
             stun_mi_key,
             max_inner_pending,
             telemetry,
@@ -315,7 +353,7 @@ impl ClientWorker {
             closed_rx_pkts: 0,
             closed_auth_drops: 0,
         };
-        if worker.cfg.lane_hunt.enabled {
+        if prewarm_on_start && worker.cfg.lane_hunt.enabled {
             let _ = worker.start_lane_hunt(HuntPurpose::PreWarm, now, VecDeque::new(), 0);
         }
         worker
@@ -360,6 +398,7 @@ impl ClientWorker {
             let (sp, sb) = tx_batch.flush_connected(&sess.upstream);
             if sp > 0 {
                 sess.tx_pkts += sp as u64;
+                sess.tx_pkts_since_dl_rx = sess.tx_pkts_since_dl_rx.saturating_add(sp as u64);
                 sess.tx_bytes += sb;
                 record_client_media_bytes(sess, &self.cfg, self.ka_base_ms, now, sb);
             }
@@ -427,18 +466,9 @@ impl ClientWorker {
         telemetry: Option<Arc<TelemetryHub>>,
         tunnel_key: SocketAddr,
     ) -> Self {
-        let mut w = Self::new_for_relay(worker_id, cfg, dtls_pool, poll, telemetry);
+        let mut w = Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, false);
         w.reverse_agent = true;
-        // Cancel generic PreWarm hunt from new_for_relay and immediately dial the primary reverse tunnel.
-        for (_, mut hunt) in w.lane_hunts.drain() {
-            for mut c in hunt.candidates.drain(..) {
-                let _ = w.poll.registry().deregister(&mut c.sock);
-            }
-            if let Some(mut fb) = hunt.best_fallback.take() {
-                let _ = w.poll.registry().deregister(&mut fb.sock);
-            }
-        }
-        w.hunt_tok_to_id.clear();
+        w.persistent_tunnel = true;
         w.ensure_reverse_tunnel(tunnel_key, Instant::now());
         w
     }
@@ -513,6 +543,90 @@ impl ClientWorker {
             return;
         }
         self.ensure_reverse_tunnel(tunnel_key, now);
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    pub(crate) fn new_for_proxy_client(
+        worker_id: usize,
+        cfg: ClientConfig,
+        dtls_pool: DtlsConfigPool,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+        tunnel_key: SocketAddr,
+    ) -> Self {
+        let mut w = Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, false);
+        w.persistent_tunnel = true;
+        w.ensure_persistent_tunnel(tunnel_key, Instant::now());
+        w
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    pub(crate) fn ensure_persistent_tunnel(&mut self, tunnel_key: SocketAddr, now: Instant) {
+        self.ensure_reverse_tunnel(tunnel_key, now);
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_event_proxy(
+        &mut self,
+        tok: Token,
+        engine: &mut crate::proxy::ProxyClientEngine,
+        now: Instant,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        if self.old_path_drains.contains_key(&tok) {
+            self.handle_old_path_drain_with(
+                tok,
+                now,
+                graceful_reconnects,
+                Some(ClientDownlink::Proxy(engine)),
+            );
+        } else if !self.hunt_tok_to_id.is_empty() && self.hunt_tok_to_id.contains_key(&tok) {
+            self.handle_hunt_readable(tok, now, standby_ready);
+        } else {
+            self.handle_upstream_readable_with(
+                tok,
+                now,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+                Some(ClientDownlink::Proxy(engine)),
+            );
+        }
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn handle_event_proxy_server(
+        &mut self,
+        tok: Token,
+        engine: &mut crate::proxy::ProxyServerEngine,
+        now: Instant,
+        standby_ready: &mut Vec<(Token, SocketAddr)>,
+        standby_promoted: &mut Vec<(Token, SocketAddr)>,
+        graceful_reconnects: &mut Vec<(Token, SocketAddr)>,
+    ) {
+        if self.old_path_drains.contains_key(&tok) {
+            self.handle_old_path_drain_with(
+                tok,
+                now,
+                graceful_reconnects,
+                Some(ClientDownlink::ProxyServer(engine)),
+            );
+        } else if !self.hunt_tok_to_id.is_empty() && self.hunt_tok_to_id.contains_key(&tok) {
+            self.handle_hunt_readable(tok, now, standby_ready);
+        } else {
+            self.handle_upstream_readable_with(
+                tok,
+                now,
+                standby_ready,
+                standby_promoted,
+                graceful_reconnects,
+                Some(ClientDownlink::ProxyServer(engine)),
+            );
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -611,6 +725,7 @@ impl ClientWorker {
             if let Some(wn) = cipher.wrap_reverse_data_into(flow_id, plaintext, &mut self.wbuf) {
                 if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
                     sess.tx_pkts += 1;
+                    sess.tx_pkts_since_dl_rx = sess.tx_pkts_since_dl_rx.saturating_add(1);
                     sess.tx_bytes += plaintext.len() as u64;
                     sent = plaintext.len() as u64;
                 }
@@ -634,7 +749,7 @@ impl ClientWorker {
         );
         if let Some(tok) = self.token_by_client.remove(&client_addr) {
             if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
-                graceful_teardown_client(sess, &mut self.dtls_buf);
+                schedule_async_teardown_client(sess, now);
                 sess.state =
                     HandshakeState::Closing(now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS));
             }
@@ -677,11 +792,22 @@ impl ClientWorker {
                     | HandshakeState::HandoverWait
                     | HandshakeState::DrainingBeforeBye(_)
             ) {
-                graceful_teardown_client(sess, &mut self.dtls_buf);
+                send_client_srtcp_bye_only(sess);
                 torn += 1;
             }
         }
         if torn > 0 {
+            std::thread::sleep(rand_duration_range_ms(22, 65));
+            for sess in self.sessions_by_token.values_mut() {
+                if matches!(
+                    sess.state,
+                    HandshakeState::Ready
+                        | HandshakeState::HandoverWait
+                        | HandshakeState::DrainingBeforeBye(_)
+                ) {
+                    send_client_dtls_close_notify(sess, &mut self.dtls_buf);
+                }
+            }
             log(
                 self.worker_id,
                 &format!(
@@ -770,7 +896,8 @@ impl ClientWorker {
     }
 
     fn maybe_log_stats(&mut self, now: Instant) {
-        if now.duration_since(self.last_stats) >= self.stats_dur {
+        if self.cfg.stats_interval_secs > 0 && now.duration_since(self.last_stats) >= self.stats_dur
+        {
             self.last_stats = now;
             for sess in self.sessions_by_token.values() {
                 if matches!(

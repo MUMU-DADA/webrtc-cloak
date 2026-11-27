@@ -6,7 +6,9 @@ use crate::constants::{
     CTRL_FRAME_BUF_LEN, DEFAULT_IDLE_TIMEOUT_SECS, DEFAULT_ROTATE_COOLDOWN_SECS,
     STUN_BINDING_REQUEST, UDP_RECV_BUF_LEN,
 };
-use crate::protocol::{demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind};
+use crate::protocol::{
+    demux_rfc7983, derive_stun_scope_key, parse_stun, CipherPref, DtlsMinVersion, PacketKind,
+};
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use std::cmp::Ordering as CmpOrdering;
@@ -209,6 +211,7 @@ impl ImpairmentProxy {
         let stop_flag = Arc::clone(&stop);
 
         let handle = thread::spawn(move || {
+            let scoped_psk = derive_stun_scope_key(&psk, server_port);
             let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port);
             let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
             let mut heap: BinaryHeap<DelayedPkt> = BinaryHeap::new();
@@ -232,14 +235,14 @@ impl ImpairmentProxy {
 
                     let kind = demux_rfc7983(pkt);
                     let parsed_stun = if kind == PacketKind::Stun {
-                        parse_stun(pkt, &psk)
+                        parse_stun(pkt, &scoped_psk)
                     } else {
                         None
                     };
                     let is_ka_stun = parsed_stun
                         .as_ref()
                         .map(|p| {
-                            p.authenticated
+                            p.fingerprint_ok
                                 && p.msg_type == STUN_BINDING_REQUEST
                                 && !p.use_candidate
                         })
@@ -282,10 +285,11 @@ impl ImpairmentProxy {
                             if let Some(ref p) = parsed_stun {
                                 match bh_first_ka_txid {
                                     None => bh_first_ka_txid = Some(p.txid),
-                                    Some(prev) if prev == p.txid => {
+                                    Some(_) => {
+                                        // v0.7 mints a fresh txid on keepalive retries to close
+                                        // the Ready-state replay oracle.
                                         st.lock().unwrap().blackhole_ka_retransmits += 1;
                                     }
-                                    _ => {}
                                 }
                             }
                         }
@@ -302,9 +306,8 @@ impl ImpairmentProxy {
                                 st.lock().unwrap().dropped_by_proxy += 1;
                                 continue;
                             }
-                            if dropped_ka_txid == Some(p.txid) {
+                            if dropped_ka_txid.take().is_some() {
                                 st.lock().unwrap().same_txid_ka_retransmits += 1;
-                                dropped_ka_txid = None;
                             }
                         }
                     }
@@ -517,9 +520,10 @@ impl ManagedServer {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
                 backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
                 psk,
+                stun_scope: None,
                 cipher_pref,
                 dtls_required: true,
-                dtls_min_version: DtlsMinVersion::Auto,
+                dtls_min_version: DtlsMinVersion::V13Only,
                 workers: 1,
                 max_sessions: 128,
                 wan_mtu,
@@ -565,6 +569,7 @@ pub(super) struct ManagedClient {
 impl ManagedClient {
     pub(super) fn start(
         target_port: u16,
+        stun_scope_port: u16,
         psk: Vec<u8>,
         cipher_pref: CipherPref,
         wan_mtu: usize,
@@ -574,14 +579,16 @@ impl ManagedClient {
         let port = reserve_free_port();
         let stop = Arc::new(AtomicBool::new(false));
         let stop_c = Arc::clone(&stop);
+        let stun_scope = (target_port != stun_scope_port).then(|| stun_scope_port.to_string());
         let handle = thread::spawn(move || {
             let _ = run_client(ClientConfig {
                 listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port),
                 server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), target_port),
                 psk,
+                stun_scope,
                 cipher_pref,
                 dtls_decoy: true,
-                dtls_min_version: DtlsMinVersion::Auto,
+                dtls_min_version: DtlsMinVersion::V13Only,
                 rotate_interval_secs: 0,
                 rotate_max_bytes: 0,
                 rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,

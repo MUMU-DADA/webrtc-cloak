@@ -90,6 +90,8 @@ pub const fn normalize_udp_batch(n: usize) -> usize {
 }
 /// `mio::Poll` 中主监听套接字的保留事件令牌。
 pub const LISTEN_TOKEN: Token = Token(0);
+/// `mio::Poll` 中反向中继第二监听套接字（`relay --upstream-mode reverse`）的保留事件令牌。
+pub const REVERSE_LISTEN_TOKEN: Token = Token(usize::MAX - 4);
 /// `mio::Poll` 中用于 Unix 信号自管道无锁优雅退出唤醒的保留令牌。
 #[cfg(unix)]
 pub const SHUTDOWN_PIPE_TOKEN: Token = Token(usize::MAX - 1);
@@ -215,6 +217,9 @@ pub const SRTCP_IDLE_MAX_MS: u64 = 6500;
 pub const SRTCP_TRICKLE_MIN_MS: u64 = 20_000;
 /// 细流退避期 SRTCP 最大发送间隔（毫秒）。
 pub const SRTCP_TRICKLE_MAX_MS: u64 = 40_000;
+/// 超过 60s 长静默细流期的双端对称极低频 SRTCP RR 最小/最大间隔（毫秒），消除“STUN 活但 RTCP 绝对为 0”异常。
+pub const SRTCP_LONG_TRICKLE_MIN_MS: u64 = 25_000;
+pub const SRTCP_LONG_TRICKLE_MAX_MS: u64 = 45_000;
 
 /// 工作线程无活跃会话时的 `mio::Poll` 最大阻塞等待时间（秒）。
 pub const WORKER_IDLE_POLL_SECS: u64 = 5;

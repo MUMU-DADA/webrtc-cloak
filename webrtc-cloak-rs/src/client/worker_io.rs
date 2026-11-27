@@ -1,6 +1,6 @@
 //! 客户端本地应用收发、旧路径静默引流、远端解封装与 MBB 切换提交。
 
-use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_session};
+use super::dtls::{drain_client_dtls, schedule_async_teardown_client, spawn_client_session};
 use super::lane_hunt::{client_outer_hdr_len, HuntPurpose};
 use super::worker::ClientWorker;
 use super::{
@@ -67,6 +67,16 @@ fn deliver_client_downlink_single(
             ingress.deliver_downlink_single(client_addr, payload, now)
         }
         Some(ClientDownlink::ReverseAgent(_)) => false,
+        #[cfg(feature = "embedded-proxy")]
+        Some(ClientDownlink::Proxy(engine)) => {
+            engine.on_tunnel_datagram(payload);
+            true
+        }
+        #[cfg(feature = "embedded-proxy")]
+        Some(ClientDownlink::ProxyServer(engine)) => {
+            engine.on_tunnel_datagram(client_addr, payload);
+            true
+        }
         None => listen_sock
             .as_ref()
             .is_some_and(|sock| sock.send_to(payload, client_addr).is_ok()),
@@ -100,6 +110,11 @@ fn flush_client_downlink_batch(
             tx_batch.clear();
             (0, 0)
         }
+        #[cfg(feature = "embedded-proxy")]
+        Some(ClientDownlink::Proxy(_)) | Some(ClientDownlink::ProxyServer(_)) => {
+            tx_batch.clear();
+            (0, 0)
+        }
         None => {
             if let Some(ref sock) = listen_sock {
                 tx_batch.flush_to(sock)
@@ -112,6 +127,8 @@ fn flush_client_downlink_batch(
     if sp > 0 {
         sess.rx_pkts += sp as u64;
         sess.rx_bytes += sb;
+        sess.last_auth_dl_rx = now;
+        sess.tx_pkts_since_dl_rx = 0;
         record_client_media_bytes(sess, cfg, ka_base_ms, now, sb);
     }
 }
@@ -133,6 +150,7 @@ fn flush_client_uplink_batch(
             let (sp, sb) = tx_batch.flush_connected(&sess.upstream);
             if sp > 0 {
                 sess.tx_pkts += sp as u64;
+                sess.tx_pkts_since_dl_rx = sess.tx_pkts_since_dl_rx.saturating_add(sp as u64);
                 sess.tx_bytes += sb;
                 record_client_media_bytes(sess, cfg, ka_base_ms, now, sb);
             }
@@ -388,6 +406,7 @@ impl ClientWorker {
                     if let Some(wn) = cipher.wrap_into(&self.rbuf[..n], &mut self.wbuf) {
                         if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
                             sess.tx_pkts += 1;
+                            sess.tx_pkts_since_dl_rx = sess.tx_pkts_since_dl_rx.saturating_add(1);
                             sess.tx_bytes += n as u64;
                             sent_ok = true;
                         }
@@ -433,6 +452,8 @@ impl ClientWorker {
                                         ) {
                                             owner.rx_pkts += 1;
                                             owner.rx_bytes += pn as u64;
+                                            owner.last_auth_dl_rx = now;
+                                            owner.tx_pkts_since_dl_rx = 0;
                                         }
                                     }
                                     Some(SrtpFrame::ReverseData { flow_id, len }) => {
@@ -446,6 +467,8 @@ impl ClientWorker {
                                             ) {
                                                 owner.rx_pkts += 1;
                                                 owner.rx_bytes += len as u64;
+                                                owner.last_auth_dl_rx = now;
+                                                owner.tx_pkts_since_dl_rx = 0;
                                             }
                                         }
                                     }
@@ -464,7 +487,10 @@ impl ClientWorker {
                                 if let Some(ref mut cipher) = owner.cipher {
                                     if let Some(true) = cipher.verify_srtcp(pkt) {
                                         owner.srtcp_rx += 1;
+                                        owner.last_auth_dl_rx = now;
+                                        owner.tx_pkts_since_dl_rx = 0;
                                         let active_recently = self.reverse_agent
+                                            || self.persistent_tunnel
                                             || now.duration_since(owner.last_data_active)
                                                 <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                         owner.state = HandshakeState::Closing(
@@ -634,6 +660,39 @@ impl ClientWorker {
                                         tx_batch.commit_slot(wn, pn as u64, Some(peer_addr));
                                     }
                                 }
+                            } else if let Some(down) = downlink.as_mut() {
+                                #[cfg(feature = "embedded-proxy")]
+                                let delivered_proxy = match down {
+                                    ClientDownlink::Proxy(engine) => {
+                                        engine.on_tunnel_datagram(&self.wbuf[..pn]);
+                                        true
+                                    }
+                                    ClientDownlink::ProxyServer(engine) => {
+                                        engine.on_tunnel_datagram(client_addr, &self.wbuf[..pn]);
+                                        true
+                                    }
+                                    _ => false,
+                                };
+                                #[cfg(not(feature = "embedded-proxy"))]
+                                let delivered_proxy = {
+                                    let _ = down;
+                                    false
+                                };
+                                if delivered_proxy {
+                                    if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                        sess.rx_pkts += 1;
+                                        sess.rx_bytes += pn as u64;
+                                        sess.last_auth_dl_rx = now;
+                                        sess.tx_pkts_since_dl_rx = 0;
+                                        record_client_media_bytes(
+                                            sess,
+                                            &self.cfg,
+                                            self.ka_base_ms,
+                                            now,
+                                            pn as u64,
+                                        );
+                                    }
+                                }
                             } else if downlink.is_none() {
                                 tx_batch.commit_slot(pn, pn as u64, Some(client_addr));
                             }
@@ -656,6 +715,8 @@ impl ClientWorker {
                                 if delivered {
                                     sess.rx_pkts += 1;
                                     sess.rx_bytes += len as u64;
+                                    sess.last_auth_dl_rx = now;
+                                    sess.tx_pkts_since_dl_rx = 0;
                                     record_client_media_bytes(
                                         sess,
                                         &self.cfg,
@@ -828,7 +889,7 @@ impl ClientWorker {
                 if sess.state == HandshakeState::Migrating {
                     // V4 1-RTT ICE migration STUN Success signed with per-session mi_key_mig
                     if let Some(mk) = sess.mi_key_mig {
-                        if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &mk) {
+                        if let Some(parsed) = parse_stun_with_key(pkt, &self.stun_auth_psk, &mk) {
                             if parsed.authenticated
                                 && parsed.msg_type == STUN_BINDING_SUCCESS
                                 && sess.mig_txid == Some(parsed.txid)
@@ -841,7 +902,12 @@ impl ClientWorker {
                     sess.auth_drops += 1;
                     return;
                 }
-                if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key) {
+                let verify_key = if sess.state == HandshakeState::Ready {
+                    sess.mi_key_mig.as_ref().unwrap_or(&self.stun_mi_key)
+                } else {
+                    &self.stun_mi_key
+                };
+                if let Some(parsed) = parse_stun_with_key(pkt, &self.stun_auth_psk, verify_key) {
                     if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
                         if sess.state == HandshakeState::StunWait && parsed.txid == sess.stun_txid {
                             let rtt_ms = sess.created_at.elapsed().as_secs_f64() * 1000.0;
@@ -854,7 +920,7 @@ impl ClientWorker {
                             }
                             let uname = sess.ice.username();
                             let (stun_key, s_c2s, s_s2c) =
-                                derive_stun_material(&self.cfg.psk, &sess.stun_txid, &uname);
+                                derive_stun_material(&self.stun_auth_psk, &sess.stun_txid, &uname);
                             sess.stun_key = Some(stun_key);
                             sess.ssrc_c2s = s_c2s;
                             sess.ssrc_s2c = s_s2c;
@@ -910,6 +976,8 @@ impl ClientWorker {
                                 sess.ready_at = Some(now);
                                 sess.last_data_active = now;
                                 sess.last_active_burst = now;
+                                sess.last_auth_dl_rx = now;
+                                sess.tx_pkts_since_dl_rx = 0;
                                 sess.rate_15s = RollingByteWindow::new(
                                     now,
                                     Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
@@ -983,6 +1051,8 @@ impl ClientWorker {
                                 th.record_stun_ok(ka_rtt, ka_retries_before_ok, parsed.xor_mapped);
                             }
                             sess.keepalives_ok += 1;
+                            sess.last_auth_dl_rx = now;
+                            sess.tx_pkts_since_dl_rx = 0;
                             sess.ka_txid = None;
                             sess.ka_pkt.clear();
                             sess.ka_retries = 0;
@@ -1101,6 +1171,7 @@ impl ClientWorker {
                     candidate_sh,
                 ) {
                     let active_recently = self.reverse_agent
+                        || self.persistent_tunnel
                         || now.duration_since(sess.last_data_active)
                             <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                     sess.state =
@@ -1123,8 +1194,11 @@ impl ClientWorker {
                     if let Some(ref mut cipher) = sess.cipher {
                         if let Some(has_bye) = cipher.verify_srtcp(pkt) {
                             sess.srtcp_rx += 1;
+                            sess.last_auth_dl_rx = now;
+                            sess.tx_pkts_since_dl_rx = 0;
                             if has_bye {
                                 let active_recently = self.reverse_agent
+                                    || self.persistent_tunnel
                                     || now.duration_since(sess.last_data_active)
                                         <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                 sess.state = HandshakeState::Closing(
@@ -1171,6 +1245,8 @@ impl ClientWorker {
                             ) {
                                 sess.rx_pkts += 1;
                                 sess.rx_bytes += pn as u64;
+                                sess.last_auth_dl_rx = now;
+                                sess.tx_pkts_since_dl_rx = 0;
                                 rx_ok_bytes = pn as u64;
                             }
                         }
@@ -1185,6 +1261,8 @@ impl ClientWorker {
                                 if mux.deliver_to_backend(flow_id, &self.wbuf[..len], now) {
                                     sess.rx_pkts += 1;
                                     sess.rx_bytes += len as u64;
+                                    sess.last_auth_dl_rx = now;
+                                    sess.tx_pkts_since_dl_rx = 0;
                                     rx_ok_bytes = len as u64;
                                 }
                             }
@@ -1234,6 +1312,8 @@ impl ClientWorker {
         let Some(sess) = self.sessions_by_token.get_mut(&tok) else {
             return;
         };
+        sess.last_auth_dl_rx = now;
+        sess.tx_pkts_since_dl_rx = 0;
         match frame {
             SrtpFrame::PathChallenge(pn) => {
                 sess.rx_pkts += 1;
@@ -1438,7 +1518,7 @@ impl ClientWorker {
                     self.standby_by_client.remove(&client_addr);
                 }
                 if let Some(orphan) = self.sessions_by_token.get_mut(&new_tok) {
-                    graceful_teardown_client(orphan, &mut self.dtls_buf);
+                    schedule_async_teardown_client(orphan, now);
                     orphan.state = HandshakeState::Closing(
                         now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                     );
@@ -1499,7 +1579,7 @@ impl ClientWorker {
             if !owner_is_live_primary {
                 // Orphaned standby (owning primary already rotated, restarted, or closed) -> tear down cleanly!
                 if let Some(orphan) = self.sessions_by_token.get_mut(&new_tok) {
-                    graceful_teardown_client(orphan, &mut self.dtls_buf);
+                    schedule_async_teardown_client(orphan, now);
                     orphan.state = HandshakeState::Closing(
                         now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                     );

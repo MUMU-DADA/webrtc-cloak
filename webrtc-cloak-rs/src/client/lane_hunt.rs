@@ -1,11 +1,11 @@
 //! 非阻塞多候选 ECMP 信道抽卡探测、启动预热与持续 RTT 优选守护引擎。
 
-use super::dtls::{build_session_after_stun, graceful_teardown_client, spawn_client_session};
+use super::dtls::{build_session_after_stun, schedule_async_teardown_client, spawn_client_session};
 use super::worker::ClientWorker;
 use super::{
     alloc_token, cancel_standby_for_client, log, make_udp_socket, record_client_media_bytes,
-    schedule_mbb_timers, HandshakeState, OldPathDrain, CLIENT_MIG_ECHO_INTERVAL_MS, KA_MAX_RETRIES,
-    KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS,
+    schedule_mbb_timers, HandshakeState, OldPathDrain, PendingReconnect,
+    CLIENT_MIG_ECHO_INTERVAL_MS, KA_MAX_RETRIES, KA_MAX_RETRIES_DAMPED, MAX_DRAINING_SESSIONS,
 };
 use crate::constants::{
     outer_udp_hdr_len, unspecified_addr_for, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS,
@@ -14,8 +14,8 @@ use crate::constants::{
     WORKER_MIN_FAST_WAIT_MS,
 };
 use crate::protocol::{
-    build_ice_stun_request, build_ice_stun_request_with_key, demux_rfc7983, jitter_duration_ms,
-    make_fresh_stun_txid, parse_stun_with_key, PacketKind, SessionIceParams, SrtpFrame,
+    build_ice_stun_request_with_key, demux_rfc7983, jitter_duration_ms, make_fresh_stun_txid,
+    parse_stun_with_key, rand_duration_range_ms, PacketKind, SessionIceParams, SrtpFrame,
 };
 use mio::net::UdpSocket as MioUdpSocket;
 use mio::{Interest, Token};
@@ -43,8 +43,11 @@ pub const MAX_LANE_DEGRADE_COOLDOWN_SECS: u64 = 3600;
 
 /// 服务端单会话每秒允许的 1-RTT 路径挑战配额上限（与 `server::MAX_CHALLENGES_PER_SEC` 对齐）。
 const MIGRATE_1RTT_MAX_PROBES: usize = 4;
-/// 同轮候选之间的自然发包错峰间隔（毫秒，模拟 ICE trickle 节奏避免瞬时微突发）。
-const LANE_PROBE_STAGGER_MS: u64 = 15;
+/// 同轮候选之间的随机发包错峰区间（毫秒，打破固定 15ms 等差阶梯发包指纹）。
+const LANE_PROBE_STAGGER_MIN_MS: u64 = 16;
+const LANE_PROBE_STAGGER_MAX_MS: u64 = 58;
+/// 失联/黑洞期抽卡失败指数退避上限（毫秒，防止演变为高频 UDP 端口扫描风暴）。
+const HUNT_FAIL_BACKOFF_MAX_MS: u64 = 60_000;
 /// 自动阈值冷启动校准默认最少采样轮次（跨越至少 2 轮取全局最低 RTT，彻底避免硬编码 ms 阈值与单轮抽黑）。
 const LANE_COLD_CALIBRATION_ROUNDS: usize = 2;
 /// 冷启动自动校准期望的最小独立端口探测总数（`probes` 较小时自动补足到最多 3 轮）。
@@ -272,6 +275,7 @@ impl HuntCandidate {
 pub(super) struct LaneHunt {
     pub(super) id: usize,
     pub(super) purpose: HuntPurpose,
+    pub(super) shared_ice: SessionIceParams,
     pub(super) cold_calibration: bool,
     pub(super) round: usize,
     pub(super) max_rounds: usize,
@@ -332,16 +336,6 @@ impl ClientWorker {
                 self.best_observed_rtt_ms = Some(prev * 0.85 + observed_best_ms * 0.15);
             }
         }
-    }
-
-    /// 计算预热会话为保活服务端 `idle_timeout` 而发送微小 `0xFFFE` 探测包的间隔。
-    pub(super) fn prewarm_keepwarm_interval(&self) -> Duration {
-        let secs = if self.cfg.idle_timeout_secs == 0 {
-            60
-        } else {
-            ((self.cfg.idle_timeout_secs * 2) / 3).clamp(15, 90)
-        };
-        Duration::from_secs(secs)
     }
 
     /// 是否存在正在为 `client_addr` 执行的 `NewPrimary` 抽卡任务（用于在抽卡期间缓存应用包）。
@@ -464,6 +458,7 @@ impl ClientWorker {
         let mut hunt = LaneHunt {
             id,
             purpose,
+            shared_ice: SessionIceParams::generate(),
             cold_calibration,
             round: 0,
             max_rounds,
@@ -511,7 +506,7 @@ impl ClientWorker {
         } else {
             LANE_COLD_ROUND_TIMEOUT_MS
         };
-        let stagger_ms = (probe_count.saturating_sub(1) as u64) * LANE_PROBE_STAGGER_MS;
+        let stagger_ms = (probe_count.saturating_sub(1) as u64) * LANE_PROBE_STAGGER_MAX_MS;
         Duration::from_millis(base_ms + stagger_ms)
     }
 
@@ -536,6 +531,7 @@ impl ClientWorker {
 
         let bind_any = unspecified_addr_for(self.cfg.server_addr);
         let mut spawned = Vec::with_capacity(count);
+        let mut cum_stagger = Duration::ZERO;
         for i in 0..count {
             let mut sock =
                 match make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB) {
@@ -554,15 +550,29 @@ impl ClientWorker {
             }
             let (ice, txid, stun_pkt) = if let Some((ref sess_ice, mk)) = mig_params {
                 let (pkt, txid) =
-                    build_ice_stun_request_with_key(&self.cfg.psk, &mk, sess_ice, None, true);
+                    build_ice_stun_request_with_key(&self.stun_auth_psk, &mk, sess_ice, None, true);
                 (sess_ice.clone(), txid, pkt)
             } else {
-                let ice = SessionIceParams::generate();
-                let txid = make_fresh_stun_txid(&self.cfg.psk);
-                let (pkt, _) = build_ice_stun_request(&self.cfg.psk, &ice, Some(txid), true);
+                // v0.7 RFC 8445 regular ICE connectivity checks: all parallel probes in the
+                // hunt share the exact same `ufrag` & `tie_breaker` with `USE-CANDIDATE = false`.
+                // Only the winning candidate sends `USE-CANDIDATE = true` to nominate & lock ufrag.
+                let cand_idx = ((hunt.round * MAX_LANE_PROBES) + i).min(u16::MAX as usize) as u16;
+                let ice = hunt.shared_ice.with_candidate_index(cand_idx);
+                let txid = make_fresh_stun_txid(&self.stun_auth_psk);
+                let (pkt, _) = build_ice_stun_request_with_key(
+                    &self.stun_auth_psk,
+                    &self.stun_mi_key,
+                    &ice,
+                    Some(txid),
+                    false,
+                );
                 (ice, txid, pkt)
             };
-            let send_at = now + Duration::from_millis((i as u64) * LANE_PROBE_STAGGER_MS);
+            if i > 0 {
+                cum_stagger +=
+                    rand_duration_range_ms(LANE_PROBE_STAGGER_MIN_MS, LANE_PROBE_STAGGER_MAX_MS);
+            }
+            let send_at = now + cum_stagger;
             let sent_at = if i == 0 {
                 let _ = sock.send(&stun_pkt);
                 Some(now)
@@ -769,7 +779,8 @@ impl ClientWorker {
                             } else {
                                 &self.stun_mi_key
                             };
-                            if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, key) {
+                            if let Some(parsed) = parse_stun_with_key(pkt, &self.stun_auth_psk, key)
+                            {
                                 if parsed.authenticated
                                     && parsed.msg_type == STUN_BINDING_SUCCESS
                                     && parsed.txid == cand.txid
@@ -965,6 +976,7 @@ impl ClientWorker {
             return;
         };
         self.hunt_tok_to_id.remove(&winner.tok);
+        self.hunt_fail_streak = 0;
         let winner_rtt = winner.rtt_ms.unwrap_or(0.0);
 
         match hunt.purpose {
@@ -996,14 +1008,12 @@ impl ClientWorker {
                     );
                 }
                 let dummy_client = unspecified_addr_for(self.cfg.listen_addr);
-                let keepwarm_dur = self.prewarm_keepwarm_interval();
                 if let Some(tok) = self.promote_stun_winner(
                     winner,
                     dummy_client,
                     KA_MAX_RETRIES,
                     None,
                     true,
-                    Some(now + keepwarm_dur),
                     VecDeque::new(),
                     0,
                     now,
@@ -1047,7 +1057,6 @@ impl ClientWorker {
                     ka_max_retries,
                     None,
                     false,
-                    None,
                     hunt.pending,
                     hunt.pending_bytes,
                     now,
@@ -1199,7 +1208,6 @@ impl ClientWorker {
                     KA_MAX_RETRIES,
                     Some(primary_tok),
                     false,
-                    None,
                     VecDeque::new(),
                     0,
                     now,
@@ -1236,7 +1244,6 @@ impl ClientWorker {
         ka_max_retries: u8,
         standby_for_primary: Option<Token>,
         is_prewarm: bool,
-        next_keepwarm_at: Option<Instant>,
         pending: VecDeque<Vec<u8>>,
         pending_bytes: usize,
         now: Instant,
@@ -1248,38 +1255,26 @@ impl ClientWorker {
             th.record_stun_ok(rtt_ms, 0, winner.mapped_addr);
         }
         let initial_lane_cooldown = self.trial_cooldown_dur();
-        let mut sess = build_session_after_stun(
+        let sess = build_session_after_stun(
             self.worker_id,
             client_addr,
             winner.sock,
             winner.local_port,
             winner.ice,
-            winner.txid,
             rtt_ms,
             winner.mapped_addr,
             &self.cfg,
-            &mut self.cert_cache,
-            &self.dtls_pool,
-            &self.cpu,
             now,
             self.retry_dur,
             self.ka_base_ms,
             ka_max_retries,
             standby_for_primary,
             is_prewarm,
-            next_keepwarm_at,
             initial_lane_cooldown,
             pending,
             pending_bytes,
-            &mut self.dtls_buf,
-            &mut self.wbuf,
         );
-        if sess.state == HandshakeState::Ready && sess.is_standby {
-            standby_ready.push((tok, client_addr));
-        }
-        if sess.state == HandshakeState::Ready && !sess.is_prewarm {
-            schedule_mbb_timers(&mut sess, &self.cfg, now);
-        }
+        let _ = standby_ready;
         self.sessions_by_token.insert(tok, sess);
         Some(tok)
     }
@@ -1451,15 +1446,33 @@ impl ClientWorker {
     }
 
     fn handle_hunt_empty(&mut self, hunt: LaneHunt, now: Instant) {
+        let streak = self.hunt_fail_streak;
+        self.hunt_fail_streak = self.hunt_fail_streak.saturating_add(1).min(8);
+        let backoff_ms = PREWARM_FAIL_RETRY_MS
+            .saturating_mul(1u64 << (streak.min(5) as u32))
+            .min(HUNT_FAIL_BACKOFF_MAX_MS);
         match hunt.purpose {
             HuntPurpose::PreWarm => {
-                self.next_prewarm_at = Some(now + Duration::from_millis(PREWARM_FAIL_RETRY_MS));
+                self.next_prewarm_at = Some(now + jitter_duration_ms(backoff_ms));
             }
             HuntPurpose::NewPrimary {
                 client_addr,
                 ka_max_retries,
             } => {
-                // 回退至常规单路会话建立，避免极端丢包下丢失首包队列
+                if streak >= 1 {
+                    // Consecutive 0-reply hunts (server outage / firewall blackhole): back off
+                    // exponentially instead of blasting 4+ new ports every second!
+                    self.pending_reconnects.insert(
+                        client_addr,
+                        PendingReconnect {
+                            at: now + jitter_duration_ms(backoff_ms),
+                            pending: hunt.pending,
+                            pending_bytes: hunt.pending_bytes,
+                        },
+                    );
+                    return;
+                }
+                // First failure: fall back immediately to single-socket handshake so brief loss recovers fast.
                 if !self.token_by_client.contains_key(&client_addr) {
                     if let Some(tok) = spawn_client_session(
                         self.worker_id,
@@ -1524,6 +1537,17 @@ impl ClientWorker {
                     &mut self.dtls_buf,
                     now,
                 );
+                if streak >= 1 {
+                    self.pending_reconnects.insert(
+                        client_addr,
+                        PendingReconnect {
+                            at: now + jitter_duration_ms(backoff_ms),
+                            pending: carried_pending,
+                            pending_bytes: carried_bytes,
+                        },
+                    );
+                    return;
+                }
                 let ka_retries = if recently_rotated {
                     KA_MAX_RETRIES_DAMPED
                 } else {
@@ -1565,7 +1589,6 @@ impl ClientWorker {
         if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
             sess.is_prewarm = false;
             sess.client_addr = client_addr;
-            sess.next_keepwarm_at = None;
             sess.last_data_active = now;
             sess.last_active_burst = now;
             // 领用后开启真实负载试用确认窗，避免空载 STUN 表现掩盖满载丢包/限速
@@ -1758,7 +1781,7 @@ impl ClientWorker {
                                 needed_streak
                             ),
                         );
-                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                        schedule_async_teardown_client(sess, now);
                         sess.state = HandshakeState::Closing(
                             now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                         );

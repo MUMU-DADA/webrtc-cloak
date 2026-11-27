@@ -15,7 +15,7 @@ pub use self::lane_hunt::{
 };
 pub(crate) use self::worker::ClientWorker;
 
-use self::dtls::graceful_teardown_client;
+use self::dtls::schedule_async_teardown_client;
 use self::worker::run_client_worker;
 use crate::constants::{
     outer_udp_hdr_len, CLOSING_DRAIN_MS, POST_BYE_CLOSING_DRAIN_MS, TRICKLE_RATE_15S_BYTES,
@@ -77,6 +77,8 @@ pub struct ClientConfig {
     pub listen_addr: SocketAddr,
     pub server_addr: SocketAddr,
     pub psk: Vec<u8>,
+    /// Optional explicit v0.7 STUN scope tag (`--stun-scope`); defaults to `server_addr.port()`.
+    pub stun_scope: Option<String>,
     pub cipher_pref: CipherPref,
     pub dtls_decoy: bool,
     pub dtls_min_version: DtlsMinVersion,
@@ -104,6 +106,10 @@ pub struct ClientConfig {
 pub(crate) enum ClientDownlink<'a> {
     Relay(&'a mut crate::server::ServerWorker),
     ReverseAgent(&'a mut crate::reverse::ReverseAgentMux),
+    #[cfg(feature = "embedded-proxy")]
+    Proxy(&'a mut crate::proxy::ProxyClientEngine),
+    #[cfg(feature = "embedded-proxy")]
+    ProxyServer(&'a mut crate::proxy::ProxyServerEngine),
 }
 
 /// 反向隧道 Agent 本地后端套接字保留令牌基址（与 `ClientWorker` 自身会话令牌严格隔离）。
@@ -166,15 +172,19 @@ pub(super) struct ClientSession {
     pub(super) ready_at: Option<Instant>,
     pub(super) last_data_active: Instant,
     pub(super) last_active_burst: Instant,
+    /// Last time an authenticated downlink SRTP, SRTCP, or session-key STUN reply arrived.
+    pub(super) last_auth_dl_rx: Instant,
+    /// Uplink data SRTP packets sent since `last_auth_dl_rx` (catches post-crash/blackhole deadlocks).
+    pub(super) tx_pkts_since_dl_rx: u64,
     pub(super) next_retry_at: Instant,
     pub(super) next_keepalive_at: Instant,
     pub(super) next_srtcp_at: Instant,
+    pub(super) pending_close_notify_at: Option<Instant>,
     pub(super) dtls_next_timeout: Option<Instant>,
     pub(super) is_standby: bool,
     pub(super) is_prewarm: bool,
     pub(super) rev_registered: bool,
     pub(super) next_rev_hello_at: Option<Instant>,
-    pub(super) next_keepwarm_at: Option<Instant>,
     pub(super) lane_rtt_ewma_ms: Option<f64>,
     pub(super) lane_rtt_last_ms: Option<f64>,
     pub(super) lane_jitter_ms: f64,
@@ -309,7 +319,7 @@ pub(super) fn cancel_standby_for_client(
     client_addr: SocketAddr,
     standby_by_client: &mut HashMap<SocketAddr, Token>,
     sessions_by_token: &mut HashMap<Token, ClientSession>,
-    dtls_buf: &mut Vec<u8>,
+    _dtls_buf: &mut Vec<u8>,
     now: Instant,
 ) {
     if let Some(st_tok) = standby_by_client.remove(&client_addr) {
@@ -323,7 +333,7 @@ pub(super) fn cancel_standby_for_client(
                     | HandshakeState::HandoverWait
                     | HandshakeState::DrainingBeforeBye(_)
             ) {
-                graceful_teardown_client(st_sess, dtls_buf);
+                schedule_async_teardown_client(st_sess, now);
                 st_sess.state =
                     HandshakeState::Closing(now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS));
             } else if !matches!(st_sess.state, HandshakeState::Closing(_)) {

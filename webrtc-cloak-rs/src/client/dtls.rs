@@ -11,10 +11,9 @@ use crate::constants::{
     DTLS_PLAINTEXT_HDR_LEN, SOCK_BUF_8MIB, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
-    build_ice_stun_request, combine_session_key, derive_ice_migration_key, derive_stun_material,
-    jitter_duration_ms, make_fresh_stun_txid, new_dtls_instance, rand_duration_range_ms,
-    resolve_srtp_suite, CertCache, CpuAccelInfo, DtlsConfigPool, RollingByteWindow,
-    SessionIceParams, SrtpCloakCipher,
+    build_ice_stun_request, combine_session_key, derive_ice_migration_key,
+    derive_stun_scope_key_for, jitter_duration_ms, make_fresh_stun_txid, rand_duration_range_ms,
+    resolve_srtp_suite, RollingByteWindow, SessionIceParams, SrtpCloakCipher,
 };
 use dimpl::{Output as DtlsOutput, ProtocolVersion};
 use mio::net::UdpSocket as MioUdpSocket;
@@ -114,12 +113,14 @@ pub(super) fn drain_client_dtls(
             let mut c =
                 SrtpCloakCipher::new(&final_key, sess.ssrc_c2s, sess.ssrc_s2c, true, chosen);
             c.set_wan_mtu_for(cfg.wan_mtu, client_outer_hdr_len(cfg.server_addr));
-            c.set_dual_ssrc(is_dtls13);
+            c.set_dual_ssrc(true);
             sess.cipher = Some(c);
             sess.state = HandshakeState::Ready;
             sess.ready_at = Some(now);
             sess.last_data_active = now;
             sess.last_active_burst = now;
+            sess.last_auth_dl_rx = now;
+            sess.tx_pkts_since_dl_rx = 0;
             sess.rate_15s =
                 RollingByteWindow::new(now, Duration::from_secs(TRICKLE_WINDOW_15S_SECS));
             sess.rate_5min =
@@ -157,12 +158,11 @@ pub(super) fn drain_client_dtls(
             log(
                 worker_id,
                 &format!(
-                    "DTLS {} (dimpl mutual-cert PFS) OK -> READY{} up_sport={} cipher={} dual_ssrc={} total_hs={:.2}ms flushed={}",
+                    "DTLS {} (dimpl mutual-cert PFS) OK -> READY{} up_sport={} cipher={} dual_ssrc=true total_hs={:.2}ms flushed={}",
                     if is_dtls13 { "1.3" } else { "1.2" },
                     if sess.is_prewarm { " (pre-warmed)" } else { "" },
                     sess.local_port,
                     chosen.name(),
-                    is_dtls13,
                     total_ms,
                     flushed
                 ),
@@ -173,7 +173,7 @@ pub(super) fn drain_client_dtls(
     peer_closed
 }
 
-pub(super) fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
+pub(super) fn send_client_srtcp_bye_only(sess: &mut ClientSession) {
     if matches!(
         sess.state,
         HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::DrainingBeforeBye(_)
@@ -184,20 +184,52 @@ pub(super) fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut 
             let bye = cipher.build_srtcp(has_rx, is_sender, true);
             let _ = sess.upstream.send(&bye);
         }
-        if let Some(ref mut dtls) = sess.dtls {
-            if dtls.close().is_ok() {
-                loop {
-                    match dtls.poll_output(dtls_buf) {
-                        DtlsOutput::Packet(p) => {
-                            let _ = sess.upstream.send(p);
-                        }
-                        DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
-                        DtlsOutput::Timeout(_) => break,
-                        _ => {}
+    }
+}
+
+pub(super) fn send_client_dtls_close_notify(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
+    if let Some(ref mut dtls) = sess.dtls {
+        if dtls.close().is_ok() {
+            loop {
+                match dtls.poll_output(dtls_buf) {
+                    DtlsOutput::Packet(p) => {
+                        let _ = sess.upstream.send(p);
                     }
+                    DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
+                    DtlsOutput::Timeout(_) => break,
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+/// 异步优雅关闭：立即发出加密 `SRTCP BYE`，并在 18..=95ms 随机间隔后由 `Closing` 定时器发出 `DTLS close_notify`，
+/// 彻底消除 `0.02ms` 紧贴双连发指纹。返回调度延迟以便 `process_timers` 立刻收紧 poll 等待时间。
+pub(super) fn schedule_async_teardown_client(
+    sess: &mut ClientSession,
+    now: Instant,
+) -> Option<Duration> {
+    if matches!(
+        sess.state,
+        HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::DrainingBeforeBye(_)
+    ) {
+        send_client_srtcp_bye_only(sess);
+        let delay = rand_duration_range_ms(18, 95);
+        sess.pending_close_notify_at = Some(now + delay);
+        Some(delay)
+    } else {
+        None
+    }
+}
+
+pub(super) fn graceful_teardown_client(sess: &mut ClientSession, dtls_buf: &mut Vec<u8>) {
+    if matches!(
+        sess.state,
+        HandshakeState::Ready | HandshakeState::HandoverWait | HandshakeState::DrainingBeforeBye(_)
+    ) {
+        send_client_srtcp_bye_only(sess);
+        send_client_dtls_close_notify(sess, dtls_buf);
     }
 }
 
@@ -307,8 +339,14 @@ pub(super) fn spawn_client_session(
         return None;
     }
     let ice = SessionIceParams::generate();
-    let stun_txid = make_fresh_stun_txid(&cfg.psk);
-    let (stun_pkt, _) = build_ice_stun_request(&cfg.psk, &ice, Some(stun_txid), true);
+    let stun_auth_psk = derive_stun_scope_key_for(
+        &cfg.psk,
+        cfg.server_addr.port(),
+        cfg.stun_scope.as_deref(),
+        false,
+    );
+    let stun_txid = make_fresh_stun_txid(&stun_auth_psk);
+    let (stun_pkt, _) = build_ice_stun_request(&stun_auth_psk, &ice, Some(stun_txid), true);
     let _ = up.send(&stun_pkt);
 
     log(
@@ -335,16 +373,18 @@ pub(super) fn spawn_client_session(
         ready_at: None,
         last_data_active: now,
         last_active_burst: now,
+        last_auth_dl_rx: now,
+        tx_pkts_since_dl_rx: 0,
         next_retry_at: now + retry_dur,
         next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
         next_srtcp_at: now
             + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS),
+        pending_close_notify_at: None,
         dtls_next_timeout: None,
         is_standby,
         is_prewarm: false,
         rev_registered: false,
         next_rev_hello_at: None,
-        next_keepwarm_at: None,
         lane_rtt_ewma_ms: None,
         lane_rtt_last_ms: None,
         lane_jitter_ms: 0.0,
@@ -416,7 +456,9 @@ pub(super) fn spawn_client_session(
     Some(tok)
 }
 
-/// 基于已完成 STUN 抽卡测速的优胜候选套接字直接推进至 DTLS 握手（或无 DTLS 时直达 Ready），零额外 STUN RTT。
+/// v0.7 RFC 8445 常规提名：对已完成并发连通性测速（`USE-CANDIDATE=false`）的优胜候选端口，
+/// 使用相同会话级 `ufrag` 与 `tie_breaker` 仅向优胜端口发出 1 次 `USE-CANDIDATE=true` 提名，
+/// 由服务端即时锁定该 `ufrag`（作废全部未中选兄弟探针防重放）后直接进入 1-RTT DTLS 1.3。
 #[allow(clippy::too_many_arguments)]
 pub(super) fn build_session_after_stun(
     worker_id: usize,
@@ -424,62 +466,67 @@ pub(super) fn build_session_after_stun(
     upstream: MioUdpSocket,
     local_port: u16,
     ice: SessionIceParams,
-    stun_txid: [u8; 12],
     rtt_ms: f64,
     mapped_addr: Option<SocketAddr>,
     cfg: &ClientConfig,
-    cert_cache: &mut CertCache,
-    dtls_pool: &DtlsConfigPool,
-    cpu: &CpuAccelInfo,
     now: Instant,
     retry_dur: Duration,
     ka_base_ms: u64,
     ka_max_retries: u8,
     standby_for_primary: Option<Token>,
     is_prewarm: bool,
-    next_keepwarm_at: Option<Instant>,
     initial_lane_cooldown: Duration,
     pending: VecDeque<Vec<u8>>,
     pending_bytes: usize,
-    dtls_buf: &mut Vec<u8>,
-    wbuf: &mut [u8],
 ) -> ClientSession {
-    let uname = ice.username();
-    let (stun_key, s_c2s, s_s2c) = derive_stun_material(&cfg.psk, &stun_txid, &uname);
+    let stun_auth_psk = derive_stun_scope_key_for(
+        &cfg.psk,
+        cfg.server_addr.port(),
+        cfg.stun_scope.as_deref(),
+        false,
+    );
+    let nom_txid = make_fresh_stun_txid(&stun_auth_psk);
+    let (nom_pkt, _) = build_ice_stun_request(&stun_auth_psk, &ice, Some(nom_txid), true);
+    let _ = upstream.send(&nom_pkt);
     let mapped_s = mapped_addr
         .map(|a| a.to_string())
         .unwrap_or_else(|| "unknown".into());
     log(
         worker_id,
         &format!(
-            "ICE STUN OK (hunted) up_sport={} rtt={:.2}ms mapped={} ssrc_tx=0x{:08x} ssrc_rx=0x{:08x}",
-            local_port, rtt_ms, mapped_s, s_c2s, s_s2c
+            "ICE STUN nominate (hunted) up_sport={} rtt={:.2}ms mapped={} ufrag={}",
+            local_port,
+            rtt_ms,
+            mapped_s,
+            ice.username()
         ),
     );
     let is_standby = standby_for_primary.is_some();
 
-    let mut sess = ClientSession {
+    ClientSession {
         client_addr,
         upstream,
         local_port,
         ice,
-        stun_txid,
-        cached_initial_stun: Vec::new(),
+        stun_txid: nom_txid,
+        cached_initial_stun: nom_pkt,
         state: HandshakeState::StunWait,
         created_at: now,
         ready_at: None,
         last_data_active: now,
         last_active_burst: now,
+        last_auth_dl_rx: now,
+        tx_pkts_since_dl_rx: 0,
         next_retry_at: now + retry_dur,
         next_keepalive_at: now + jitter_duration_ms(ka_base_ms),
         next_srtcp_at: now
             + rand_duration_range_ms(CLIENT_SRTCP_INIT_MIN_MS, CLIENT_SRTCP_INIT_MAX_MS),
+        pending_close_notify_at: None,
         dtls_next_timeout: None,
         is_standby,
         is_prewarm,
         rev_registered: false,
         next_rev_hello_at: None,
-        next_keepwarm_at,
         lane_rtt_ewma_ms: Some(rtt_ms),
         lane_rtt_last_ms: Some(rtt_ms),
         lane_jitter_ms: 0.0,
@@ -517,11 +564,11 @@ pub(super) fn build_session_after_stun(
         handover_payload: None,
         handover_retries: 0,
         handover_retry_at: None,
-        stun_key: Some(stun_key),
+        stun_key: None,
         session_key: None,
         mi_key_mig: None,
-        ssrc_c2s: s_c2s,
-        ssrc_s2c: s_s2c,
+        ssrc_c2s: 0,
+        ssrc_s2c: 0,
         dtls: None,
         dtls_resets: 0,
         pending_sh_suite: None,
@@ -541,61 +588,5 @@ pub(super) fn build_session_after_stun(
         srtcp_tx: 0,
         srtcp_rx: 0,
         auth_drops: 0,
-    };
-
-    if cfg.dtls_decoy {
-        let cert = cert_cache.get(now);
-        let mut dtls = Box::new(new_dtls_instance(
-            cfg.dtls_min_version,
-            dtls_pool.pick(),
-            cert,
-            now,
-        ));
-        dtls.set_active(true);
-        let _ = dtls.handle_timeout(now);
-        sess.dtls = Some(dtls);
-        sess.state = HandshakeState::DtlsHandshake;
-        let _ = drain_client_dtls(worker_id, &mut sess, dtls_buf, wbuf, cfg, cpu, now, None);
-    } else {
-        let chosen = resolve_srtp_suite(cfg.cipher_pref, None, cpu, true);
-        let final_key = combine_session_key(&stun_key, None);
-        sess.session_key = Some(final_key);
-        sess.mi_key_mig = Some(derive_ice_migration_key(&final_key));
-        sess.active_cipher = Some(chosen);
-        let mut c = SrtpCloakCipher::new(&final_key, s_c2s, s_s2c, true, chosen);
-        c.set_wan_mtu_for(cfg.wan_mtu, client_outer_hdr_len(cfg.server_addr));
-        sess.cipher = Some(c);
-        sess.state = HandshakeState::Ready;
-        sess.ready_at = Some(now);
-        sess.rx_pkts_at_last_rtcp = sess.rx_pkts;
-        let mut flushed = 0usize;
-        let mut flushed_bytes = 0u64;
-        sess.pending_bytes = 0;
-        if let Some(ref mut cipher) = sess.cipher {
-            while let Some(raw) = sess.pending.pop_front() {
-                if let Some(wn) = cipher.wrap_into(&raw, wbuf) {
-                    if sess.upstream.send(&wbuf[..wn]).is_ok() {
-                        sess.tx_pkts += 1;
-                        sess.tx_bytes += raw.len() as u64;
-                        flushed_bytes = flushed_bytes.saturating_add(raw.len() as u64);
-                        flushed += 1;
-                    }
-                }
-            }
-        }
-        if flushed_bytes > 0 {
-            record_client_media_bytes(&mut sess, cfg, ka_base_ms, now, flushed_bytes);
-        }
-        log(
-            worker_id,
-            &format!(
-                "session READY{} (hunted, no-dtls) up_sport={} cipher={} flushed={}",
-                if is_prewarm { " (pre-warmed)" } else { "" },
-                local_port,
-                chosen.name(),
-                flushed
-            ),
-        );
     }
-    sess
 }

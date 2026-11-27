@@ -169,13 +169,23 @@ pub(super) fn deliver_uplink_payload(
             match sess.backend {
                 BackendPipe::Owned(ref sock) => return sock.send(payload).is_ok(),
                 BackendPipe::RelayFlow(flow_addr) => {
-                    return matches!(hook, Some(ServerHook::Relay(_)))
-                        && match hook {
-                            Some(ServerHook::Relay(e)) => {
-                                e.send_uplink_single(flow_addr, payload, now)
-                            }
-                            _ => false,
-                        };
+                    return match hook {
+                        Some(ServerHook::Relay(e)) => e.send_uplink_single(flow_addr, payload, now),
+                        Some(ServerHook::RelayReversePeer(peer)) => peer
+                            .active_ready_relay_flow()
+                            .is_some_and(|dst| peer.deliver_downlink_single(dst, payload, now)),
+                        #[cfg(feature = "embedded-proxy")]
+                        Some(ServerHook::Proxy(engine)) => {
+                            engine.on_tunnel_datagram(flow_addr, payload);
+                            true
+                        }
+                        #[cfg(feature = "embedded-proxy")]
+                        Some(ServerHook::ProxyClient(engine)) => {
+                            engine.on_tunnel_datagram(payload);
+                            true
+                        }
+                        _ => false,
+                    };
                 }
                 BackendPipe::ReverseAgent => return false,
                 BackendPipe::ForwardLocal {
@@ -308,7 +318,7 @@ pub(super) fn drain_server_dtls(
         sess.negotiated_cipher = Some(chosen);
         let mut c = SrtpCloakCipher::new(&final_key, sess.ssrc_s2c, sess.ssrc_c2s, false, chosen);
         c.set_wan_mtu_for(cfg.wan_mtu, outer_udp_hdr_len(cfg.listen_addr));
-        c.set_dual_ssrc(is_dtls13);
+        c.set_dual_ssrc(true);
         sess.cipher = Some(c);
         sess.state = ServerState::Ready;
         sess.ready_at = Some(now);
@@ -324,11 +334,10 @@ pub(super) fn drain_server_dtls(
         log(
             worker_id,
             &format!(
-                "DTLS {} (dimpl mutual-cert PFS) OK -> READY peer={} cipher={} dual_ssrc={} backend_sport={} early_srtp={}",
+                "DTLS {} (dimpl mutual-cert PFS) OK -> READY peer={} cipher={} dual_ssrc=true backend_sport={} early_srtp={}",
                 if is_dtls13 { "1.3" } else { "1.2" },
                 sess.peer_addr,
                 chosen.name(),
-                is_dtls13,
                 sess.backend_lport,
                 sess.early_srtp.len()
             ),
@@ -338,10 +347,9 @@ pub(super) fn drain_server_dtls(
     (peer_closed, became_ready)
 }
 
-pub(super) fn graceful_teardown_server(
+pub(super) fn send_server_srtcp_bye_only(
     sess: &mut ServerSession,
     listen_sock: &MioUdpSocket,
-    dtls_buf: &mut Vec<u8>,
     audit: &mut WireAudit,
 ) {
     if sess.state == ServerState::Ready {
@@ -352,21 +360,41 @@ pub(super) fn graceful_teardown_server(
             audit.record(1, &bye);
             let _ = listen_sock.send_to(&bye, sess.peer_addr);
         }
-        if let Some(ref mut dtls) = sess.dtls {
-            if dtls.close().is_ok() {
-                loop {
-                    match dtls.poll_output(dtls_buf) {
-                        DtlsOutput::Packet(p) => {
-                            audit.record(1, p);
-                            let _ = listen_sock.send_to(p, sess.peer_addr);
-                        }
-                        DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
-                        DtlsOutput::Timeout(_) => break,
-                        _ => {}
+    }
+}
+
+pub(super) fn send_server_dtls_close_notify(
+    sess: &mut ServerSession,
+    listen_sock: &MioUdpSocket,
+    dtls_buf: &mut Vec<u8>,
+    audit: &mut WireAudit,
+) {
+    if let Some(ref mut dtls) = sess.dtls {
+        if dtls.close().is_ok() {
+            loop {
+                match dtls.poll_output(dtls_buf) {
+                    DtlsOutput::Packet(p) => {
+                        audit.record(1, p);
+                        let _ = listen_sock.send_to(p, sess.peer_addr);
                     }
+                    DtlsOutput::BufferTooSmall { needed } => dtls_buf.resize(needed, 0),
+                    DtlsOutput::Timeout(_) => break,
+                    _ => {}
                 }
             }
         }
+    }
+}
+
+pub(super) fn graceful_teardown_server(
+    sess: &mut ServerSession,
+    listen_sock: &MioUdpSocket,
+    dtls_buf: &mut Vec<u8>,
+    audit: &mut WireAudit,
+) {
+    if sess.state == ServerState::Ready {
+        send_server_srtcp_bye_only(sess, listen_sock, audit);
+        send_server_dtls_close_notify(sess, listen_sock, dtls_buf, audit);
     }
 }
 

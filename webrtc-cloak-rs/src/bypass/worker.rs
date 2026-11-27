@@ -11,8 +11,9 @@ use crate::constants::{
     WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    build_ice_stun_request, is_shutdown_requested, jitter_duration_ms, make_fresh_stun_txid,
-    parse_stun, register_shutdown_poll, SessionIceParams,
+    build_bypass_stun_request, derive_stun_scope_key_for, is_shutdown_requested,
+    jitter_duration_ms, lognormal_duration_ms, make_fresh_stun_txid, parse_stun,
+    rand_duration_range_ms, register_shutdown_poll, SessionIceParams,
 };
 use crate::telemetry::{TelemetryHub, WorkerSnapshot};
 use crate::udp_batch::{is_udp_batch_active, UdpRecvBatch, UdpSendBatch};
@@ -30,8 +31,9 @@ const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const BYPASS_OLD_PORT_DRAIN_SECS: u64 = 3;
 /// 单工作线程最多同时保留的排空旧套接字数上限。
 const MAX_OLD_DRAINS: usize = 16;
-/// 同轮抽卡候选端口之间的错峰发包间隔（毫秒）。
-const HUNT_STAGGER_MS: u64 = 15;
+/// 同轮抽卡候选端口之间的随机错峰发包区间（毫秒，打破固定 15ms 等差扫描指纹）。
+const HUNT_STAGGER_MIN_MS: u64 = 16;
+const HUNT_STAGGER_MAX_MS: u64 = 58;
 /// 冷启动自动校准最少跨越轮数（取全局最低 RTT 建立跨地域基线）。
 const COLD_CALIBRATION_ROUNDS: usize = 2;
 /// 冷启动自动校准期望最小总候选数。
@@ -45,9 +47,10 @@ const ROUND_TIMEOUT_MAX_MS: u64 = 1200;
 const EARLY_SETTLE_MARGIN_MS: f64 = 45.0;
 const EARLY_SETTLE_MIN_MS: u64 = 80;
 const EARLY_SETTLE_MAX_MS: u64 = 500;
-/// 预热失败重试间隔（毫秒）。
+/// 预热失败初始重试间隔与指数退避上限（毫秒，防止失联期高频扫端口）。
 const PREWARM_RETRY_MS: u64 = 3_000;
-/// 预热就绪套接字空闲保鲜探针间隔（毫秒）。
+const PREWARM_RETRY_MAX_MS: u64 = 60_000;
+/// 预热就绪套接字空闲保鲜探针基准间隔（毫秒，发送时施加 ±20% 抖动）。
 const PREWARM_KEEP_FRESH_MS: u64 = 20_000;
 /// 常规 STUN 同意探针最大重传次数（共 3 次尝试）。
 const KA_MAX_RETRIES: u8 = 2;
@@ -111,6 +114,7 @@ struct HuntCandidate {
 
 struct BypassHunt {
     reason: HuntReason,
+    shared_ice: SessionIceParams,
     round: usize,
     max_rounds: usize,
     min_rounds_before_accept: usize,
@@ -149,7 +153,6 @@ struct OldDrain {
 #[derive(Clone)]
 struct PendingKa {
     txid: [u8; 12],
-    pkt: Vec<u8>,
     first_sent: Instant,
     retry_at: Instant,
     retries: u8,
@@ -187,6 +190,8 @@ struct BypassSession {
 pub(crate) struct BypassWorker {
     worker_id: usize,
     cfg: BypassConfig,
+    stun_auth_psk: [u8; 32],
+    last_local_traffic: Instant,
     poll: SharedPoll,
     listen_sock: Option<MioUdpSocket>,
     report_telemetry_periodic: bool,
@@ -198,6 +203,7 @@ pub(crate) struct BypassWorker {
     hunt_tok_set: HashMap<Token, usize>,
     prewarm: Option<PrewarmedSocket>,
     next_prewarm_at: Option<Instant>,
+    hunt_fail_streak: u8,
     best_observed_rtt_ms: Option<f64>,
     trial_fail_streak: u8,
     next_token_id: usize,
@@ -262,9 +268,17 @@ pub(super) fn run_bypass_worker(
         .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
     let now = Instant::now();
     let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
+    let stun_auth_psk = derive_stun_scope_key_for(
+        &cfg.psk,
+        cfg.server_addr.port(),
+        cfg.stun_scope.as_deref(),
+        true,
+    );
 
     let mut w = BypassWorker {
         worker_id,
+        stun_auth_psk,
+        last_local_traffic: now,
         ka_base_ms: cfg.keepalive_secs.max(1) * 1000,
         idle_dur: Duration::from_secs(cfg.idle_timeout_secs),
         stats_dur: Duration::from_secs(cfg.stats_interval_secs),
@@ -282,6 +296,7 @@ pub(super) fn run_bypass_worker(
         hunt_tok_set: HashMap::with_capacity(8),
         prewarm: None,
         next_prewarm_at: cfg.lane_hunt.enabled.then_some(now),
+        hunt_fail_streak: 0,
         best_observed_rtt_ms: None,
         trial_fail_streak: 0,
         next_token_id: 1,
@@ -389,7 +404,7 @@ impl BypassWorker {
         if self.cfg.rotate_interval_secs == 0 {
             None
         } else {
-            Some(now + jitter_duration_ms(self.cfg.rotate_interval_secs * 1000))
+            Some(now + lognormal_duration_ms(self.cfg.rotate_interval_secs * 1000))
         }
     }
 
@@ -417,6 +432,7 @@ impl BypassWorker {
         };
         let mut hunt = BypassHunt {
             reason,
+            shared_ice: SessionIceParams::generate(),
             round: 0,
             max_rounds,
             min_rounds_before_accept: min_rounds,
@@ -435,6 +451,7 @@ impl BypassWorker {
     fn spawn_hunt_round(&mut self, hunt: &mut BypassHunt, probes: usize, now: Instant) -> bool {
         self.clear_hunt_candidates(&mut hunt.candidates);
         let bind_any = unspecified_addr_for(self.cfg.server_addr);
+        let mut cum_stagger = Duration::ZERO;
         for i in 0..probes {
             let Ok(mut sock) =
                 make_udp_socket(bind_any, Some(self.cfg.server_addr), false, SOCK_BUF_8MIB)
@@ -451,10 +468,15 @@ impl BypassWorker {
             {
                 continue;
             }
-            let ice = SessionIceParams::generate();
-            let txid = make_fresh_stun_txid(&self.cfg.psk);
-            let (stun_pkt, _) = build_ice_stun_request(&self.cfg.psk, &ice, Some(txid), true);
-            let send_at = now + Duration::from_millis((i as u64) * HUNT_STAGGER_MS);
+            let ice = hunt
+                .shared_ice
+                .with_candidate_index((hunt.total_probed + i) as u16);
+            let txid = make_fresh_stun_txid(&self.stun_auth_psk);
+            let (stun_pkt, _) = build_bypass_stun_request(&self.stun_auth_psk, &ice, Some(txid));
+            if i > 0 {
+                cum_stagger += rand_duration_range_ms(HUNT_STAGGER_MIN_MS, HUNT_STAGGER_MAX_MS);
+            }
+            let send_at = now + cum_stagger;
             let sent_at = if i == 0 {
                 let _ = sock.send(&stun_pkt);
                 Some(now)
@@ -481,7 +503,8 @@ impl BypassWorker {
         }
         hunt.round += 1;
         hunt.total_probed += hunt.candidates.len();
-        let stagger = Duration::from_millis(((probes as u64).saturating_sub(1)) * HUNT_STAGGER_MS);
+        let stagger =
+            Duration::from_millis(((probes as u64).saturating_sub(1)) * HUNT_STAGGER_MAX_MS);
         hunt.round_deadline = now + self.round_timeout() + stagger;
         hunt.early_settle_at = None;
         true
@@ -675,6 +698,7 @@ impl BypassWorker {
                             let Some(tok) = self.ensure_session(client_addr, now) else {
                                 continue;
                             };
+                            self.last_local_traffic = now;
                             if cur_tok != Some(tok) {
                                 if let Some(prev_t) = cur_tok.take() {
                                     self.flush_tx_batch_to_session(prev_t, &mut tx_b, now);
@@ -717,6 +741,7 @@ impl BypassWorker {
             let Some(tok) = self.ensure_session(client_addr, now) else {
                 continue;
             };
+            self.last_local_traffic = now;
             if let Some(sess) = self.sessions_by_tok.get_mut(&tok) {
                 if sess.upstream.send(&self.rbuf[..n]).is_ok() {
                     sess.tx_pkts = sess.tx_pkts.saturating_add(1);
@@ -906,7 +931,7 @@ impl BypassWorker {
     }
 
     fn process_session_stun(&mut self, tok: Token, pkt: &[u8], now: Instant) {
-        let Some(parsed) = parse_stun(pkt, &self.cfg.psk) else {
+        let Some(parsed) = parse_stun(pkt, &self.stun_auth_psk) else {
             if let Some(s) = self.sessions_by_tok.get_mut(&tok) {
                 s.auth_drops = s.auth_drops.saturating_add(1);
             }
@@ -1049,14 +1074,14 @@ impl BypassWorker {
             if !is_stun_wire_packet(&self.rbuf[..n]) {
                 continue;
             }
-            if let Some(parsed) = parse_stun(&self.rbuf[..n], &self.cfg.psk) {
+            if let Some(parsed) = parse_stun(&self.rbuf[..n], &self.stun_auth_psk) {
                 if parsed.authenticated && parsed.msg_type == STUN_BINDING_SUCCESS {
                     if let Some((txid, sent_at)) = pw.pending_txid {
                         if parsed.txid == txid {
                             pw.rtt_ms =
                                 now.saturating_duration_since(sent_at).as_secs_f64() * 1000.0;
                             pw.pending_txid = None;
-                            pw.next_refresh_at = now + Duration::from_millis(PREWARM_KEEP_FRESH_MS);
+                            pw.next_refresh_at = now + jitter_duration_ms(PREWARM_KEEP_FRESH_MS);
                             if parsed.xor_mapped.is_some() {
                                 pw.mapped_nat = parsed.xor_mapped;
                             }
@@ -1080,7 +1105,7 @@ impl BypassWorker {
                             if !is_stun_wire_packet(&self.rbuf[..n]) {
                                 continue;
                             }
-                            if let Some(parsed) = parse_stun(&self.rbuf[..n], &self.cfg.psk) {
+                            if let Some(parsed) = parse_stun(&self.rbuf[..n], &self.stun_auth_psk) {
                                 if parsed.authenticated
                                     && parsed.msg_type == STUN_BINDING_SUCCESS
                                     && parsed.txid == c.txid
@@ -1210,11 +1235,17 @@ impl BypassWorker {
 
         let Some((mut win_sock, win_tok, win_port, win_ice, win_rtt, win_mapped)) = hunt.best
         else {
+            let streak = self.hunt_fail_streak;
+            self.hunt_fail_streak = self.hunt_fail_streak.saturating_add(1).min(8);
+            let backoff_ms = PREWARM_RETRY_MS
+                .saturating_mul(1u64 << (streak.min(5) as u32))
+                .min(PREWARM_RETRY_MAX_MS);
             if matches!(hunt.reason, HuntReason::PreWarm) {
-                self.next_prewarm_at = Some(now + Duration::from_millis(PREWARM_RETRY_MS));
+                self.next_prewarm_at = Some(now + jitter_duration_ms(backoff_ms));
             }
             return;
         };
+        self.hunt_fail_streak = 0;
 
         if let Some(ref th) = self.telemetry {
             th.record_stun_ok(win_rtt, 0, win_mapped);
@@ -1247,7 +1278,7 @@ impl BypassWorker {
                     ice: win_ice,
                     rtt_ms: win_rtt,
                     mapped_nat: win_mapped,
-                    next_refresh_at: now + Duration::from_millis(PREWARM_KEEP_FRESH_MS),
+                    next_refresh_at: now + jitter_duration_ms(PREWARM_KEEP_FRESH_MS),
                     pending_txid: None,
                 });
             }
@@ -1405,18 +1436,30 @@ impl BypassWorker {
             }
         }
 
-        // 3. Prewarm refresh or re-arm when idle
+        // 3. Prewarm refresh or re-arm when idle (suspend background STUN beacon after 5 min of
+        //    zero local client traffic; wakes immediately on first local datagram).
+        let prewarm_idle_sleep =
+            now.saturating_duration_since(self.last_local_traffic) >= Duration::from_secs(300);
         if self.sessions_by_tok.is_empty() && self.hunt.is_none() && self.cfg.lane_hunt.enabled {
-            if let Some(ref mut pw) = self.prewarm {
+            if prewarm_idle_sleep {
+                if self.prewarm.is_some() {
+                    self.drop_prewarm();
+                }
+            } else if let Some(ref mut pw) = self.prewarm {
                 if let Some((_, sent_at)) = pw.pending_txid {
                     if now.saturating_duration_since(sent_at) >= Duration::from_secs(2) {
                         self.drop_prewarm();
-                        self.next_prewarm_at = Some(now + Duration::from_millis(PREWARM_RETRY_MS));
+                        let streak = self.hunt_fail_streak;
+                        self.hunt_fail_streak = self.hunt_fail_streak.saturating_add(1).min(8);
+                        let backoff_ms = PREWARM_RETRY_MS
+                            .saturating_mul(1u64 << (streak.min(5) as u32))
+                            .min(PREWARM_RETRY_MAX_MS);
+                        self.next_prewarm_at = Some(now + jitter_duration_ms(backoff_ms));
                     }
                 } else if now >= pw.next_refresh_at {
-                    let txid = make_fresh_stun_txid(&self.cfg.psk);
+                    let txid = make_fresh_stun_txid(&self.stun_auth_psk);
                     let (pkt, _) =
-                        build_ice_stun_request(&self.cfg.psk, &pw.ice, Some(txid), false);
+                        build_bypass_stun_request(&self.stun_auth_psk, &pw.ice, Some(txid));
                     let _ = pw.sock.send(&pkt);
                     pw.pending_txid = Some((txid, now));
                 }
@@ -1459,10 +1502,14 @@ impl BypassWorker {
                         base_r
                     };
                     if ka.retries < max_r {
-                        let _ = s.upstream.send(&ka.pkt);
+                        // v0.7: mint fresh txid on keepalive retry so bypass responder enforces
+                        // strict single-use txid (0 replay step oracle).
+                        let txid = make_fresh_stun_txid(&self.stun_auth_psk);
+                        let (pkt, _) =
+                            build_bypass_stun_request(&self.stun_auth_psk, &s.ice, Some(txid));
+                        let _ = s.upstream.send(&pkt);
                         s.pending_ka = Some(PendingKa {
-                            txid: ka.txid,
-                            pkt: ka.pkt,
+                            txid,
                             first_sent: ka.first_sent,
                             retry_at: now + retry_dur,
                             retries: ka.retries + 1,
@@ -1477,12 +1524,11 @@ impl BypassWorker {
                     }
                 }
             } else if now >= s.next_ka_at {
-                let txid = make_fresh_stun_txid(&self.cfg.psk);
-                let (pkt, _) = build_ice_stun_request(&self.cfg.psk, &s.ice, Some(txid), false);
+                let txid = make_fresh_stun_txid(&self.stun_auth_psk);
+                let (pkt, _) = build_bypass_stun_request(&self.stun_auth_psk, &s.ice, Some(txid));
                 let _ = s.upstream.send(&pkt);
                 s.pending_ka = Some(PendingKa {
                     txid,
-                    pkt,
                     first_sent: now,
                     retry_at: now + retry_dur,
                     retries: 0,
@@ -1497,7 +1543,7 @@ impl BypassWorker {
                         rotate_client = Some(s.client_addr);
                     }
                     s.next_rotate_at =
-                        (rot_iv_secs > 0).then(|| now + jitter_duration_ms(rot_iv_secs * 1000));
+                        (rot_iv_secs > 0).then(|| now + lognormal_duration_ms(rot_iv_secs * 1000));
                 }
             }
         }
@@ -1592,8 +1638,16 @@ impl BypassWorker {
             .map(|th| th.interval())
             .unwrap_or(Duration::from_secs(TELEMETRY_DEFAULT_INTERVAL_SECS));
         let now = Instant::now();
+        let stun_auth_psk = derive_stun_scope_key_for(
+            &cfg.psk,
+            cfg.server_addr.port(),
+            cfg.stun_scope.as_deref(),
+            true,
+        );
         let mut w = BypassWorker {
             worker_id,
+            stun_auth_psk,
+            last_local_traffic: now,
             ka_base_ms: cfg.keepalive_secs.max(1) * 1000,
             idle_dur: Duration::from_secs(cfg.idle_timeout_secs),
             stats_dur: Duration::from_secs(cfg.stats_interval_secs),
@@ -1611,6 +1665,7 @@ impl BypassWorker {
             hunt_tok_set: HashMap::with_capacity(8),
             prewarm: None,
             next_prewarm_at: cfg.lane_hunt.enabled.then_some(now),
+            hunt_fail_streak: 0,
             best_observed_rtt_ms: None,
             trial_fail_streak: 0,
             next_token_id: 1,
@@ -1847,7 +1902,7 @@ impl BypassWorker {
             consider(self.last_telemetry + self.telemetry_dur);
         }
 
-        let max_wait = if self.cfg.stop.is_some() {
+        let max_wait = if self.cfg.stop.is_some() && self.cfg.quiet {
             Duration::from_millis(WORKER_QUIET_STOP_POLL_MS)
         } else if self.sessions_by_tok.is_empty() && self.hunt.is_none() {
             Duration::from_secs(WORKER_IDLE_POLL_SECS)

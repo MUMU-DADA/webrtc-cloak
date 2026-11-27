@@ -5,6 +5,8 @@ mod bypass;
 mod client;
 mod constants;
 mod protocol;
+#[cfg(feature = "embedded-proxy")]
+mod proxy;
 mod relay;
 mod reverse;
 mod selftest;
@@ -23,7 +25,14 @@ use crate::constants::{
     DEFAULT_UDP_BATCH, DEFAULT_WAN_MTU,
 };
 use crate::protocol::{
-    detect_cpu_accel, install_shutdown_handler, CipherPref, CipherSuite, DtlsMinVersion,
+    detect_cpu_accel, install_shutdown_handler, set_global_stun_scope, CipherPref, CipherSuite,
+    DtlsMinVersion,
+};
+#[cfg(feature = "embedded-proxy")]
+use crate::proxy::{
+    parse_bandwidth_bps, parse_tcp_forward_rule, run_proxy_client, run_proxy_client_reverse,
+    run_proxy_server, run_proxy_server_reverse, AclConfig, AclRule, ProxyClientConfig,
+    ProxyServerConfig, ReverseProxyClientConfig, ReverseProxyServerConfig, TcpForwardRule,
 };
 use crate::relay::{run_relay, RelayConfig, RelayUpstreamConfig};
 use crate::reverse::{
@@ -43,6 +52,18 @@ const MIB: u64 = 1024 * 1024;
 const DEFAULT_CLIENT_LISTEN_HOST: &str = "127.0.0.1";
 /// 客户端本地默认监听端口。
 const DEFAULT_CLIENT_LISTEN_PORT: u16 = 19543;
+/// 内嵌代理客户端默认本地 SOCKS5 监听端口。
+#[cfg(feature = "embedded-proxy")]
+const DEFAULT_PROXY_SOCKS_PORT: u16 = 19548;
+/// 内嵌代理客户端默认上行 Brutal 带宽（100 Mbps）。
+#[cfg(feature = "embedded-proxy")]
+const DEFAULT_PROXY_UP_BPS: u64 = 100_000_000;
+/// 内嵌代理客户端默认下行 Brutal 带宽（300 Mbps）。
+#[cfg(feature = "embedded-proxy")]
+const DEFAULT_PROXY_DOWN_BPS: u64 = 300_000_000;
+/// 内嵌代理服务端默认上下行最大 Brutal 带宽上限（500 Mbps）。
+#[cfg(feature = "embedded-proxy")]
+const DEFAULT_PROXY_MAX_BPS: u64 = 500_000_000;
 /// 服务端公网默认监听地址。
 const DEFAULT_SERVER_LISTEN_HOST: &str = "0.0.0.0";
 /// 服务端公网默认监听端口。
@@ -82,6 +103,7 @@ const DEFAULT_LOADGEN_STREAMS: usize = 1;
 
 struct CommonTunnelArgs {
     psk: Vec<u8>,
+    stun_scope: Option<String>,
     cipher_pref: CipherPref,
     dtls_min_version: DtlsMinVersion,
     workers: usize,
@@ -160,16 +182,18 @@ fn usage() -> ! {
     eprintln!(
         "Usage:\n  \
          webrtc-cloak cpu\n  \
-         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak relay --listen-host 0.0.0.0 --listen-port 19643 --upstream-host <IPv4|IPv6> --upstream-port 19643 [--upstream-mode bypass|cloak] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--upstream-psk <KEY> | --upstream-psk-file <PATH> | env WEBRTC_CLOAK_UPSTREAM_PSK] [--cipher auto|aes-gcm|chacha20|blake2b] [--upstream-cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--upstream-dtls-min-version auto|1.2|1.3] [--lane-hunt | --no-lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak reverse --entry --listen-host 0.0.0.0 --listen-port 19643 --expose-host 127.0.0.1 --expose-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak reverse --agent --server-host <IPv4|IPv6> --server-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak bypass --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--no-lane-hunt] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
-         webrtc-cloak bypass --responder --listen-host 127.0.0.1 --listen-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--workers 1|auto] [--mtu 1488] [--udp-batch 0] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
+         webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak relay --listen-host 0.0.0.0 --listen-port 19643 [--upstream-mode bypass|cloak|reverse] (--upstream-host <IPv4|IPv6> [--upstream-port 19643] | --reverse-listen-port <PORT> [--reverse-listen-host 0.0.0.0]) (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--upstream-psk <KEY> | --upstream-psk-file <PATH> | env WEBRTC_CLOAK_UPSTREAM_PSK] [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--upstream-cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--upstream-dtls-min-version 1.3|1.2|auto] [--lane-hunt | --no-lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak reverse --entry --listen-host 0.0.0.0 --listen-port 19643 --expose-host 127.0.0.1 --expose-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak reverse --agent --server-host <IPv4|IPv6> --server-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak bypass --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--no-lane-hunt] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
+         webrtc-cloak bypass --responder --listen-host 127.0.0.1 --listen-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--workers 1|auto] [--mtu 1488] [--udp-batch 0] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
+         webrtc-cloak proxy --client [--reverse --listen-host 0.0.0.0 --listen-port 19643 | --server-host <IPv4|IPv6> --server-port 19643] [--socks-listen 127.0.0.1:19548 | --no-socks] [--tcp-forward LOCAL=TARGET]... [--up 100Mbps] [--down 300Mbps] [--proxy-mtu <BYTES>] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak proxy --server [--reverse --server-host <IPv4|IPv6> --server-port 19643 | --listen-host 0.0.0.0 --listen-port 19643] [--max-up 500Mbps] [--max-down 500Mbps] [--proxy-mtu <BYTES>] [--acl-allow CIDR[:PORT]]... [--acl-deny CIDR[:PORT]]... [--allow-private] [--outbound-ipv4-only] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
-         webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
-         webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version auto|1.2|1.3] [--mtu 1488] [--no-color] [--json]"
+         webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
+         webrtc-cloak selftest [--local] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--mtu 1488] [--no-color] [--json]"
     );
     process::exit(2);
 }
@@ -220,12 +244,13 @@ fn check_no_extra(args: Arguments) {
 fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_args::Error> {
     let psk_arg: Option<String> = args.opt_value_from_str("--psk")?;
     let psk_file: Option<String> = args.opt_value_from_str("--psk-file")?;
+    let stun_scope: Option<String> = args.opt_value_from_str("--stun-scope")?;
     let cipher_pref = args
         .opt_value_from_fn("--cipher", parse_cipher_pref)?
         .unwrap_or(CipherPref::Auto);
     let dtls_min_version = args
         .opt_value_from_fn("--dtls-min-version", parse_dtls_min_version)?
-        .unwrap_or(DtlsMinVersion::Auto);
+        .unwrap_or(DtlsMinVersion::V13Only);
     let workers = args
         .opt_value_from_fn("--workers", parse_workers)?
         .unwrap_or(DEFAULT_WORKERS);
@@ -253,6 +278,7 @@ fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_ar
     check_no_extra(args);
     Ok(CommonTunnelArgs {
         psk: resolve_psk(psk_arg, psk_file),
+        stun_scope,
         cipher_pref,
         dtls_min_version,
         workers,
@@ -282,6 +308,9 @@ fn run() -> Result<(), pico_args::Error> {
         }
         "selftest" => {
             let mut opts = SelftestOptions::default();
+            if let Some(scope) = args.opt_value_from_str::<_, String>("--stun-scope")? {
+                set_global_stun_scope(scope);
+            }
             let server_host: Option<String> = args.opt_value_from_str("--server-host")?;
             let server_port: u16 = args
                 .opt_value_from_str("--server-port")?
@@ -452,6 +481,7 @@ fn run() -> Result<(), pico_args::Error> {
                 listen_addr,
                 server_addr,
                 psk: common.psk,
+                stun_scope: common.stun_scope,
                 cipher_pref: common.cipher_pref,
                 dtls_decoy: common.dtls_enabled,
                 dtls_min_version: common.dtls_min_version,
@@ -499,6 +529,7 @@ fn run() -> Result<(), pico_args::Error> {
                 listen_addr,
                 backend_addr,
                 psk: common.psk,
+                stun_scope: common.stun_scope,
                 cipher_pref: common.cipher_pref,
                 dtls_required: common.dtls_enabled,
                 dtls_min_version: common.dtls_min_version,
@@ -527,13 +558,20 @@ fn run() -> Result<(), pico_args::Error> {
             let upstream_mode: String = args
                 .opt_value_from_str("--upstream-mode")?
                 .unwrap_or_else(|| "bypass".into());
-            let upstream_host: String = args.value_from_str("--upstream-host")?;
+            let upstream_host_opt: Option<String> = args.opt_value_from_str("--upstream-host")?;
             let upstream_port: u16 = args
                 .opt_value_from_str("--upstream-port")?
                 .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+            let reverse_listen_host: String = args
+                .opt_value_from_str("--reverse-listen-host")?
+                .unwrap_or_else(|| DEFAULT_SERVER_LISTEN_HOST.into());
+            let reverse_listen_port_opt: Option<u16> =
+                args.opt_value_from_str("--reverse-listen-port")?;
             let upstream_psk_arg: Option<String> = args.opt_value_from_str("--upstream-psk")?;
             let upstream_psk_file: Option<String> =
                 args.opt_value_from_str("--upstream-psk-file")?;
+            let upstream_stun_scope: Option<String> =
+                args.opt_value_from_str("--upstream-stun-scope")?;
             let upstream_cipher_opt: Option<CipherPref> =
                 args.opt_value_from_fn("--upstream-cipher", parse_cipher_pref)?;
             let upstream_dtls_min_opt: Option<DtlsMinVersion> =
@@ -556,9 +594,6 @@ fn run() -> Result<(), pico_args::Error> {
             let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
             let lane_target_rtt_opt: Option<u64> = args.opt_value_from_str("--lane-target-rtt")?;
             let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
-            if upstream_host.is_empty() {
-                usage();
-            }
             let common = finish_common_tunnel(args)?;
             let upstream_psk = resolve_optional_psk(
                 upstream_psk_arg,
@@ -567,13 +602,32 @@ fn run() -> Result<(), pico_args::Error> {
             )
             .unwrap_or_else(|| common.psk.clone());
             let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
-            let upstream_addr = parse_socket_addr(&upstream_host, upstream_port, "upstream");
+            let upstream_addr = if upstream_mode == "reverse" {
+                let rev_port = reverse_listen_port_opt.unwrap_or_else(|| {
+                    eprintln!("relay --upstream-mode reverse requires --reverse-listen-port");
+                    usage();
+                });
+                if rev_port == 0 {
+                    usage();
+                }
+                parse_socket_addr(&reverse_listen_host, rev_port, "reverse-listen")
+            } else {
+                let Some(upstream_host) = upstream_host_opt.filter(|s| !s.is_empty()) else {
+                    eprintln!(
+                        "relay --upstream-mode {} requires --upstream-host",
+                        upstream_mode
+                    );
+                    usage();
+                };
+                parse_socket_addr(&upstream_host, upstream_port, "upstream")
+            };
             let stop = Some(install_shutdown_handler());
 
             let ingress = ServerConfig {
                 listen_addr,
                 backend_addr: upstream_addr,
                 psk: common.psk,
+                stun_scope: common.stun_scope,
                 cipher_pref: common.cipher_pref,
                 dtls_required: common.dtls_enabled,
                 dtls_min_version: common.dtls_min_version,
@@ -604,6 +658,7 @@ fn run() -> Result<(), pico_args::Error> {
                         listen_addr,
                         server_addr: upstream_addr,
                         psk: upstream_psk,
+                        stun_scope: upstream_stun_scope,
                         rotate_interval_secs,
                         workers: common.workers,
                         max_sessions: common.max_sessions,
@@ -643,6 +698,7 @@ fn run() -> Result<(), pico_args::Error> {
                         listen_addr,
                         server_addr: upstream_addr,
                         psk: upstream_psk,
+                        stun_scope: upstream_stun_scope,
                         cipher_pref: upstream_cipher_opt.unwrap_or(common.cipher_pref),
                         dtls_decoy: common.dtls_enabled && !upstream_no_dtls_decoy,
                         dtls_min_version: upstream_dtls_min_opt.unwrap_or(common.dtls_min_version),
@@ -664,9 +720,28 @@ fn run() -> Result<(), pico_args::Error> {
                         stop,
                     })
                 }
+                "reverse" => RelayUpstreamConfig::Reverse(ServerConfig {
+                    listen_addr: upstream_addr,
+                    backend_addr: listen_addr,
+                    psk: upstream_psk,
+                    stun_scope: upstream_stun_scope,
+                    cipher_pref: upstream_cipher_opt.unwrap_or(common.cipher_pref),
+                    dtls_required: common.dtls_enabled && !upstream_no_dtls_decoy,
+                    dtls_min_version: upstream_dtls_min_opt.unwrap_or(common.dtls_min_version),
+                    workers: 1,
+                    max_sessions: common.max_sessions,
+                    wan_mtu: common.wan_mtu,
+                    udp_batch: common.udp_batch,
+                    idle_timeout_secs: common.idle_timeout_secs,
+                    stats_interval_secs: common.stats_interval_secs,
+                    wire_audit_file: None,
+                    telemetry: common.telemetry,
+                    quiet: false,
+                    stop,
+                }),
                 other => {
                     eprintln!(
-                        "Unknown --upstream-mode: {} (expected bypass or cloak)",
+                        "Unknown --upstream-mode: {} (expected bypass, cloak, or reverse)",
                         other
                     );
                     usage();
@@ -709,6 +784,7 @@ fn run() -> Result<(), pico_args::Error> {
                         listen_addr,
                         backend_addr: expose_addr,
                         psk: common.psk,
+                        stun_scope: common.stun_scope,
                         cipher_pref: common.cipher_pref,
                         dtls_required: common.dtls_enabled,
                         dtls_min_version: common.dtls_min_version,
@@ -783,6 +859,7 @@ fn run() -> Result<(), pico_args::Error> {
                         listen_addr: backend_addr,
                         server_addr,
                         psk: common.psk,
+                        stun_scope: common.stun_scope,
                         cipher_pref: common.cipher_pref,
                         dtls_decoy: common.dtls_enabled,
                         dtls_min_version: common.dtls_min_version,
@@ -824,6 +901,7 @@ fn run() -> Result<(), pico_args::Error> {
                 if let Err(e) = run_bypass_responder(BypassResponderConfig {
                     listen_addr,
                     psk: common.psk,
+                    stun_scope: common.stun_scope,
                     workers: common.workers,
                     wan_mtu: common.wan_mtu,
                     udp_batch: common.udp_batch,
@@ -881,6 +959,7 @@ fn run() -> Result<(), pico_args::Error> {
                     listen_addr,
                     server_addr,
                     psk: common.psk,
+                    stun_scope: common.stun_scope,
                     rotate_interval_secs,
                     workers: common.workers,
                     max_sessions: common.max_sessions,
@@ -900,6 +979,344 @@ fn run() -> Result<(), pico_args::Error> {
                     process::exit(1);
                 }
             }
+        }
+        #[cfg(feature = "embedded-proxy")]
+        "proxy" => {
+            let is_client = args.contains("--client");
+            let is_server = args.contains("--server");
+            let is_reverse = args.contains("--reverse");
+            if is_client == is_server {
+                eprintln!("proxy requires exactly one of --client or --server");
+                usage();
+            }
+            if is_server && !is_reverse {
+                let listen_host: String = args
+                    .opt_value_from_str("--listen-host")?
+                    .unwrap_or_else(|| DEFAULT_SERVER_LISTEN_HOST.into());
+                let listen_port: u16 = args
+                    .opt_value_from_str("--listen-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let max_up_bps = args
+                    .opt_value_from_fn("--max-up", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_MAX_BPS);
+                let max_down_bps = args
+                    .opt_value_from_fn("--max-down", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_MAX_BPS);
+                let proxy_mtu: Option<u16> = args.opt_value_from_str("--proxy-mtu")?;
+                let acl_allow: Vec<AclRule> = args.values_from_fn("--acl-allow", AclRule::parse)?;
+                let acl_deny: Vec<AclRule> = args.values_from_fn("--acl-deny", AclRule::parse)?;
+                let allow_private = args.contains("--allow-private");
+                let outbound_ipv4_only = args.contains("--outbound-ipv4-only");
+                let wire_audit_file: Option<String> =
+                    args.opt_value_from_str("--wire-audit-file")?;
+                let common = finish_common_tunnel(args)?;
+                let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+                if let Err(e) = run_proxy_server(ProxyServerConfig {
+                    server: ServerConfig {
+                        listen_addr,
+                        backend_addr: listen_addr,
+                        psk: common.psk,
+                        stun_scope: common.stun_scope,
+                        cipher_pref: common.cipher_pref,
+                        dtls_required: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        wire_audit_file,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    max_up_bps,
+                    max_down_bps,
+                    acl: AclConfig {
+                        allow: acl_allow,
+                        deny: acl_deny,
+                        reject_private: !allow_private,
+                        outbound_ipv4_only,
+                    },
+                    proxy_mtu,
+                }) {
+                    eprintln!("proxy server error: {}", e);
+                    process::exit(1);
+                }
+            } else if is_server && is_reverse {
+                let server_host: String = args.value_from_str("--server-host")?;
+                let server_port: u16 = args
+                    .opt_value_from_str("--server-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let max_up_bps = args
+                    .opt_value_from_fn("--max-up", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_MAX_BPS);
+                let max_down_bps = args
+                    .opt_value_from_fn("--max-down", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_MAX_BPS);
+                let proxy_mtu: Option<u16> = args.opt_value_from_str("--proxy-mtu")?;
+                let acl_allow: Vec<AclRule> = args.values_from_fn("--acl-allow", AclRule::parse)?;
+                let acl_deny: Vec<AclRule> = args.values_from_fn("--acl-deny", AclRule::parse)?;
+                let allow_private = args.contains("--allow-private");
+                let outbound_ipv4_only = args.contains("--outbound-ipv4-only");
+                let rotate_interval_secs: u64 =
+                    args.opt_value_from_str("--rotate-interval")?.unwrap_or(0);
+                let rotate_bytes_mb: Option<u64> = args.opt_value_from_str("--rotate-bytes")?;
+                let retry_ms: u64 = args
+                    .opt_value_from_str("--retry-ms")?
+                    .unwrap_or(DEFAULT_CLIENT_RETRY_MS);
+                let max_retries: u32 = args
+                    .opt_value_from_str("--max-retries")?
+                    .unwrap_or(DEFAULT_CLIENT_MAX_RETRIES);
+                let keepalive_secs: u64 = args
+                    .opt_value_from_str("--keepalive")?
+                    .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+                let lane_hunt_flag = args.contains("--lane-hunt");
+                let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+                let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+                let lane_target_rtt_opt: Option<u64> =
+                    args.opt_value_from_str("--lane-target-rtt")?;
+                let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+                let lane_enabled = lane_hunt_flag
+                    || lane_probes_opt.is_some_and(|p| p > 1)
+                    || lane_target_rtt_opt.is_some_and(|t| t > 0);
+                let lane_hunt = LaneHuntConfig {
+                    enabled: lane_enabled,
+                    probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                    max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                    target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                    degrade_cooldown_secs: lane_cooldown_opt
+                        .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                }
+                .normalized();
+                if server_host.is_empty() {
+                    eprintln!("proxy --server --reverse requires --server-host");
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let rotate_max_bytes = match rotate_bytes_mb {
+                    Some(mb) => mb.saturating_mul(MIB),
+                    None if rotate_interval_secs > 0 => DEFAULT_ROTATE_BYTE_BUDGET_MIB * MIB,
+                    None => 0,
+                };
+                let server_addr = parse_socket_addr(&server_host, server_port, "server");
+                if let Err(e) = run_proxy_server_reverse(ReverseProxyServerConfig {
+                    client: ClientConfig {
+                        listen_addr: server_addr,
+                        server_addr,
+                        psk: common.psk,
+                        stun_scope: common.stun_scope,
+                        cipher_pref: common.cipher_pref,
+                        dtls_decoy: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        rotate_interval_secs,
+                        rotate_max_bytes,
+                        rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        retry_ms,
+                        max_retries,
+                        keepalive_secs,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        lane_hunt,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    max_up_bps,
+                    max_down_bps,
+                    acl: AclConfig {
+                        allow: acl_allow,
+                        deny: acl_deny,
+                        reject_private: !allow_private,
+                        outbound_ipv4_only,
+                    },
+                    proxy_mtu,
+                }) {
+                    eprintln!("proxy reverse server error: {}", e);
+                    process::exit(1);
+                }
+            } else if is_reverse {
+                let listen_host: String = args
+                    .opt_value_from_str("--listen-host")?
+                    .unwrap_or_else(|| DEFAULT_SERVER_LISTEN_HOST.into());
+                let listen_port: u16 = args
+                    .opt_value_from_str("--listen-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let no_socks = args.contains("--no-socks");
+                let socks_listen_opt: Option<SocketAddr> =
+                    args.opt_value_from_str("--socks-listen")?;
+                let tcp_forwards: Vec<TcpForwardRule> =
+                    args.values_from_fn("--tcp-forward", parse_tcp_forward_rule)?;
+                let up_bps = args
+                    .opt_value_from_fn("--up", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_UP_BPS);
+                let down_bps = args
+                    .opt_value_from_fn("--down", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_DOWN_BPS);
+                let proxy_mtu: Option<u16> = args.opt_value_from_str("--proxy-mtu")?;
+                let wire_audit_file: Option<String> =
+                    args.opt_value_from_str("--wire-audit-file")?;
+                let socks_listen = if no_socks {
+                    None
+                } else {
+                    Some(socks_listen_opt.unwrap_or_else(|| {
+                        parse_socket_addr(
+                            DEFAULT_CLIENT_LISTEN_HOST,
+                            DEFAULT_PROXY_SOCKS_PORT,
+                            "socks-listen",
+                        )
+                    }))
+                };
+                if socks_listen.is_none() && tcp_forwards.is_empty() {
+                    eprintln!("proxy --client --reverse requires at least --socks-listen or --tcp-forward");
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let listen_addr = parse_socket_addr(&listen_host, listen_port, "listen");
+                if let Err(e) = run_proxy_client_reverse(ReverseProxyClientConfig {
+                    server: ServerConfig {
+                        listen_addr,
+                        backend_addr: listen_addr,
+                        psk: common.psk,
+                        stun_scope: common.stun_scope,
+                        cipher_pref: common.cipher_pref,
+                        dtls_required: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        wire_audit_file,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    socks_listen,
+                    tcp_forwards,
+                    up_bps,
+                    down_bps,
+                    proxy_mtu,
+                }) {
+                    eprintln!("proxy reverse client error: {}", e);
+                    process::exit(1);
+                }
+            } else {
+                let server_host: String = args.value_from_str("--server-host")?;
+                let server_port: u16 = args
+                    .opt_value_from_str("--server-port")?
+                    .unwrap_or(DEFAULT_SERVER_LISTEN_PORT);
+                let no_socks = args.contains("--no-socks");
+                let socks_listen_opt: Option<SocketAddr> =
+                    args.opt_value_from_str("--socks-listen")?;
+                let tcp_forwards: Vec<TcpForwardRule> =
+                    args.values_from_fn("--tcp-forward", parse_tcp_forward_rule)?;
+                let up_bps = args
+                    .opt_value_from_fn("--up", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_UP_BPS);
+                let down_bps = args
+                    .opt_value_from_fn("--down", parse_bandwidth_bps)?
+                    .unwrap_or(DEFAULT_PROXY_DOWN_BPS);
+                let proxy_mtu: Option<u16> = args.opt_value_from_str("--proxy-mtu")?;
+                let rotate_interval_secs: u64 =
+                    args.opt_value_from_str("--rotate-interval")?.unwrap_or(0);
+                let rotate_bytes_mb: Option<u64> = args.opt_value_from_str("--rotate-bytes")?;
+                let retry_ms: u64 = args
+                    .opt_value_from_str("--retry-ms")?
+                    .unwrap_or(DEFAULT_CLIENT_RETRY_MS);
+                let max_retries: u32 = args
+                    .opt_value_from_str("--max-retries")?
+                    .unwrap_or(DEFAULT_CLIENT_MAX_RETRIES);
+                let keepalive_secs: u64 = args
+                    .opt_value_from_str("--keepalive")?
+                    .unwrap_or(DEFAULT_CLIENT_KEEPALIVE_SECS);
+                let lane_hunt_flag = args.contains("--lane-hunt");
+                let lane_probes_opt: Option<usize> = args.opt_value_from_str("--lane-probes")?;
+                let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
+                let lane_target_rtt_opt: Option<u64> =
+                    args.opt_value_from_str("--lane-target-rtt")?;
+                let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+                let lane_enabled = lane_hunt_flag
+                    || lane_probes_opt.is_some_and(|p| p > 1)
+                    || lane_target_rtt_opt.is_some_and(|t| t > 0);
+                let lane_hunt = LaneHuntConfig {
+                    enabled: lane_enabled,
+                    probes: lane_probes_opt.unwrap_or(DEFAULT_LANE_PROBES),
+                    max_rounds: lane_rounds_opt.unwrap_or(DEFAULT_LANE_ROUNDS),
+                    target_rtt_ms: lane_target_rtt_opt.unwrap_or(0),
+                    degrade_cooldown_secs: lane_cooldown_opt
+                        .unwrap_or(DEFAULT_LANE_DEGRADE_COOLDOWN_SECS),
+                }
+                .normalized();
+                let socks_listen = if no_socks {
+                    None
+                } else {
+                    Some(socks_listen_opt.unwrap_or_else(|| {
+                        parse_socket_addr(
+                            DEFAULT_CLIENT_LISTEN_HOST,
+                            DEFAULT_PROXY_SOCKS_PORT,
+                            "socks-listen",
+                        )
+                    }))
+                };
+                if server_host.is_empty() || (socks_listen.is_none() && tcp_forwards.is_empty()) {
+                    eprintln!("proxy --client requires --server-host and at least --socks-listen or --tcp-forward");
+                    usage();
+                }
+                let common = finish_common_tunnel(args)?;
+                let rotate_max_bytes = match rotate_bytes_mb {
+                    Some(mb) => mb.saturating_mul(MIB),
+                    None if rotate_interval_secs > 0 => DEFAULT_ROTATE_BYTE_BUDGET_MIB * MIB,
+                    None => 0,
+                };
+                let server_addr = parse_socket_addr(&server_host, server_port, "server");
+                if let Err(e) = run_proxy_client(ProxyClientConfig {
+                    client: ClientConfig {
+                        listen_addr: socks_listen.unwrap_or_else(|| tcp_forwards[0].listen),
+                        server_addr,
+                        psk: common.psk,
+                        stun_scope: common.stun_scope,
+                        cipher_pref: common.cipher_pref,
+                        dtls_decoy: common.dtls_enabled,
+                        dtls_min_version: common.dtls_min_version,
+                        rotate_interval_secs,
+                        rotate_max_bytes,
+                        rotate_cooldown_secs: DEFAULT_ROTATE_COOLDOWN_SECS,
+                        workers: common.workers,
+                        max_sessions: common.max_sessions,
+                        wan_mtu: common.wan_mtu,
+                        udp_batch: common.udp_batch,
+                        retry_ms,
+                        max_retries,
+                        keepalive_secs,
+                        idle_timeout_secs: common.idle_timeout_secs,
+                        stats_interval_secs: common.stats_interval_secs,
+                        lane_hunt,
+                        telemetry: common.telemetry,
+                        quiet: false,
+                        stop: Some(install_shutdown_handler()),
+                    },
+                    socks_listen,
+                    tcp_forwards,
+                    up_bps,
+                    down_bps,
+                    proxy_mtu,
+                }) {
+                    eprintln!("proxy client error: {}", e);
+                    process::exit(1);
+                }
+            }
+        }
+        #[cfg(not(feature = "embedded-proxy"))]
+        "proxy" => {
+            eprintln!("This binary was built without the 'embedded-proxy' feature.");
+            process::exit(2);
         }
         _ => usage(),
     }

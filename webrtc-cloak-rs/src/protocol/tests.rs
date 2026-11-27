@@ -182,7 +182,11 @@ fn v31_full_security_and_protocol_invariants() {
         for _ in 0..20 {
             let p = vec![0xABu8; 148];
             let wn = cli.wrap_into(&p, &mut wbuf).unwrap();
-            assert_eq!(wbuf[0], 0x90); // V=2, P=0, X=1
+            assert!(
+                wbuf[0] == 0x90 || wbuf[0] == 0xB0,
+                "RTP first byte must be 0x90 (V=2,X=1) or 0xB0 (V=2,P=1,X=1), got 0x{:02x}",
+                wbuf[0]
+            );
             if (wbuf[1] & 0x80) != 0 {
                 marked_cnt += 1;
             }
@@ -244,7 +248,7 @@ fn srtp_inband_probe_roundtrip_and_zero_collision() {
         // Probe packet round-trip must be recognized as Probe, NOT Data
         let probe = b"PING_INBAND_PROBE_123456";
         let wn = cli.wrap_probe_into(probe, &mut wbuf).unwrap();
-        assert_eq!(wbuf[0], 0x90);
+        assert!(wbuf[0] == 0x90 || wbuf[0] == 0xB0);
         assert!(wn <= DEFAULT_WAN_MTU - 28);
         assert_eq!(
             srv.unwrap_into_ex(&wbuf[..wn], &mut rbuf),
@@ -389,6 +393,28 @@ fn dual_ssrc_audio_video_split_and_replay_isolation() {
         let mut wbuf = [0u8; 2048];
         let mut rbuf = [0u8; 2048];
 
+        let extract_twcc = |pkt: &[u8]| -> u16 {
+            assert_eq!(&pkt[12..14], &[0xBE, 0xDE], "RFC 8285 One-Byte profile");
+            let ext_words = u16::from_be_bytes([pkt[14], pkt[15]]) as usize;
+            let end = 16 + ext_words * 4;
+            let mut pos = 16usize;
+            while pos < end {
+                let b = pkt[pos];
+                if b == 0 {
+                    pos += 1;
+                    continue;
+                }
+                let id = b >> 4;
+                let len = ((b & 0x0F) as usize) + 1;
+                pos += 1;
+                if id == 3 && len == 2 && pos + 2 <= end {
+                    return u16::from_be_bytes([pkt[pos], pkt[pos + 1]]);
+                }
+                pos += len;
+            }
+            panic!("RFC 8285 TWCC (ID=3) extension not found");
+        };
+
         // Small ACK packet (< 256B) -> Audio SSRC + PT=111 (Opus)
         let small = vec![0x11u8; 64];
         let wn_a = cli.wrap_into(&small, &mut wbuf).unwrap();
@@ -397,7 +423,7 @@ fn dual_ssrc_audio_video_split_and_replay_isolation() {
             u32::from_be_bytes([wbuf[8], wbuf[9], wbuf[10], wbuf[11]]),
             cli.audio_ssrc_tx
         );
-        let twcc1 = u16::from_be_bytes([wbuf[17], wbuf[18]]);
+        let twcc1 = extract_twcc(&wbuf[..wn_a]);
         let rn_a = srv.unwrap_into(&wbuf[..wn_a], &mut rbuf).unwrap();
         assert_eq!(&rbuf[..rn_a], &small[..]);
         // Replay of Audio packet MUST be blocked independently
@@ -411,7 +437,7 @@ fn dual_ssrc_audio_video_split_and_replay_isolation() {
             u32::from_be_bytes([wbuf[8], wbuf[9], wbuf[10], wbuf[11]]),
             cli.ssrc_tx
         );
-        let twcc2 = u16::from_be_bytes([wbuf[17], wbuf[18]]);
+        let twcc2 = extract_twcc(&wbuf[..wn_v]);
         assert_eq!(twcc2, twcc1.wrapping_add(1));
         let rn_v = srv.unwrap_into(&wbuf[..wn_v], &mut rbuf).unwrap();
         assert_eq!(&rbuf[..rn_v], &large[..]);
@@ -470,10 +496,10 @@ fn v32_hardening_invariants_crypto_dpi_and_anti_downgrade() {
     bad_sh[13 + 50..13 + 52].copy_from_slice(&2u16.to_be_bytes());
     assert_eq!(extract_dtls_server_hello_suite(&bad_sh), Some(0x1303));
 
-    // 4. Multi-MTU DtlsConfigPool respects --mtu clamping (P1-2 / L-03)
+    // 4. DtlsConfigPool respects --mtu clamping cleanly (v0.7 removes 10-slot fake padding pool)
     let cpu = detect_cpu_accel();
     let pool_default = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, DEFAULT_WAN_MTU);
-    assert_eq!(pool_default.mtus().len(), 8);
+    assert_eq!(pool_default.mtus().len(), 1);
     let pool_small = build_dimpl_config_pool(CipherPref::Auto, &cpu, true, 1000);
     assert!(pool_small.mtus().iter().all(|&m| m <= 972));
 
@@ -630,19 +656,25 @@ fn v38_zero_media_srtcp_no_fake_fb_and_lognormal_distributions() {
     cli.set_dual_ssrc(true);
     srv.set_dual_ssrc(true);
 
-    // 1. Zero-media RR MUST NEVER attach fake PT=205/206 feedback (always exact minimal 52B: 8B hdr + 24B SDES + 16B tag + 4B idx)
+    // 1. Zero-media RR omits fake PT=205/206 feedback while randomizing encrypted SDES (52..=80B, 4B aligned)
+    let mut idle_lens = std::collections::HashSet::new();
     for _ in 0..64 {
         let pkt = cli.build_srtcp(false, false, false);
         assert_eq!(pkt[0], 0x80); // RC=0
         assert_eq!(pkt[1], 201); // RR
-        assert_eq!(
-            pkt.len(),
-            52,
-            "zero-media RR MUST omit PT=205/206 feedback subpackets (expected 52B, got {}B)",
+        assert!(
+            (52..=80).contains(&pkt.len()) && pkt.len().is_multiple_of(4),
+            "zero-media RR must stay within 52..=80B 4B-aligned SDES range (got {}B)",
             pkt.len()
         );
+        idle_lens.insert(pkt.len());
         assert_eq!(srv.verify_srtcp(&pkt), Some(false));
     }
+    assert!(
+        idle_lens.len() >= 4,
+        "zero-media RR lengths must vary to break 52B spike (saw {:?})",
+        idle_lens
+    );
 
     // 2. When rx media IS present (has_rx_media=true), FB subpackets (PT=205/206) still attach smoothly (~87.5%)
     let mut fb_seen = 0usize;
@@ -774,11 +806,11 @@ fn v40_hkdf_stun_per_session_mig_and_control_frames() {
             .wrap_control_unpadded_into(SRTP_PATH_CHALLENGE_MAGIC, &ch, &mut wbuf)
             .unwrap();
         assert_eq!(wbuf[0], 0x90);
-        // P0-4 strict anti-reflection bound: 20B RTP+ext + 4B ctrl + 17B challenge + 16B tag = exact 57B
-        // (64B STUN Success + 57B SRTP Challenge = 121B <= 1.32x against 92B STUN Request)
+        // P0-4 strict anti-reflection bound: 24B Video RTP+ext + 4B ctrl + 17B challenge + 16B tag = exact 61B
+        // (64B STUN Success + 61B SRTP Challenge = 125B <= 1.36x against 92B STUN Request)
         assert_eq!(
-            wn1, 57,
-            "unpadded 0xFFFD challenge MUST be exact 57B (<= 1.32x total reply)"
+            wn1, 61,
+            "unpadded 0xFFFD challenge MUST be exact 61B (<= 1.36x total reply)"
         );
         assert_eq!(
             srv.unwrap_into_ex(&wbuf[..wn1], &mut rbuf),
@@ -793,7 +825,7 @@ fn v40_hkdf_stun_per_session_mig_and_control_frames() {
         let wn2 = cli
             .wrap_control_into(SRTP_HANDOVER_MAGIC, &ho, &mut wbuf)
             .unwrap();
-        assert_eq!(wbuf[0], 0x90);
+        assert!(wbuf[0] == 0x90 || wbuf[0] == 0xB0);
         assert_eq!(
             srv.unwrap_into_ex(&wbuf[..wn2], &mut rbuf),
             Some(SrtpFrame::Handover(ho.len()))
@@ -989,6 +1021,732 @@ fn srtp_settled_loss_accuracy_and_reorder_immunity() {
             got, exp,
             "new migrated lane must report exact 0% loss despite 40-pkt old blackhole + late drain packets (exp={}, got={})",
             exp, got
+        );
+    }
+}
+
+#[test]
+fn camouflage_hardening_invariants_stun_srtp_and_bypass() {
+    let psk = b"camouflage-hardening-test-psk-2026";
+
+    // 1. Consistent Chrome/libwebrtc 4-char Base64 ICE ufrag matches our BoringSSL GREASE DTLS 1.3 persona
+    let mut ufrags = std::collections::HashSet::new();
+    for _ in 0..64 {
+        let ice = SessionIceParams::generate();
+        assert_eq!(ice.ufrag_local.len(), 4);
+        assert_eq!(ice.ufrag_remote.len(), 4);
+        let (req, _) = build_ice_stun_request(psk, &ice, None, true);
+        let parsed = parse_stun(&req, psk).expect("ICE STUN request must verify");
+        assert!(parsed.authenticated);
+        assert!(parsed.use_candidate);
+        assert!(parsed.tie_breaker.is_some());
+        ufrags.insert(ice.username());
+    }
+    assert!(
+        ufrags.len() >= 60,
+        "ICE STUN ufrags must be fresh random 4:4 Base64 pairs (saw {} unique)",
+        ufrags.len()
+    );
+
+    // 2. Minimal bypass RFC 5389 STUN omits WebRTC ICE attributes (ICE-CONTROLLING / USE-CANDIDATE / PRIORITY)
+    //    while remaining 100% parseable & authenticated by bypass --responder (including v0.6.0)!
+    let ice = SessionIceParams::generate();
+    let (byp_req, _) = build_bypass_stun_request(psk, &ice, None);
+    let parsed_byp = parse_stun(&byp_req, psk).expect("bypass STUN request must verify");
+    assert!(parsed_byp.authenticated);
+    assert!(
+        !parsed_byp.use_candidate,
+        "bypass STUN must NOT carry WebRTC USE-CANDIDATE"
+    );
+    assert!(
+        parsed_byp.tie_breaker.is_none(),
+        "bypass STUN must NOT carry WebRTC ICE-CONTROLLING"
+    );
+    assert!(
+        byp_req.len() < 84,
+        "minimal bypass STUN should omit ICE attrs"
+    );
+
+    // 3. High-rate SRTP burst:
+    //    (a) Video frames MUST respect hard packet cap (never 400+ pkts in 1 frame!)
+    //    (b) Tiny QUIC ACKs spilling past 50pps audio cap onto PT=96 MUST widen smoothly above <89B razor spike
+    let key = [0x42u8; 32];
+    let mut tx = SrtpCloakCipher::new(&key, 0xAAAA_1111, 0xBBBB_2222, true, CipherSuite::Aes128Gcm);
+    let mut rx = SrtpCloakCipher::new(
+        &key,
+        0xBBBB_2222,
+        0xAAAA_1111,
+        false,
+        CipherSuite::Aes128Gcm,
+    );
+    tx.set_dual_ssrc(true);
+    rx.set_dual_ssrc(true);
+    tx.set_wan_mtu(DEFAULT_WAN_MTU);
+    rx.set_wan_mtu(DEFAULT_WAN_MTU);
+
+    let mut wbuf = [0u8; 2048];
+    let mut rbuf = [0u8; 2048];
+
+    // (a) 250 full-MTU downlink video packets in <1ms -> multiple closed frames with M=1, max <= 60 pkts/frame
+    let big = [0x5Au8; 1200];
+    let mut max_same_ts = 0usize;
+    let mut cur_ts = 0u32;
+    let mut cur_run = 0usize;
+    let mut closed_m1 = 0usize;
+    for _ in 0..250 {
+        let wn = tx.wrap_into(&big, &mut wbuf).unwrap();
+        let pt = wbuf[1] & 0x7F;
+        let m = (wbuf[1] & 0x80) != 0;
+        assert_eq!(pt, RTP_VIDEO_PT);
+        let ts = u32::from_be_bytes([wbuf[4], wbuf[5], wbuf[6], wbuf[7]]);
+        if cur_run == 0 || ts != cur_ts {
+            cur_ts = ts;
+            cur_run = 1;
+        } else {
+            cur_run += 1;
+        }
+        max_same_ts = max_same_ts.max(cur_run);
+        if m {
+            closed_m1 += 1;
+        }
+        assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(big.len()));
+    }
+    assert!(
+        max_same_ts <= 60,
+        "high-rate video burst must cap pkts/frame <= 60 (got {})",
+        max_same_ts
+    );
+    assert!(
+        closed_m1 >= 4,
+        "250-pkt burst must emit multiple M=1 frame boundaries (got {})",
+        closed_m1
+    );
+
+    // (b) 100 tiny 45B ACK packets in <1ms -> 1 goes to PT=111, 99 spill to PT=96 and are widened smoothly
+    let tiny = [0x40u8; 45];
+    let mut v_lens = Vec::new();
+    for _ in 0..100 {
+        let wn = tx.wrap_into(&tiny, &mut wbuf).unwrap();
+        let pt = wbuf[1] & 0x7F;
+        if pt == RTP_VIDEO_PT {
+            v_lens.push(wn);
+        }
+        assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(tiny.len()));
+        assert_eq!(&rbuf[..tiny.len()], &tiny[..]);
+    }
+    assert!(v_lens.len() >= 95);
+    let min_v = *v_lens.iter().min().unwrap();
+    let max_v = *v_lens.iter().max().unwrap();
+    assert!(
+        min_v >= 140 && max_v >= 280,
+        "spilled tiny PT=96 packets must widen smoothly instead of <89B spike (min={}, max={})",
+        min_v,
+        max_v
+    );
+}
+
+#[test]
+fn v70_dtls13_wire_stealth_grease_padding_and_downgrade_rejection() {
+    use std::collections::HashSet;
+
+    let cpu = detect_cpu_accel();
+    let cli_cfg = build_dimpl_config(CipherPref::Auto, &cpu, true);
+    let srv_cfg = build_dimpl_config(CipherPref::Auto, &cpu, false);
+    let now = Instant::now();
+
+    let is_grease_u16 = |v: u16| (v & 0x0F0F) == 0x0A0A && ((v >> 8) == (v & 0xFF));
+
+    let parse_client_hello = |rec: &[u8]| -> (Vec<u16>, Vec<(u16, Vec<u8>)>) {
+        assert_eq!(rec[0], 22, "expected DTLS Handshake record");
+        assert_eq!(rec[13], 1, "expected ClientHello");
+        let body = &rec[25..]; // 13B record hdr + 12B hs hdr
+        let mut p = 2 + 32; // version + random
+        let sid_len = body[p] as usize;
+        p += 1 + sid_len;
+        let cookie_len = body[p] as usize;
+        p += 1 + cookie_len;
+        let cs_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        let mut cs = Vec::new();
+        for c in body[p..p + cs_len].as_chunks::<2>().0 {
+            cs.push(u16::from_be_bytes([c[0], c[1]]));
+        }
+        p += cs_len;
+        let comp_len = body[p] as usize;
+        p += 1 + comp_len;
+        let exts_len = u16::from_be_bytes([body[p], body[p + 1]]) as usize;
+        p += 2;
+        let end = p + exts_len;
+        let mut exts = Vec::new();
+        while p + 4 <= end {
+            let et = u16::from_be_bytes([body[p], body[p + 1]]);
+            let el = u16::from_be_bytes([body[p + 2], body[p + 3]]) as usize;
+            p += 4;
+            exts.push((et, body[p..p + el].to_vec()));
+            p += el;
+        }
+        (cs, exts)
+    };
+
+    // 1. Run 10 full DTLS 1.3 handshakes + close_notify:
+    //    - 0 HelloRetryRequest (direct 1-RTT ServerHello)
+    //    - 0 EXT_PADDING (0x0015)
+    //    - Chrome/libwebrtc use_srtp order [0x0007, 0x0008, 0x0001]
+    //    - RFC 8701 GREASE in cipher suites, supported_versions, supported_groups, key_share, extensions
+    //    - Per-handshake shuffled extension order
+    //    - Variable encrypted Server ACK and close_notify lengths (RFC 9147 §4.2 inner padding)
+    let mut ext_orders: HashSet<Vec<u16>> = HashSet::new();
+    let mut ack_lens: HashSet<usize> = HashSet::new();
+    let mut close_lens: HashSet<usize> = HashSet::new();
+    let hrr_magic: [u8; 32] = [
+        0xCF, 0x21, 0xAD, 0x74, 0xE5, 0x9A, 0x61, 0x11, 0xBE, 0x1D, 0x8C, 0x02, 0x1E, 0x65, 0xB8,
+        0x91, 0xC2, 0xA2, 0x11, 0x16, 0x7A, 0xBB, 0x8C, 0x5E, 0x07, 0x9E, 0x09, 0xE2, 0xC8, 0xA8,
+        0x33, 0x9C,
+    ];
+
+    for _ in 0..10 {
+        let mut cli = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&cli_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        let mut srv = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&srv_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        cli.set_active(true);
+        let _ = cli.handle_timeout(now);
+        let _ = srv.handle_timeout(now);
+        let mut buf = vec![0u8; 4096];
+        let mut ch_checked = false;
+        let (mut c_ok, mut s_ok) = (false, false);
+
+        for _ in 0..12 {
+            let mut c_pkts = Vec::new();
+            loop {
+                match cli.poll_output(&mut buf) {
+                    Output::Packet(p) => c_pkts.push(p.to_vec()),
+                    Output::Connected => c_ok = true,
+                    Output::Timeout(_) => break,
+                    _ => {}
+                }
+            }
+            for p in c_pkts {
+                if !ch_checked && p[0] == 22 && p.len() > 25 && p[13] == 1 {
+                    ch_checked = true;
+                    let (cs, exts) = parse_client_hello(&p);
+                    assert!(
+                        cs.iter().any(|&v| is_grease_u16(v)),
+                        "ClientHello cipher suites must contain RFC 8701 GREASE"
+                    );
+                    assert!(
+                        !exts.iter().any(|(t, _)| *t == 0x0015),
+                        "ClientHello MUST NOT contain 0x0015 EXT_PADDING zero blob!"
+                    );
+                    let grease_ext_cnt = exts.iter().filter(|(t, _)| is_grease_u16(*t)).count();
+                    assert!(
+                        grease_ext_cnt >= 2,
+                        "ClientHello must contain >=2 GREASE extensions (got {})",
+                        grease_ext_cnt
+                    );
+                    // R2-P2-2: BoringSSL bookend pinning — GREASE #1 at index 0, GREASE #2 at last index
+                    assert!(
+                        is_grease_u16(exts[0].0),
+                        "ClientHello first extension MUST be GREASE (got 0x{:04x})",
+                        exts[0].0
+                    );
+                    assert!(
+                        is_grease_u16(exts.last().unwrap().0),
+                        "ClientHello last extension MUST be GREASE (got 0x{:04x})",
+                        exts.last().unwrap().0
+                    );
+                    let use_srtp = exts
+                        .iter()
+                        .find(|(t, _)| *t == 0x000E)
+                        .expect("use_srtp extension missing");
+                    assert_eq!(
+                        &use_srtp.1[..8],
+                        &[0x00, 0x06, 0x00, 0x07, 0x00, 0x08, 0x00, 0x01],
+                        "use_srtp must use Chrome/libwebrtc order [0x0007, 0x0008, 0x0001]"
+                    );
+                    let sv = exts
+                        .iter()
+                        .find(|(t, _)| *t == 0x002B)
+                        .expect("supported_versions missing");
+                    assert!(
+                        sv.1[1..]
+                            .as_chunks::<2>()
+                            .0
+                            .iter()
+                            .any(|c| is_grease_u16(u16::from_be_bytes([c[0], c[1]]))),
+                        "supported_versions must include GREASE"
+                    );
+                    let non_grease_order: Vec<u16> = exts
+                        .iter()
+                        .map(|(t, _)| *t)
+                        .filter(|t| !is_grease_u16(*t))
+                        .collect();
+                    ext_orders.insert(non_grease_order);
+                }
+                srv.handle_packet(&p).unwrap();
+            }
+
+            let mut s_pkts = Vec::new();
+            loop {
+                match srv.poll_output(&mut buf) {
+                    Output::Packet(p) => s_pkts.push(p.to_vec()),
+                    Output::Connected => s_ok = true,
+                    Output::Timeout(_) => break,
+                    _ => {}
+                }
+            }
+            for p in s_pkts {
+                // Verify ServerHello is NOT HelloRetryRequest (0x02 + hrr_magic)
+                if p[0] == 22 && p.len() >= 25 + 34 && p[13] == 2 {
+                    assert_ne!(
+                        &p[27..59],
+                        &hrr_magic[..],
+                        "Server MUST NOT emit HelloRetryRequest after authenticated ICE STUN!"
+                    );
+                }
+                // After server is Connected, the final server ciphertext record is DTLS 1.3 ACK
+                if s_ok && (p[0] & 0xE0) == 0x20 {
+                    ack_lens.insert(p.len());
+                }
+                cli.handle_packet(&p).unwrap();
+            }
+            if c_ok && s_ok {
+                break;
+            }
+        }
+        assert!(c_ok && s_ok && ch_checked);
+
+        // Close and check encrypted close_notify length variation (breaks fixed 24B fingerprint)
+        cli.close().unwrap();
+        loop {
+            match cli.poll_output(&mut buf) {
+                Output::Packet(p) => {
+                    assert!(
+                        p.len() >= 28,
+                        "padded DTLS 1.3 close_notify must exceed constant 24B (got {}B)",
+                        p.len()
+                    );
+                    close_lens.insert(p.len());
+                }
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+    }
+    assert!(
+        ext_orders.len() >= 3,
+        "ClientHello extensions must be per-handshake shuffled (unique orders={})",
+        ext_orders.len()
+    );
+    assert!(
+        ack_lens.len() >= 3 && !ack_lens.contains(&72),
+        "DTLS 1.3 Server ACK lengths must be padded & variable (saw {:?})",
+        ack_lens
+    );
+    assert!(
+        close_lens.len() >= 3,
+        "DTLS 1.3 close_notify lengths must be padded & variable (saw {:?})",
+        close_lens
+    );
+
+    // 2. 1-byte MITM downgrade attack: flipping 0xFE 0xFC -> 0xFE 0xFD inside ClientHello
+    //    (a) V13Only server MUST reject the downgraded ClientHello (0 ServerHello emitted)
+    let mut cli_mitm = new_dtls_instance(
+        DtlsMinVersion::V13Only,
+        Arc::clone(&cli_cfg),
+        generate_ephemeral_webrtc_cert(),
+        now,
+    );
+    let mut srv_v13 = new_dtls_instance(
+        DtlsMinVersion::V13Only,
+        Arc::clone(&srv_cfg),
+        generate_ephemeral_webrtc_cert(),
+        now,
+    );
+    cli_mitm.set_active(true);
+    let _ = cli_mitm.handle_timeout(now);
+    let _ = srv_v13.handle_timeout(now);
+    let mut buf = vec![0u8; 4096];
+    let mut ch = match cli_mitm.poll_output(&mut buf) {
+        Output::Packet(p) => p.to_vec(),
+        _ => panic!("expected ClientHello"),
+    };
+    let pos = ch
+        .windows(2)
+        .position(|w| w == [0xFE, 0xFC])
+        .expect("0xFEFC DTLS 1.3 version marker");
+    ch[pos + 1] = 0xFD; // 1-byte MITM downgrade!
+    assert!(
+        srv_v13.handle_packet(&ch).is_err()
+            || !matches!(srv_v13.poll_output(&mut buf), Output::Packet(_)),
+        "V13Only server MUST reject 1-byte MITM downgraded ClientHello!"
+    );
+
+    //    (b) Even in Auto mode, RFC 8446 §4.1.3 DOWNGRD\x01 sentinel MUST abort the downgrade!
+    let mut cli_auto = Dtls::new_auto(Arc::clone(&cli_cfg), generate_ephemeral_webrtc_cert(), now);
+    let mut srv_auto = Dtls::new_auto(Arc::clone(&srv_cfg), generate_ephemeral_webrtc_cert(), now);
+    cli_auto.set_active(true);
+    let _ = cli_auto.handle_timeout(now);
+    let _ = srv_auto.handle_timeout(now);
+    let mut ch_auto = match cli_auto.poll_output(&mut buf) {
+        Output::Packet(p) => p.to_vec(),
+        _ => panic!("expected Auto ClientHello"),
+    };
+    // R2-P2-2: Verify Auto HybridClientHello matches BoringSSL GREASE bookends & cipher suite order
+    {
+        let (cs_auto, exts_auto) = parse_client_hello(&ch_auto);
+        assert!(is_grease_u16(cs_auto[0]));
+        assert_eq!(
+            &cs_auto[1..12],
+            &[
+                0x1301, 0x1302, 0x1303, 0xC02B, 0xC02F, 0xC02C, 0xC030, 0xCCA9, 0xCCA8, 0xC013,
+                0xC014
+            ],
+            "Auto HybridClientHello cipher suite order must match BoringSSL Chrome order"
+        );
+        assert!(is_grease_u16(exts_auto[0].0));
+        assert!(is_grease_u16(exts_auto.last().unwrap().0));
+    }
+    let pos2 = ch_auto
+        .windows(2)
+        .position(|w| w == [0xFE, 0xFC])
+        .expect("0xFEFC marker in Auto ClientHello");
+    ch_auto[pos2 + 1] = 0xFD;
+    let _ = srv_auto.handle_packet(&ch_auto);
+    let mut downgrade_rejected = false;
+    for _ in 0..8 {
+        let mut sp = Vec::new();
+        loop {
+            match srv_auto.poll_output(&mut buf) {
+                Output::Packet(p) => sp.push(p.to_vec()),
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        for p in sp {
+            if cli_auto.handle_packet(&p).is_err() {
+                downgrade_rejected = true;
+                break;
+            }
+        }
+        if downgrade_rejected {
+            break;
+        }
+        let mut cp = Vec::new();
+        loop {
+            match cli_auto.poll_output(&mut buf) {
+                Output::Packet(p) => cp.push(p.to_vec()),
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        for p in cp {
+            let _ = srv_auto.handle_packet(&p);
+        }
+    }
+    assert!(
+        downgrade_rejected,
+        "Auto client MUST abort on RFC 8446 §4.1.3 DOWNGRD\\x01 downgrade sentinel!"
+    );
+}
+
+#[test]
+fn v70_browser_ufrag_stun_scope_video_clock_and_dynamic_rtp_extensions() {
+    // 1. Unified Chrome/libwebrtc persona: 100% 4-char Base64 ufrag matching BoringSSL GREASE DTLS 1.3
+    for _ in 0..200 {
+        let ice = SessionIceParams::generate();
+        assert_eq!(
+            ice.ufrag_local.len(),
+            4,
+            "Chrome ufrag_local must be 4 chars"
+        );
+        assert_eq!(
+            ice.ufrag_remote.len(),
+            4,
+            "Chrome ufrag_remote must be 4 chars"
+        );
+        assert_eq!(ice.priority, 0x7EFF_FFFF);
+    }
+
+    // 2. Endpoint-scoped STUN HKDF: isolates ports, isolates cloak vs bypass, matches DNAT port tag
+    let psk = b"v70-scope-test-psk";
+    let k_cloak_a = derive_stun_scope_key_for(psk, 19643, None, false);
+    let k_cloak_b = derive_stun_scope_key_for(psk, 19644, None, false);
+    let k_bypass_a = derive_stun_scope_key_for(psk, 19643, None, true);
+    let k_bypass_dnat = derive_stun_scope_key_for(psk, 19644, Some("443"), true);
+    let k_bypass_443 = derive_stun_scope_key_for(psk, 443, None, true);
+    assert_ne!(
+        k_cloak_a, k_cloak_b,
+        "different ports must derive distinct keys"
+    );
+    assert_ne!(
+        k_cloak_a, k_bypass_a,
+        "cloak vs bypass must derive distinct keys"
+    );
+    assert_eq!(
+        k_bypass_dnat, k_bypass_443,
+        "explicit --stun-scope <PUBLIC_PORT> must match client connecting to <PUBLIC_PORT>"
+    );
+
+    // 3. SRTP 30/60 FPS virtual video clock + dynamic 24B/28B RFC 8285 extensions + RFC 3550 P=1 (0xB0)
+    let key = [0x3Cu8; 32];
+    let mut tx = SrtpCloakCipher::new(&key, 0x1122_3344, 0x5566_7788, true, CipherSuite::Aes128Gcm);
+    let mut rx = SrtpCloakCipher::new(
+        &key,
+        0x5566_7788,
+        0x1122_3344,
+        false,
+        CipherSuite::Aes128Gcm,
+    );
+    tx.set_dual_ssrc(true);
+    rx.set_dual_ssrc(true);
+    tx.set_wan_mtu(DEFAULT_WAN_MTU);
+    rx.set_wan_mtu(DEFAULT_WAN_MTU);
+
+    let mut wbuf = [0u8; 2048];
+    let mut rbuf = [0u8; 2048];
+    let mut prev_v_ts: Option<u32> = None;
+    let mut saw_p1 = 0usize;
+    let mut saw_mid = 0usize;
+    let mut saw_video_ext_words = std::collections::HashSet::new();
+    let mut saw_audio_ext_words = std::collections::HashSet::new();
+    let mut micro_frames = 0usize;
+    let mut cur_frame_pkts = 0usize;
+
+    for i in 0..300usize {
+        let payload = if i % 5 == 0 {
+            vec![0x11u8; 64]
+        } else {
+            vec![0x22u8; 1100]
+        };
+        let wn = tx.wrap_into(&payload, &mut wbuf).unwrap();
+        let b0 = wbuf[0];
+        assert!(b0 == 0x90 || b0 == 0xB0);
+        if b0 == 0xB0 {
+            saw_p1 += 1;
+        }
+        assert_eq!(&wbuf[12..14], &[0xBE, 0xDE]);
+        let ext_words = u16::from_be_bytes([wbuf[14], wbuf[15]]);
+        let pt = wbuf[1] & 0x7F;
+        let m = (wbuf[1] & 0x80) != 0;
+        let ts = u32::from_be_bytes([wbuf[4], wbuf[5], wbuf[6], wbuf[7]]);
+        if pt == RTP_VIDEO_PT {
+            saw_video_ext_words.insert(ext_words);
+            if ext_words == 3 {
+                saw_mid += 1;
+            }
+            if let Some(prev) = prev_v_ts {
+                if ts != prev {
+                    let dt = ts.wrapping_sub(prev);
+                    assert!(
+                        dt >= 1320,
+                        "Video frame delta MUST stay >= 1320 ticks (<=68 FPS), got {} ticks!",
+                        dt
+                    );
+                    if cur_frame_pkts > 0 && cur_frame_pkts <= 3 {
+                        micro_frames += 1;
+                    }
+                    cur_frame_pkts = 0;
+                }
+            }
+            prev_v_ts = Some(ts);
+            cur_frame_pkts += 1;
+            if m {
+                if cur_frame_pkts <= 3 {
+                    micro_frames += 1;
+                }
+                cur_frame_pkts = 0;
+            }
+        } else {
+            assert_eq!(pt, RTP_AUDIO_PT);
+            saw_audio_ext_words.insert(ext_words);
+        }
+        assert_eq!(rx.unwrap_into(&wbuf[..wn], &mut rbuf), Some(payload.len()));
+        assert_eq!(&rbuf[..payload.len()], &payload[..]);
+    }
+    assert!(
+        saw_p1 >= 10,
+        "RFC 3550 P=1 (0xB0) must appear on padded SRTP packets (got {})",
+        saw_p1
+    );
+    assert!(
+        saw_mid >= 5,
+        "Initial video packets should include RFC 8285 MID (28B hdr)"
+    );
+    assert!(
+        saw_video_ext_words.contains(&2) && saw_video_ext_words.contains(&3),
+        "Video extensions must vary between 28B (with mid) and 24B (abs-send-time+twcc), saw {:?}",
+        saw_video_ext_words
+    );
+    assert!(
+        saw_audio_ext_words.contains(&2) || saw_audio_ext_words.contains(&3),
+        "Audio extensions must carry ssrc-audio-level+twcc, saw {:?}",
+        saw_audio_ext_words
+    );
+    assert_eq!(
+        micro_frames, 0,
+        "Video frame pacing MUST NOT produce <=3-pkt mechanical micro-frames"
+    );
+}
+
+#[test]
+fn r2_dtls13_flight4_corruption_fast_recovery() {
+    let cpu = detect_cpu_accel();
+    let cli_cfg = build_dimpl_config(CipherPref::Auto, &cpu, true);
+    let srv_cfg = build_dimpl_config(CipherPref::Auto, &cpu, false);
+    let now = Instant::now();
+    let mut buf = vec![0u8; 4096];
+
+    // (a) Corrupting encrypted Finished (byte -10) in coalesced Flight-4 MUST recover on the
+    //     very next coalesced Flight-4 retransmission (not drop the whole datagram for 12s!).
+    {
+        let mut cli = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&cli_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        let mut srv = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&srv_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        cli.set_active(true);
+        let _ = cli.handle_timeout(now);
+        let _ = srv.handle_timeout(now);
+
+        let ch = match cli.poll_output(&mut buf) {
+            Output::Packet(p) => p.to_vec(),
+            _ => panic!("expected ClientHello"),
+        };
+        srv.handle_packet(&ch).unwrap();
+
+        let mut flight4 = Vec::new();
+        loop {
+            match srv.poll_output(&mut buf) {
+                Output::Packet(p) => flight4.push(p.to_vec()),
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        assert!(!flight4.is_empty());
+
+        // Deliver Flight-4 with byte -10 corrupted (Finished AEAD tag fails)
+        let mut bad_f4 = flight4.clone();
+        let last = bad_f4.last_mut().unwrap();
+        let idx = last.len() - 10;
+        last[idx] ^= 0xFF;
+        for p in &bad_f4 {
+            cli.handle_packet(p).unwrap();
+        }
+        // Drain client output — should NOT be connected yet
+        let mut c_ok = false;
+        loop {
+            match cli.poll_output(&mut buf) {
+                Output::Packet(_) => {}
+                Output::Connected => c_ok = true,
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        assert!(!c_ok, "corrupted Finished must not complete handshake");
+
+        // Now force server to retransmit full coalesced Flight-4 cleanly (with new epoch-2 seqs!)
+        let t_retx = now + Duration::from_secs(2);
+        srv.handle_timeout(t_retx).unwrap();
+        let mut retx_f4 = Vec::new();
+        loop {
+            match srv.poll_output(&mut buf) {
+                Output::Packet(p) => retx_f4.push(p.to_vec()),
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        assert!(!retx_f4.is_empty(), "server must retransmit Flight-4");
+        for p in &retx_f4 {
+            cli.handle_packet(p).unwrap();
+        }
+        let mut s_ok = false;
+        let mut c_pkts = Vec::new();
+        loop {
+            match cli.poll_output(&mut buf) {
+                Output::Packet(p) => c_pkts.push(p.to_vec()),
+                Output::Connected => c_ok = true,
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        assert!(
+            c_ok,
+            "client MUST accept clean Finished from coalesced Flight-4 retransmission immediately!"
+        );
+        for p in &c_pkts {
+            srv.handle_packet(p).unwrap();
+        }
+        loop {
+            match srv.poll_output(&mut buf) {
+                Output::Connected => s_ok = true,
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        assert!(s_ok, "server MUST complete handshake after client Flight-5");
+    }
+
+    // (b) Corrupting plaintext ServerHello.random (byte 35) poisons handshake traffic keys so
+    //     all encrypted Flight-4 records fail AEAD decrypt -> client MUST surface Err immediately
+    //     so ClientWorker executes <50ms fast DTLS reset instead of stalling 12s!
+    {
+        let mut cli = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&cli_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        let mut srv = new_dtls_instance(
+            DtlsMinVersion::V13Only,
+            Arc::clone(&srv_cfg),
+            generate_ephemeral_webrtc_cert(),
+            now,
+        );
+        cli.set_active(true);
+        let _ = cli.handle_timeout(now);
+        let _ = srv.handle_timeout(now);
+
+        let ch = match cli.poll_output(&mut buf) {
+            Output::Packet(p) => p.to_vec(),
+            _ => panic!("expected ClientHello"),
+        };
+        srv.handle_packet(&ch).unwrap();
+
+        let mut flight4 = Vec::new();
+        loop {
+            match srv.poll_output(&mut buf) {
+                Output::Packet(p) => flight4.push(p.to_vec()),
+                Output::Timeout(_) => break,
+                _ => {}
+            }
+        }
+        flight4[0][35] ^= 0xFF; // flip byte inside ServerHello.random
+        let mut got_err = false;
+        for p in &flight4 {
+            if cli.handle_packet(p).is_err() {
+                got_err = true;
+                break;
+            }
+        }
+        assert!(
+            got_err,
+            "corrupted ServerHello.random causing all epoch-2 decrypts to fail MUST return Err immediately!"
         );
     }
 }

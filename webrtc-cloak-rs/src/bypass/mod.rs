@@ -21,7 +21,8 @@ use crate::constants::{
     TELEMETRY_DEFAULT_INTERVAL_SECS, WORKER_IDLE_POLL_SECS, WORKER_QUIET_STOP_POLL_MS,
 };
 use crate::protocol::{
-    build_stun_success_response, is_shutdown_requested, parse_stun, register_shutdown_poll,
+    build_stun_success_response_with_key, derive_stun_scope_key_for, is_shutdown_requested,
+    parse_stun_with_key, register_shutdown_poll, stun_hmac_key,
 };
 use crate::server::{SeenTxidCache, TxidCheck};
 use crate::telemetry::{TelemetryConfig, TelemetryHub, WorkerSnapshot};
@@ -47,6 +48,8 @@ pub struct BypassConfig {
     pub listen_addr: SocketAddr,
     pub server_addr: SocketAddr,
     pub psk: Vec<u8>,
+    /// Optional explicit v0.7 STUN scope tag (`--stun-scope`); defaults to `server_addr.port()`.
+    pub stun_scope: Option<String>,
     pub rotate_interval_secs: u64,
     pub workers: usize,
     pub max_sessions: usize,
@@ -68,6 +71,8 @@ pub struct BypassConfig {
 pub struct BypassResponderConfig {
     pub listen_addr: SocketAddr,
     pub psk: Vec<u8>,
+    /// Optional explicit v0.7 STUN scope tag (`--stun-scope <PUBLIC_PORT|TAG>`); defaults to listen port.
+    pub stun_scope: Option<String>,
     pub workers: usize,
     pub wan_mtu: usize,
     pub udp_batch: usize,
@@ -246,7 +251,8 @@ fn handle_responder_packet(
     pkt: &[u8],
     peer: SocketAddr,
     now: Instant,
-    psk: &[u8],
+    stun_auth_psk: &[u8; 32],
+    stun_mi_key: &[u8; 32],
     seen_txids: &Mutex<SeenTxidCache>,
     cnt: &mut ResponderCounters,
 ) -> Option<Vec<u8>> {
@@ -254,7 +260,7 @@ fn handle_responder_packet(
         cnt.unauth_drops = cnt.unauth_drops.saturating_add(1);
         return None;
     }
-    let Some(parsed) = parse_stun(pkt, psk) else {
+    let Some(parsed) = parse_stun_with_key(pkt, stun_auth_psk, stun_mi_key) else {
         cnt.unauth_drops = cnt.unauth_drops.saturating_add(1);
         return None;
     };
@@ -263,22 +269,18 @@ fn handle_responder_packet(
         return None;
     }
     let mut cache = seen_txids.lock().unwrap_or_else(|e| e.into_inner());
-    match cache.check(parsed.txid, peer, now, true) {
+    // v0.7: bypass clients mint fresh txid on every retry -> enforce strict single-use txid (0 retransmits)
+    // to eliminate same-port replay step oracles on bypass responders.
+    match cache.check_with_limit(parsed.txid, peer, now, false, 0) {
         TxidCheck::Fresh => {
-            let resp = build_stun_success_response(&parsed.txid, peer, psk);
-            cache.record(parsed.txid, peer, now, &resp);
+            let resp = build_stun_success_response_with_key(&parsed.txid, peer, stun_mi_key);
+            cache.record_single_use(parsed.txid, peer, now);
             drop(cache);
             cnt.rx_pkts = cnt.rx_pkts.saturating_add(1);
             cnt.rx_bytes = cnt.rx_bytes.saturating_add(pkt.len() as u64);
             Some(resp)
         }
-        TxidCheck::Retransmit(buf, len) => {
-            drop(cache);
-            cnt.rx_pkts = cnt.rx_pkts.saturating_add(1);
-            cnt.rx_bytes = cnt.rx_bytes.saturating_add(pkt.len() as u64);
-            Some(buf[..len as usize].to_vec())
-        }
-        TxidCheck::Rejected => {
+        TxidCheck::Retransmit(_, _) | TxidCheck::Rejected => {
             drop(cache);
             cnt.unauth_drops = cnt.unauth_drops.saturating_add(1);
             None
@@ -300,6 +302,13 @@ fn run_responder_worker(
     let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
     poll.registry()
         .register(&mut listen_sock, LISTEN_TOKEN, Interest::READABLE)?;
+    let actual_port = listen_sock
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(cfg.listen_addr.port());
+    let stun_auth_psk =
+        derive_stun_scope_key_for(&cfg.psk, actual_port, cfg.stun_scope.as_deref(), true);
+    let stun_mi_key = stun_hmac_key(&stun_auth_psk);
 
     log(
         "bypass-responder",
@@ -373,7 +382,8 @@ fn run_responder_worker(
                                         pkt,
                                         peer,
                                         now,
-                                        &cfg.psk,
+                                        &stun_auth_psk,
+                                        &stun_mi_key,
                                         &seen_txids,
                                         &mut cnt,
                                     ) {
@@ -412,7 +422,8 @@ fn run_responder_worker(
                                     &rbuf[..n],
                                     peer,
                                     now,
-                                    &cfg.psk,
+                                    &stun_auth_psk,
+                                    &stun_mi_key,
                                     &seen_txids,
                                     &mut cnt,
                                 ) {

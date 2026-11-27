@@ -67,8 +67,6 @@ const DTLS_DEFAULT_MTU: usize = 1150;
 const DTLS_MAX_MTU: usize = 1360;
 /// DTLS 配置允许的最小分片 MTU 下限（字节）。
 const DTLS_MIN_MTU: usize = 256;
-/// 客户端随机选用的 DTLS MTU 候选池（字节），消除固定 1150B ClientHello 长度尖峰指纹。
-const DTLS_CLIENT_MTUS: [usize; 8] = [760, 840, 920, 1000, 1080, 1150, 1240, 1340];
 /// DTLS 握手首包重传超时 RTO（毫秒）。
 const DTLS_FLIGHT_START_RTO_MS: u64 = 350;
 /// DTLS 单个 flight 最大重传次数。
@@ -461,7 +459,9 @@ fn build_single_dimpl_config(
         .with_crypto_provider(provider)
         .mtu(dtls_mtu)
         .require_client_certificate(true)
-        .use_server_cookie(true)
+        // ICE STUN already authenticates PSK + source reachability before DTLS is ever reached,
+        // matching real Chrome/Firefox/Pion WebRTC (zero 109B HelloRetryRequest round-trip).
+        .use_server_cookie(false)
         .flight_start_rto(Duration::from_millis(DTLS_FLIGHT_START_RTO_MS))
         .flight_retries(DTLS_FLIGHT_RETRIES)
         .handshake_timeout(Duration::from_secs(DTLS_HANDSHAKE_TIMEOUT_SECS));
@@ -513,27 +513,16 @@ pub fn build_dimpl_config_pool_for(
     } else {
         DTLS_MAX_MTU
     };
-    if !is_client {
-        return DtlsConfigPool {
-            configs: vec![build_single_dimpl_config(
-                pref,
-                cpu,
-                false,
-                DTLS_DEFAULT_MTU.min(max_dtls_mtu),
-            )],
-        };
+    // Patched `dimpl` emits natural Chrome-aligned ClientHello without RFC 7685 MTU zero-padding,
+    // so both client and server use a single clean MTU clamped to WAN MTU.
+    DtlsConfigPool {
+        configs: vec![build_single_dimpl_config(
+            pref,
+            cpu,
+            is_client,
+            DTLS_DEFAULT_MTU.min(max_dtls_mtu),
+        )],
     }
-    let mut mtus: Vec<usize> = DTLS_CLIENT_MTUS
-        .iter()
-        .map(|&m| m.min(max_dtls_mtu))
-        .collect();
-    mtus.sort_unstable();
-    mtus.dedup();
-    let configs = mtus
-        .into_iter()
-        .map(|m| build_single_dimpl_config(pref, cpu, true, m))
-        .collect();
-    DtlsConfigPool { configs }
 }
 
 /// Build a single `dimpl` DTLS 1.3 / 1.2 Config (default WAN MTU).

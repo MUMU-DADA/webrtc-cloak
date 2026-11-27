@@ -3,7 +3,9 @@
 use super::reserve_free_port;
 use crate::client::{run_client, ClientConfig, KA_MAX_RETRIES};
 use crate::constants::STUN_BINDING_REQUEST;
-use crate::protocol::{demux_rfc7983, parse_stun, CipherPref, DtlsMinVersion, PacketKind};
+use crate::protocol::{
+    demux_rfc7983, derive_stun_scope_key, parse_stun, CipherPref, DtlsMinVersion, PacketKind,
+};
 use crate::server::{run_server, ServerConfig};
 use crate::telemetry::TelemetryConfig;
 use std::collections::HashMap;
@@ -40,6 +42,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::Auto,
@@ -72,7 +75,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
     let relay_same_txid = Arc::clone(&same_txid_retransmits);
     let relay_bh_txid_match = Arc::clone(&blackholed_ka_txids_matched);
     let relay_dl_srtcp = Arc::clone(&downlink_srtcp_during_blackhole);
-    let relay_psk = psk.clone();
+    let relay_psk = derive_stun_scope_key(&psk, server_port).to_vec();
 
     let relay_front = UdpSocket::bind(("127.0.0.1", relay_port)).unwrap();
     relay_front.set_nonblocking(true).unwrap();
@@ -95,7 +98,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
                 let is_ka_stun = demux_rfc7983(pkt) == PacketKind::Stun
                     && parse_stun(pkt, &relay_psk)
                         .map(|p| {
-                            p.authenticated
+                            p.fingerprint_ok
                                 && p.msg_type == STUN_BINDING_REQUEST
                                 && !p.use_candidate
                         })
@@ -108,7 +111,8 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
                         if let Some(p) = parse_stun(pkt, &relay_psk) {
                             match bh_first_ka_txid {
                                 None => bh_first_ka_txid = Some(p.txid),
-                                Some(prev) if prev == p.txid => {
+                                Some(prev) if prev != p.txid => {
+                                    // v0.7 mints fresh txid on keepalive retries to eliminate Ready replay oracle
                                     relay_bh_txid_match.fetch_add(1, Ordering::SeqCst);
                                 }
                                 _ => {}
@@ -118,14 +122,14 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
                     continue; // Drop 100% uplink for blackholed 5-tuple!
                 }
 
-                // Phase 1: Drop exactly ONE STUN keepalive to verify RFC 5389 same-txid retry without rotation
+                // Phase 1: Drop exactly ONE STUN keepalive to verify v0.7 fresh-txid retry without rotation
                 if is_ka_stun {
                     if let Some(p) = parse_stun(pkt, &relay_psk) {
                         if relay_drop_first.swap(false, Ordering::SeqCst) {
                             dropped_ka_txid = Some(p.txid);
                             continue;
                         }
-                        if dropped_ka_txid == Some(p.txid) {
+                        if dropped_ka_txid.is_some_and(|old| old != p.txid) {
                             relay_same_txid.fetch_add(1, Ordering::SeqCst);
                             dropped_ka_txid = None;
                         }
@@ -163,6 +167,7 @@ fn asymmetric_uplink_blackhole_auto_rotates_and_single_stun_loss_retransmits_sam
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::Auto,
@@ -294,6 +299,7 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -350,6 +356,7 @@ fn dtls13_flight5_packet_loss_retransmits_from_ready_state() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -432,6 +439,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk1,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::Auto,
@@ -487,6 +495,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), relay_port),
             psk: cli_psk,
+            stun_scope: Some(server_port.to_string()),
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::Auto,
@@ -543,6 +552,7 @@ fn graceful_server_shutdown_bye_triggers_subsecond_reconnect() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk2,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::Auto,
@@ -619,6 +629,7 @@ fn udp_batch_high_burst_bidirectional_and_ipv6_echo() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), backend_port),
             psk: srv_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_required: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -640,6 +651,7 @@ fn udp_batch_high_burst_bidirectional_and_ipv6_echo() {
             listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
             server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), server_port),
             psk: cli_psk,
+            stun_scope: None,
             cipher_pref: CipherPref::Auto,
             dtls_decoy: true,
             dtls_min_version: DtlsMinVersion::V13Only,
@@ -717,5 +729,213 @@ fn udp_batch_high_burst_bidirectional_and_ipv6_echo() {
     stop_echo.store(true, Ordering::SeqCst);
     let _ = cli_h.join();
     let _ = srv_h.join();
+    let _ = echo_h.join();
+}
+
+/// R2-P0-1 regression test: abrupt server restart with ZERO SRTCP BYE / DTLS close_notify
+/// (exact SIGKILL / power-loss semantics) MUST NOT trap the client in an infinite 64B STUN
+/// zombie loop. Session-key (`mi_key_mig`) Ready keepalives force the restarted server to
+/// silently drop stale keepalives so the client detects consent loss and re-handshakes in <8s.
+#[test]
+fn r2_sigkill_server_restart_recovers_without_zombie_loop() {
+    use crate::server::{run_server, ServerConfig};
+
+    let psk = b"r2-sigkill-restart-regression-psk".to_vec();
+    let scope_tag = "r2-sigkill-scope".to_string();
+    let free_udp_port = || {
+        UdpSocket::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port()
+    };
+    let echo_port = free_udp_port();
+    let srv1_port = free_udp_port();
+    let srv2_port = free_udp_port();
+    let proxy_port = free_udp_port();
+    let client_port = free_udp_port();
+
+    let stop_all = Arc::new(AtomicBool::new(false));
+    let stop_srv1 = Arc::new(AtomicBool::new(false));
+    let active_srv_port = Arc::new(AtomicU16::new(srv1_port));
+
+    // 1. Echo backend
+    let echo_stop = Arc::clone(&stop_all);
+    let echo_h = thread::spawn(move || {
+        let sock = UdpSocket::bind(("127.0.0.1", echo_port)).unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(50)))
+            .unwrap();
+        let mut buf = [0u8; 4096];
+        while !echo_stop.load(Ordering::Relaxed) {
+            if let Ok((n, src)) = sock.recv_from(&mut buf) {
+                let _ = sock.send_to(&buf[..n], src);
+            }
+        }
+    });
+
+    // 2. Switching proxy: instantaneously flips target from srv1 -> srv2 (0 BYE/close_notify reaches client!)
+    let proxy_stop = Arc::clone(&stop_all);
+    let proxy_tgt = Arc::clone(&active_srv_port);
+    let proxy_h = thread::spawn(move || {
+        let front = UdpSocket::bind(("127.0.0.1", proxy_port)).unwrap();
+        front.set_nonblocking(true).unwrap();
+        let mut upstreams: HashMap<u16, (UdpSocket, SocketAddr)> = HashMap::new();
+        let mut buf = [0u8; 4096];
+        while !proxy_stop.load(Ordering::Relaxed) {
+            let cur_srv = proxy_tgt.load(Ordering::SeqCst);
+            let srv_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), cur_srv);
+            while let Ok((n, cli_addr)) = front.recv_from(&mut buf) {
+                let entry = upstreams.entry(cli_addr.port()).or_insert_with(|| {
+                    let s = UdpSocket::bind("127.0.0.1:0").unwrap();
+                    s.set_nonblocking(true).unwrap();
+                    (s, cli_addr)
+                });
+                let _ = entry.0.send_to(&buf[..n], srv_addr);
+            }
+            for (usock, cli_addr) in upstreams.values() {
+                while let Ok((n, from)) = usock.recv_from(&mut buf) {
+                    if from.port() == cur_srv {
+                        let _ = front.send_to(&buf[..n], *cli_addr);
+                    }
+                }
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+
+    // 3. First server instance
+    let srv1_psk = psk.clone();
+    let srv1_scope = scope_tag.clone();
+    let srv1_stop_c = Arc::clone(&stop_srv1);
+    let srv1_h = thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), srv1_port),
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), echo_port),
+            psk: srv1_psk,
+            stun_scope: Some(srv1_scope),
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 16,
+            wan_mtu: 1488,
+            udp_batch: 1,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(srv1_stop_c),
+        });
+    });
+
+    // 4. Client pointing to proxy (--keepalive 1 for fast test)
+    let cli_psk = psk.clone();
+    let cli_scope = scope_tag.clone();
+    let cli_stop = Arc::clone(&stop_all);
+    let cli_h = thread::spawn(move || {
+        let _ = run_client(ClientConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), client_port),
+            server_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), proxy_port),
+            psk: cli_psk,
+            stun_scope: Some(cli_scope),
+            cipher_pref: CipherPref::Auto,
+            dtls_decoy: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            rotate_interval_secs: 0,
+            rotate_max_bytes: 0,
+            rotate_cooldown_secs: 10,
+            workers: 1,
+            max_sessions: 16,
+            wan_mtu: 1488,
+            udp_batch: 1,
+            retry_ms: 80,
+            max_retries: 20,
+            keepalive_secs: 1,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            lane_hunt: Default::default(),
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(cli_stop),
+        });
+    });
+    thread::sleep(Duration::from_millis(80));
+
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(120)))
+        .unwrap();
+    app.connect(("127.0.0.1", client_port)).unwrap();
+
+    // Establish session on srv1 and exchange data (rx_pkts > 0!)
+    let mut rbuf = [0u8; 2048];
+    let mut established = false;
+    let t0 = Instant::now();
+    while t0.elapsed() < Duration::from_secs(5) {
+        let _ = app.send(b"BEFORE_SIGKILL_PING");
+        if let Ok(n) = app.recv(&mut rbuf) {
+            if &rbuf[..n] == b"BEFORE_SIGKILL_PING" {
+                established = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(40));
+    }
+    assert!(established, "initial session against srv1 must establish");
+
+    // Start fresh srv2 (empty session table) and switch proxy instantaneously so srv1's
+    // shutdown packets are completely dropped (exact SIGKILL semantics!)
+    let srv2_psk = psk.clone();
+    let srv2_scope = scope_tag.clone();
+    let srv2_stop = Arc::clone(&stop_all);
+    let srv2_h = thread::spawn(move || {
+        let _ = run_server(ServerConfig {
+            listen_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), srv2_port),
+            backend_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), echo_port),
+            psk: srv2_psk,
+            stun_scope: Some(srv2_scope),
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 16,
+            wan_mtu: 1488,
+            udp_batch: 1,
+            idle_timeout_secs: 60,
+            stats_interval_secs: 3600,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig::default(),
+            quiet: true,
+            stop: Some(srv2_stop),
+        });
+    });
+    thread::sleep(Duration::from_millis(80));
+    active_srv_port.store(srv2_port, Ordering::SeqCst);
+    stop_srv1.store(true, Ordering::SeqCst);
+
+    // Client MUST detect dead session (srv2 silently drops stale mi_key_mig keepalives!)
+    // and re-handshake cleanly against srv2 within 9s!
+    let mut recovered = false;
+    let t_rec = Instant::now();
+    while t_rec.elapsed() < Duration::from_secs(9) {
+        let _ = app.send(b"AFTER_SIGKILL_RECOVER");
+        if let Ok(n) = app.recv(&mut rbuf) {
+            if &rbuf[..n] == b"AFTER_SIGKILL_RECOVER" {
+                recovered = true;
+                break;
+            }
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+    assert!(
+        recovered,
+        "client MUST recover from SIGKILL-style unclean server restart without zombie STUN loop!"
+    );
+
+    stop_all.store(true, Ordering::SeqCst);
+    let _ = cli_h.join();
+    let _ = srv1_h.join();
+    let _ = srv2_h.join();
+    let _ = proxy_h.join();
     let _ = echo_h.join();
 }

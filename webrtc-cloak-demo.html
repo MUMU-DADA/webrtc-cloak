@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>WebRTC-Cloak V4.0 (v0.6.0) 协议原理与抗干扰交互演示</title>
+<title>WebRTC-Cloak V4.0 (v0.7.0) 协议原理、内嵌代理与红蓝对抗交互演示</title>
 <style>
   :root {
     --bg: #070b14;
@@ -496,35 +496,36 @@
 <div class="container">
   <header>
     <div class="title-wrap">
-      <h1>WebRTC-Cloak V4.0 (v0.6.0) 协议原理与抗干扰交互演示</h1>
-      <p>纯 Rust · 零 C 依赖 · <strong>RFC 9147 DTLS 1.3 / 1.2 自动协商</strong> (<code>dimpl 0.9.0</code>) + ICE STUN + <strong>音视频双 SSRC</strong> SRTP/SRTCP + <strong>1-RTT 黑洞迁移 (0xFFFD)</strong> + <strong>MBB 原子过户 (0xFFFC)</strong> + 原生中继/反向隧道 (<code>0xFFFB</code>)</p>
+      <h1>WebRTC-Cloak V4.0 (v0.7.0) 协议原理、内嵌代理与对抗交互演示</h1>
+      <p>纯 Rust · 零 C 依赖 · <strong>Chrome/BoringSSL 对齐 DTLS 1.3 默认锁定</strong> (<code>patches/dimpl</code>) + 域隔离 ICE STUN + <strong>动态 24/28B 双 SSRC SRTP</strong> + <strong>零回环内嵌类 Hy2 代理 (<code>proxy</code> 正向/反向)</strong> + <strong>1-RTT 黑洞迁移 (0xFFFD)</strong> + <strong>MBB 原子过户 (0xFFFC)</strong></p>
     </div>
     <div class="badge-row">
-      <span class="badge green">V4.0 · v0.6.0</span>
-      <span class="badge purple">DTLS 1.3 + 原生 relay / reverse</span>
-      <span class="badge">MBB 0xFFFC 过户 · 0 后端换口</span>
+      <span class="badge green">V4.0 · v0.7.0</span>
+      <span class="badge purple">默认 DTLS 1.3 · 0% HRR · BoringSSL GREASE</span>
+      <span class="badge">零回环 proxy / relay / reverse</span>
       <span class="badge amber">全架构 SIMD · 1488B Anti-Frag</span>
     </div>
   </header>
 
   <nav class="nav-pills">
-    <a class="nav-pill" href="#sec-sim">1. 全生命周期与实战场景推演 (6 场景)</a>
+    <a class="nav-pill" href="#sec-sim">1. 全生命周期与实战场景推演 (7 场景)</a>
     <a class="nav-pill" href="#sec-packet">2. 字节级报文解剖 &amp; 双流/MTU/填充模拟器</a>
-    <a class="nav-pill" href="#sec-crypto">3. Hybrid PFS 密钥域分离 &amp; RFC 7983 分流</a>
+    <a class="nav-pill" href="#sec-crypto">3. 域隔离 STUN + Hybrid PFS &amp; RFC 7983 分流</a>
     <a class="nav-pill" href="#sec-bench">4. V4.0 演进、实测指标与适用边界</a>
   </nav>
 
   <!-- ==================== SECTION 1: INTERACTIVE FLOW SIMULATOR ==================== -->
   <section class="card" id="sec-sim">
     <div class="card-head">
-      <div class="card-title"><span class="dot"></span> 1. 全生命周期协议流与实战对抗动态推演</div>
+      <div class="card-title"><span class="dot"></span> 1. 全生命周期协议流、内嵌代理与实战对抗动态推演</div>
       <div class="controls">
         <div class="mode-tabs" id="scenarioTabs">
           <button class="tab-btn" data-mode="raw">对照：裸 UDP 五包断流</button>
           <button class="tab-btn active-green" data-mode="v32">V4.0 DTLS 1.3 + 双流建连</button>
-          <button class="tab-btn" data-mode="mbb">V4.0 MBB 无感过户 (0xFFFC)</button>
-          <button class="tab-btn" data-mode="heal">V4.0 1-RTT 黑洞迁移 (0xFFFD)</button>
-          <button class="tab-btn" data-mode="attack">主动探测与旁路注入</button>
+          <button class="tab-btn" data-mode="proxy">零回环内嵌代理 (proxy)</button>
+          <button class="tab-btn" data-mode="mbb">MBB 无感过户 (0xFFFC)</button>
+          <button class="tab-btn" data-mode="heal">1-RTT 黑洞迁移 (0xFFFD)</button>
+          <button class="tab-btn" data-mode="attack">主动探测与红蓝攻防</button>
           <button class="tab-btn" data-mode="selftest">在线 0xFFFE 实网自测</button>
         </div>
         <button class="action-btn" id="btnPrev">← 上一步</button>
@@ -561,9 +562,9 @@
         <g id="nodeApp">
           <rect x="20" y="96" width="145" height="108" rx="12" fill="#101b33" stroke="#3b82f6" stroke-width="1.8"/>
           <text x="92" y="124" text-anchor="middle" fill="#93c5fd" font-size="13" font-weight="700">本地代理 / 应用</text>
-          <text x="92" y="144" text-anchor="middle" fill="#94a3b8" font-size="11">Hysteria 2 / WG</text>
+          <text x="92" y="144" text-anchor="middle" fill="#94a3b8" font-size="11">SOCKS5 / Hy2 / WG</text>
           <rect x="34" y="160" width="117" height="28" rx="6" fill="#091121" stroke="#1e3a5f"/>
-          <text id="lblAppState" x="92" y="178" text-anchor="middle" fill="#60a5fa" font-size="10.5" font-family="monospace">127.0.0.1:19543</text>
+          <text id="lblAppState" x="92" y="178" text-anchor="middle" fill="#60a5fa" font-size="10.5" font-family="monospace">127.0.0.1:19543/48</text>
         </g>
 
         <!-- Node 2: webrtc-cloak client -->
@@ -643,9 +644,9 @@
     <div class="card-head">
       <div class="card-title"><span class="dot green"></span> 2. 字节级报文解剖器 &amp; 双 SSRC / MTU 1488 / 填充模拟器</div>
       <div class="mode-tabs" id="pktTabs">
-        <button class="tab-btn active-cyan" data-pkt="srtp">SRTP 双流 (PT=96/111 + 0xBEDE)</button>
-        <button class="tab-btn" data-pkt="stun">ICE STUN 鉴权/保活</button>
-        <button class="tab-btn" data-pkt="dtls">DTLS 1.3/1.2 Auto (RFC 9147)</button>
+        <button class="tab-btn active-cyan" data-pkt="srtp">SRTP 双流 (24/28B RFC 8285 + P=1)</button>
+        <button class="tab-btn" data-pkt="stun">域隔离 ICE STUN &amp; mi_key_mig 保活</button>
+        <button class="tab-btn" data-pkt="dtls">DTLS 1.3 (RFC 9147 · BoringSSL 对齐)</button>
         <button class="tab-btn" data-pkt="srtcp">Compound SRTCP (PT=200/201)</button>
       </div>
     </div>
@@ -654,7 +655,7 @@
       <div class="legend-item"><span class="legend-swatch" style="background:#3b82f6"></span> 明文标准协议头</div>
       <div class="legend-item"><span class="legend-swatch" style="background:#22d3ee"></span> AEAD 关联认证数据 (AAD 明文不可篡改)</div>
       <div class="legend-item"><span class="legend-swatch" style="background:#10b981"></span> AEAD 加密密文体 (含加密证书 / 载荷)</div>
-      <div class="legend-item"><span class="legend-swatch" style="background:#f59e0b"></span> 密文内层随机填充 (DPI 不可见)</div>
+      <div class="legend-item"><span class="legend-swatch" style="background:#f59e0b"></span> 密文内层随机填充 (含 ~12.5% P=1 0xB0)</div>
       <div class="legend-item"><span class="legend-swatch" style="background:#a855f7"></span> 认证标签 / 指纹 / 索引</div>
     </div>
 
@@ -665,12 +666,12 @@
         <!-- Interactive Dual-SSRC + MTU + Padding Simulator (shown for SRTP) -->
         <div class="pad-sim" id="padSimBox">
           <div class="pad-controls">
-            <strong style="color:var(--amber)">双 SSRC 分流 + PPPoE MTU 1488 + 内层填充模拟器：</strong>
+            <strong style="color:var(--amber)">v0.7.0 双 SSRC 分流 + PPPoE MTU 1488 + 内层填充模拟器：</strong>
             <label>内层 UDP 负载: <code id="lblOrigLen" style="color:var(--cyan)">148</code> B</label>
             <input type="range" id="rngOrigLen" min="48" max="1460" step="2" value="148"/>
             <button class="action-btn" id="btnPresetAck">QUIC ACK 64B</button>
             <button class="action-btn" id="btnPresetWG">WG 148B</button>
-            <button class="action-btn" id="btnPresetHy2">Hy2 1200B</button>
+            <button class="action-btn" id="btnPresetHy2">Hy2/Proxy 1200B</button>
             <button class="action-btn" id="btnPresetEdge">MTU 极限 1422B</button>
             <button class="action-btn" id="btnPresetOver">超限 1452B</button>
             <button class="action-btn primary" id="btnSimPad">连发 64 包</button>
@@ -692,24 +693,24 @@
   <!-- ==================== SECTION 3: HYBRID PFS & RFC 7983 DEMUX ==================== -->
   <section class="card" id="sec-crypto">
     <div class="card-head">
-      <div class="card-title"><span class="dot purple"></span> 3. Hybrid PFS 三域 Nonce 隔离 &amp; RFC 7983 全区间单端口分流</div>
+      <div class="card-title"><span class="dot purple"></span> 3. 域隔离 STUN + Hybrid PFS 三域 Nonce 隔离 &amp; RFC 7983 单端口分流</div>
     </div>
 
     <div class="two-col">
       <div style="background:var(--bg-deep);border:1px solid var(--border);border-radius:12px;padding:14px;">
-        <div style="font-size:13px;font-weight:700;color:#d8b4fe;margin-bottom:10px;">Hybrid PFS 密钥派生与三域 Nonce 数学隔离（视频 / 音频 / SRTCP）</div>
+        <div style="font-size:13px;font-weight:700;color:#d8b4fe;margin-bottom:10px;">v0.7.0 域隔离 STUN HKDF + Hybrid PFS 密钥派生与三域 Nonce 隔离</div>
         <svg viewBox="0 0 600 278" style="width:100%;height:auto;display:block;" xmlns="http://www.w3.org/2000/svg">
           <!-- Input 1 -->
           <rect x="10" y="10" width="238" height="62" rx="9" fill="#131f3a" stroke="#3b82f6" stroke-width="1.5"/>
-          <text x="129" y="32" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="700">路径 A：ICE STUN 鉴权材料</text>
-          <text x="129" y="49" text-anchor="middle" fill="#94a3b8" font-size="10.2" font-family="monospace">SHA256(PSK || txid || ufrag)</text>
-          <text x="129" y="64" text-anchor="middle" fill="#67e8f9" font-size="10" font-family="monospace">→ stun_key(32B) + Video SSRC</text>
+          <text x="129" y="32" text-anchor="middle" fill="#93c5fd" font-size="12" font-weight="700">路径 A：端点域隔离 STUN HKDF</text>
+          <text x="129" y="49" text-anchor="middle" fill="#94a3b8" font-size="9.8" font-family="monospace">HKDF(PSK, cloak|bypass, scope/port)</text>
+          <text x="129" y="64" text-anchor="middle" fill="#67e8f9" font-size="9.8" font-family="monospace">→ stun_key(32B) + Video SSRC (±10s)</text>
 
           <!-- Input 2 -->
           <rect x="10" y="94" width="238" height="66" rx="9" fill="#1c1433" stroke="#a855f7" stroke-width="1.5"/>
-          <text x="129" y="116" text-anchor="middle" fill="#e9d5ff" font-size="12" font-weight="700">路径 B：真 DTLS 1.3 / 1.2 (dimpl)</text>
-          <text x="129" y="133" text-anchor="middle" fill="#94a3b8" font-size="10.2" font-family="monospace">X25519 ECDHE + 全加密双向 P-256 证书</text>
-          <text x="129" y="149" text-anchor="middle" fill="#d8b4fe" font-size="10" font-family="monospace">→ RFC 5764 KeyingMaterial(64B)</text>
+          <text x="129" y="116" text-anchor="middle" fill="#e9d5ff" font-size="12" font-weight="700">路径 B：DTLS 1.3 锁定 (patches/dimpl)</text>
+          <text x="129" y="133" text-anchor="middle" fill="#94a3b8" font-size="9.8" font-family="monospace">BoringSSL GREASE + 0% HRR + 内层填充</text>
+          <text x="129" y="149" text-anchor="middle" fill="#d8b4fe" font-size="9.8" font-family="monospace">→ RFC 5764 KeyingMaterial(64B)</text>
 
           <!-- Arrows into combiner -->
           <path d="M 248 41 L 285 41 L 285 82 L 310 82" fill="none" stroke="#3b82f6" stroke-width="2"/>
@@ -717,9 +718,9 @@
 
           <!-- Combiner -->
           <rect x="310" y="48" width="278" height="76" rx="10" fill="#0d2526" stroke="#10b981" stroke-width="1.8"/>
-          <text x="449" y="71" text-anchor="middle" fill="#6ee7b7" font-size="12.5" font-weight="700">Hybrid PFS 主密钥 + 双 SSRC 派生</text>
+          <text x="449" y="71" text-anchor="middle" fill="#6ee7b7" font-size="12.5" font-weight="700">Hybrid PFS 主密钥 + mi_key_mig 保活</text>
           <text x="449" y="90" text-anchor="middle" fill="#cbd5e1" font-size="9.5" font-family="monospace">SHA256("webrtc-cloak-v3|pfs-bind|"||sk||km)</text>
-          <text x="449" y="108" text-anchor="middle" fill="#a5f3fc" font-size="9.6" font-family="monospace">audio_ssrc[31:16] ≠ video_ssrc[31:16]</text>
+          <text x="449" y="108" text-anchor="middle" fill="#a5f3fc" font-size="9.5" font-family="monospace">HKDF(skey,"ice-pwd-v4") → Ready 保活/迁移</text>
 
           <!-- Output splits -->
           <path d="M 449 124 L 449 172" fill="none" stroke="#10b981" stroke-width="2"/>
@@ -730,21 +731,21 @@
           <!-- Video SRTP -->
           <rect x="10" y="194" width="188" height="72" rx="9" fill="#0b1d2e" stroke="#22d3ee" stroke-width="1.5"/>
           <text x="104" y="214" text-anchor="middle" fill="#67e8f9" font-size="11.5" font-weight="700">Video SRTP (PT=96)</text>
-          <text x="104" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.6" font-family="monospace">90kHz 严格 M=1 帧尾因果</text>
+          <text x="104" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.4" font-family="monospace">30/60FPS 90kHz · 24/28B 扩展头</text>
           <text x="104" y="246" text-anchor="middle" fill="#34d399" font-size="9.5" font-family="monospace">Nonce(dir, v_ssrc, seq)</text>
-          <text x="104" y="259" text-anchor="middle" fill="#94a3b8" font-size="9.3" font-family="monospace">独立 2048 包防重放环</text>
+          <text x="104" y="259" text-anchor="middle" fill="#94a3b8" font-size="9.3" font-family="monospace">独立 2048 包防重放环 + P=1</text>
 
           <!-- Audio SRTP -->
           <rect x="206" y="194" width="188" height="72" rx="9" fill="#1b1230" stroke="#c084fc" stroke-width="1.5"/>
           <text x="300" y="214" text-anchor="middle" fill="#e9d5ff" font-size="11.5" font-weight="700">Audio SRTP (PT=111)</text>
-          <text x="300" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.6" font-family="monospace">48kHz Opus · 限速 ≤50 pps</text>
+          <text x="300" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.4" font-family="monospace">48kHz Opus · ≤50pps · 24B 头</text>
           <text x="300" y="246" text-anchor="middle" fill="#d8b4fe" font-size="9.5" font-family="monospace">Nonce(dir|0x40, a_ssrc, seq)</text>
-          <text x="300" y="259" text-anchor="middle" fill="#94a3b8" font-size="9.3" font-family="monospace">独立 2048 包防重放环</text>
+          <text x="300" y="259" text-anchor="middle" fill="#94a3b8" font-size="9.3" font-family="monospace">高 16 位与 Video SSRC 互斥</text>
 
           <!-- SRTCP Domain -->
           <rect x="402" y="194" width="188" height="72" rx="9" fill="#1e180d" stroke="#f59e0b" stroke-width="1.5"/>
           <text x="496" y="214" text-anchor="middle" fill="#fde68a" font-size="11.5" font-weight="700">Compound SRTCP</text>
-          <text x="496" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.6" font-family="monospace">PT=200/201 + 加密 BYE</text>
+          <text x="496" y="231" text-anchor="middle" fill="#94a3b8" font-size="9.4" font-family="monospace">长静默对称 RR · 异步 BYE</text>
           <text x="496" y="246" text-anchor="middle" fill="#fcd34d" font-size="9.5" font-family="monospace">Nonce(dir|0x80, ssrc, idx)</text>
           <text x="496" y="259" text-anchor="middle" fill="#94a3b8" font-size="9.3" font-family="monospace">独立 64-bit 防重放位图</text>
         </svg>
@@ -753,12 +754,12 @@
       <div style="background:var(--bg-deep);border:1px solid var(--border);border-radius:12px;padding:16px;display:flex;flex-direction:column;justify-content:space-between;">
         <div>
           <div style="font-size:13px;font-weight:700;color:var(--cyan);margin-bottom:6px;">RFC 7983 §7 + RFC 9147 首字节精准分流图谱 (0x00 ~ 0xFF)</div>
-          <p style="font-size:12px;color:var(--muted);">V4.0 支持完整标准 DTLS 区间 <code>20..=63</code>（<code>20..=23</code> DTLS 1.2/明文 + <code>26</code> DTLS 1.3 ACK + <code>32..=63</code> RFC 9147 Unified Ciphertext <code>001C_SL_EE</code>），入口强校验 <code>C=0</code> 与最小 <code>18B</code> 密文边界；V4 新增子密钥（<code>ice-pwd-v4</code> / <code>handover-v4</code>）均采用 RFC 5869 HKDF-SHA256 派生。</p>
+          <p style="font-size:12px;color:var(--muted);">V4.0 (<code>v0.7.0</code>) 支持完整标准 DTLS 区间 <code>20..=63</code>（默认锁定 DTLS 1.3，支持 <code>32..=63</code> RFC 9147 Unified Ciphertext <code>001C_SL_EE</code> + §4.2 密文内层随机填充），入口强校验 <code>C=0</code>、<code>record_seq==0</code> 与最小 <code>18B</code> 密文边界；所有域隔离 STUN、<code>Ready</code> 保活与 MBB 交接子密钥均采用 RFC 5869 HKDF-SHA256 派生。</p>
 
           <div class="demux-bar">
             <div class="demux-seg" style="width:11%;background:rgba(59,130,246,0.35);color:#bfdbfe;" title="0..=3 STUN">0..3<br/>STUN</div>
             <div class="demux-seg" style="width:9%;background:#111827;color:#64748b;" title="4..=19 Drop">DROP</div>
-            <div class="demux-seg" style="width:24%;background:rgba(168,85,247,0.38);color:#f3e8ff;" title="20..=63 DTLS 1.2 & 1.3">20..63<br/>DTLS 1.3 / 1.2</div>
+            <div class="demux-seg" style="width:24%;background:rgba(168,85,247,0.38);color:#f3e8ff;" title="20..=63 DTLS 1.3">20..63<br/>DTLS 1.3</div>
             <div class="demux-seg" style="width:16%;background:#111827;color:#64748b;" title="64..=127 Drop">64..127 DROP</div>
             <div class="demux-seg" style="width:27%;background:rgba(16,185,129,0.35);color:#d1fae5;" title="128..=191 SRTP/SRTCP">128..191<br/>SRTP / SRTCP</div>
             <div class="demux-seg" style="width:13%;background:#111827;color:#64748b;" title="192..=255 Drop">DROP</div>
@@ -771,16 +772,16 @@
             <div class="v" style="color:#6ee7b7">b[1] ∈ 192..=223 → SRTCP</div>
           </div>
           <div class="kv-box">
-            <div class="k">未认证 / 恶意探测</div>
+            <div class="k">未认证 / 跨口重放探测</div>
             <div class="v" style="color:#fca5a5">100% Silent Drop (0B 回复)</div>
           </div>
           <div class="kv-box">
-            <div class="k">DTLS 1.3 证书隐蔽</div>
-            <div class="v" style="color:#d8b4fe">0x2e 密文封装 · 零明文证书</div>
+            <div class="k">默认 DTLS 1.3 锁定</div>
+            <div class="v" style="color:#d8b4fe">V13Only 防降级 · 零明文证书</div>
           </div>
           <div class="kv-box">
-            <div class="k">滚动升级向后兼容</div>
-            <div class="v" style="color:#fcd34d">Auto↔1.2 自动回退零断流</div>
+            <div class="k">内嵌代理零二次加密</div>
+            <div class="v" style="color:#fcd34d">No-op QUIC + 外层 DTLS/SRTP</div>
           </div>
         </div>
       </div>
@@ -790,38 +791,28 @@
   <!-- ==================== SECTION 4: EVOLUTION, BENCHMARKS & BOUNDARIES ==================== -->
   <section class="card" id="sec-bench">
     <div class="card-head">
-      <div class="card-title"><span class="dot amber"></span> 4. V3 → V4.0 (v0.6.0) 关键演进、实测指标与客观边界</div>
-      <span class="badge green">V4.0 协议定型 · 39 项测试全绿 + 16 架构</span>
+      <div class="card-title"><span class="dot amber"></span> 4. V3 → V4.0 (v0.7.0) 关键演进、实测指标与客观边界</div>
+      <span class="badge green">V4.0 · v0.7.0 · 56 项测试全绿 + 16 架构</span>
     </div>
 
     <div class="evo-grid">
       <div class="evo-card">
-        <div class="ec-tag">v0.3.2 ~ v0.3.6 · 现代 WebRTC 底座</div>
-        <div class="ec-title">DTLS 1.3 加密证书 + 双 SSRC + MTU 1488</div>
+        <div class="ec-tag">v0.3.2 ~ v0.4.0 (V4.0) · 现代底座与无感承载</div>
+        <div class="ec-title">DTLS 1.3 + 双 SSRC + 1-RTT 迁移 + MBB 原子过户</div>
         <ul>
-          <li><code>Dtls::new_auto</code> 优先 RFC 9147 DTLS 1.3（双向 ECDSA P-256 证书 <strong>100% 加密</strong>、跨洋省 1 RTT），兼容 1.2 滚动升级，支持 <code>--dtls-min-version 1.3</code> 防降级。</li>
-          <li>协商 DTLS 1.3 自动启用<strong>音视频双 SSRC</strong>（<code>PT=111</code> Opus <code>≤50 pps</code> + <code>PT=96</code> 90kHz 严格 <code>M=1</code> 因果），独立 2048 槽 RFC 6479 防重放环与正交 Nonce 域。</li>
-          <li>默认 <code>--mtu 1488</code> 彻底消除 PPPoE <code>1492B</code> IPv4 分片；内置双模式 12 项自测与带内 <code>0xFFFE</code> 加密回显。</li>
+          <li>RFC 9147 DTLS 1.3（双向 ECDSA P-256 证书 100% 加密）+ 音视频双 SSRC 正交 Nonce（独立 2048 槽 RFC 6479 环）+ PPPoE <code>--mtu 1488</code> 零分片。</li>
+          <li><strong>1-RTT 黑洞迁移（<code>0xFFFD</code>）</strong>：以 <code>mi_key_mig</code> 签名迁移 STUN，经防反射加密挑战（<code>61B</code>）验真后原地切换 <code>peer_addr</code>，0 DTLS 重握、<strong>0 后端换口</strong>。</li>
+          <li><strong>MBB 无感轮换（<code>0xFFFC</code>）</strong>：按对数正态时长或字节预算发起全新不可关联 DTLS 1.3，原子过户后端管道，实测 <strong>0 丢包 0 换口</strong>。</li>
         </ul>
       </div>
 
       <div class="evo-card">
-        <div class="ec-tag">v0.3.7 ~ v0.4.0 (V4.0) · 换路不换门牌</div>
-        <div class="ec-title">1-RTT 黑洞迁移 + MBB 0xFFFC 原子过户</div>
+        <div class="ec-tag">v0.4.1 ~ v0.5.0 · 轻量化、ECMP 优车道与旁路</div>
+        <div class="ec-title">解耦遥测 + 双栈优车道 + Linux recvmmsg + bypass</div>
         <ul>
-          <li><strong>1-RTT ICE 黑洞迁移（<code>0xFFFD</code>）</strong>：保留 PFS 密钥与 SRTP 序列号，以每会话 HKDF 密钥 <code>ice-pwd-v4</code> 签名迁移 STUN，经防反射（<code>≤1.32x</code>）加密挑战验真后原地更新 <code>peer_addr</code>，0 DTLS 重握、<strong>0 后端换口</strong>。</li>
-          <li><strong>MBB 无感轮换（<code>0xFFFC</code>）</strong>：按对数正态时长或字节预算发起全新不可关联 DTLS 1.3，凭双会话 HKDF 证明原子移交 <code>backend_sock</code>（支持跨 worker 无锁转发），延迟 <code>2–10s</code> 发旧流 BYE，实测 <strong>0 丢包 0 换口</strong>。</li>
-          <li><code>SIGTERM</code> 广播优雅 <code>SRTCP BYE + close_notify</code>（<code>0.23s</code> 快切）；空闲/微流自动退避控制面并严格遵守 RFC 3550 零媒体 <code>RC=0</code> 语义。</li>
-        </ul>
-      </div>
-
-      <div class="evo-card">
-        <div class="ec-tag">v0.4.1 ~ v0.5.0 · 轻量化、批量 I/O、ECMP 与旁路</div>
-        <div class="ec-title">解耦遥测 + 双栈优车道 + recvmmsg + bypass</div>
-        <ul>
-          <li>旁路健康遥测（原子 JSON <code>--status-file</code> + 单线程 <code>mio</code> HTTP/Prometheus <code>--status-http</code>），纯隧道仅 <strong>1 线程</strong>（开遥测 <strong>2 线程</strong>），<code>x86_64</code> 静态 musl 压至 <strong><code>~2.0 MiB</code></strong>。</li>
-          <li>原生双栈 IPv4/IPv6 与 <code>--lane-hunt</code> 多维自适应优车道（无阈值冷启动校准、SRTP 数据面真实丢包评分、Canary 确认与 0ms MBB 逃逸），辅以 Linux <code>--udp-batch</code> 批量收发与 <code>4/8 MiB</code> 突发缓冲。</li>
-          <li>新增一级旁路直通模式 <code>bypass</code> / <code>bypass --responder</code>：共享五元组带外 STUN 抽卡切路 + 数据面 0 封装原始 UDP 透传（兼容内核 UDP GSO）。</li>
+          <li>旁路健康遥测（原子 JSON <code>--status-file</code> + 单线程 <code>mio</code> HTTP/Prometheus <code>--status-http</code>），纯隧道常驻 <strong>1 线程</strong>（开遥测 <strong>2 线程</strong>）。</li>
+          <li>原生双栈 IPv4/IPv6 与 <code>--lane-hunt</code> 多维自适应优车道（冷启动校准、SRTP 数据面真实丢包评分、Canary 确认与 0ms MBB 逃逸），辅以 Linux <code>--udp-batch</code> 批量收发与 <code>4/8 MiB</code> 缓冲。</li>
+          <li>一级旁路直通 <code>bypass</code> / <code>bypass --responder</code>（<strong>仅限非 DPI 路由优选</strong>）：<code>68B</code> 带外 STUN 抽卡 + 原始 UDP 透传（兼容内核 UDP GSO）。</li>
         </ul>
       </div>
 
@@ -829,44 +820,54 @@
         <div class="ec-tag">v0.5.1 ~ v0.6.0 · 原生中继、反向隧道与全架构 SIMD</div>
         <div class="ec-title">零回环 relay + 零入站 reverse + 16 架构算力补齐</div>
         <ul>
-          <li><strong>原生单进程中继（<code>relay</code>）</strong>：单线程 <code>mio</code> 融合入站终止与出站 <code>bypass</code>/<code>cloak</code>，消除本地回环，实测中继 CPU 降 <strong><code>29%–59%</code></strong>、上下文切换降 <strong><code>68%–79%</code></strong>、峰值吞吐升 <strong><code>+17% ~ +20%</code></strong>。</li>
-          <li><strong>原生反向隧道（<code>reverse --entry | --agent</code>）</strong>：内网/NAT 侧零入站端口，常驻 DTLS 1.3 隧道内借 <code>0xFFFB</code> 按 <code>flow_id: u32</code> 复用多条 UDP 流（固定后端源端口、0-RTT 首包、完整 MBB/1-RTT/<code>--lane-hunt</code>）。</li>
-          <li><strong>全架构 SIMD 补齐</strong>：补齐非 AVX x86 硬件 <code>SSE2+PCLMULQDQ</code>、全 64 位常时间 <code>radix-2^44</code> Poly1305（Apple Silicon ChaCha20 提速 <strong><code>+23.5%</code></strong> 至 <code>4,027 Mbps</code>）、x86 <code>AVX-512</code> ChaCha20 与 <code>webrtc-cloak cpu</code> 真实后端诊断。</li>
+          <li><strong>单进程中继（<code>relay</code>）</strong>：单线程 <code>mio</code> 融合入站与出站（<code>bypass</code> / <code>cloak</code> / <code>reverse</code> 三态），消除本地回环，中继 CPU 降 <strong><code>29%–59%</code></strong>、峰值吞吐升 <strong><code>+17% ~ +20%</code></strong>。</li>
+          <li><strong>L4 UDP 反向隧道（<code>reverse --entry | --agent</code>）</strong>：NAT 侧零入站端口，借 <code>0xFFFB</code> 按 <code>flow_id: u32</code> 多流复用（固定源端口、0-RTT 首包、完整 MBB/1-RTT）。</li>
+          <li><strong>全架构 SIMD</strong>：非 AVX <code>SSE2+PCLMULQDQ</code>、全 64 位常时间 <code>radix-2^44</code> Poly1305（Apple Silicon ChaCha20 提速 <strong><code>+23.5%</code></strong> 至 <code>4,027 Mbps</code>）、x86 <code>AVX-512</code> ChaCha20。</li>
+        </ul>
+      </div>
+
+      <div class="evo-card">
+        <div class="ec-tag">v0.7.0 · 零回环内嵌类 Hy2 代理 &amp; 三轮红蓝对抗加固</div>
+        <div class="ec-title">内嵌 proxy (正向/反向) + Chrome/BoringSSL 深度对齐</div>
+        <ul>
+          <li><strong>内嵌类 Hy2 代理（<code>proxy --client | --server</code>, <code>--reverse</code>）</strong>：单线程 <code>mio</code> 融合 No-op <code>quinn-proto</code> + Brutal + RFC 9221 UDP + SOCKS5/<code>--tcp-forward</code> + 异步 DNS/CIDR ACL；回环直通 <strong><code>1,586–2,037 Mbps</code></strong>、交互 p95 <strong><code>0.1–0.4 ms</code></strong>、双向视频帧尾包整形、<code>SIGKILL</code> 0 句柄泄漏（可用 <code>--no-default-features</code> 裁剪）。</li>
+          <li><strong>定制 <code>patches/dimpl</code> DTLS 1.3 加固</strong>：默认锁定 <code>V13Only</code>（0 降级、0 明文证书）、0% HRR、0% <code>0x0015</code>、BoringSSL 首位/末位 GREASE 书立 + 套件/SRTP 序、RFC 9147 §4.2 密文内层随机填充、拼接尾包损坏 <code>10/10</code> 在 <code>274–409ms</code> 恢复。</li>
+          <li><strong>全栈协议细节硬化</strong>：端点域分离 STUN HKDF（<code>--stun-scope</code>）、<code>±10s</code> 窗口、<code>Ready</code> 态 <code>mi_key_mig</code> 保活、<code>HuntUfragTable</code> 墓碑、动态 <code>24/28B</code> RFC 8285 + <code>P=1</code> SRTP、30/60 FPS 量化视频时钟与异步 <code>BYE → close_notify</code>。</li>
         </ul>
       </div>
     </div>
 
     <div class="metric-grid">
       <div class="metric-box">
-        <div class="m-label">PPPoE 1492B 纯 L3 封装开销</div>
-        <div class="m-val">+2.8%</div>
-        <div class="m-note">1468B → 1485B (0 分片) · 160ms 跨洋留存 94–98%</div>
+        <div class="m-label">内嵌 proxy 直通 / 交互 p95</div>
+        <div class="m-val">1.6–2.0 Gbps</div>
+        <div class="m-note">正向 1,586–2,037M / 反向 1,653–1,778M · 交互 0.1–0.4ms</div>
       </div>
       <div class="metric-box">
-        <div class="m-label">MBB 换口 / P8 黑洞自愈</div>
+        <div class="m-label">MBB 换口 / 黑洞 / 尾包损坏</div>
         <div class="m-val amber">0ms / 5.2s</div>
-        <div class="m-note">33,280 包 0 丢包 0 换口 · 黑洞 1-RTT 满血复速</div>
+        <div class="m-note">0 丢包 0 换口 · 加密 Flight-4 损坏 10/10 (274–409ms) 恢复</div>
       </div>
       <div class="metric-box">
         <div class="m-label">低功耗 x86_64 软路由 (AES-NI)</div>
         <div class="m-val cyan">900–1,449 Mbps</div>
-        <div class="m-note">1W 900M / 4W 1,449M · RSS 2.1–2.8 MB</div>
+        <div class="m-note">1W 900M / 4W 1,449M · 132s 静默 0 信标 · RSS 2.1–2.8 MB</div>
       </div>
       <div class="metric-box">
         <div class="m-label">Apple Silicon (ARM64, 12C)</div>
         <div class="m-val purple">18.7 / 127.4 Gbps</div>
-        <div class="m-note">单核 18,720M / 12核 127.4G · macOS RSS 2.7–3.4 MiB</div>
+        <div class="m-note">单核 18,720M / 12核 127.4G · ChaCha20 4,027M · 56 项测试全绿</div>
       </div>
     </div>
 
     <div class="boundary-note">
-      <strong>客观工程定位与适用边界：</strong>
-      本项目定位为<strong>面向 Hysteria 2 / QUIC / WireGuard 的高性能透明 UDP 抗干扰传输外壳</strong>，核心解决两类现实问题：① 状态化中间件对裸高熵 UDP 的特征识别、QoS 限速与主动探测暴露；② CGNAT / 防火墙导致的单向上行黑洞、长流五元组关联与 PPPoE 分片掉速。它<strong>不是通用 TCP/TUN VPN</strong>，内层业务机密性始终由上层协议独立保障；在持续突发丢包 ≥15% 或彻底禁止 100% UDP 出口的网络策略下应回退至常规 TCP 传输线路。
+      <strong>客观工程定位与适用边界（<code>v0.7.0</code>）：</strong>
+      本项目提供<strong>透明 UDP 封装（<code>client</code>/<code>server</code>/<code>relay</code>/<code>reverse</code>）</strong>与<strong>可选零回环内嵌 SOCKS5/TCP 转发代理（<code>proxy</code>）</strong>，非内核 TUN VPN；<code>v0.7.0</code> 线格式与密钥域不向前兼容 <code>v0.6.x</code>（DNAT 场景使用 <code>--stun-scope</code> 对齐）。<code>bypass</code> 仅用于<strong>非 DPI 链路</strong>的 ECMP 路由优选，不提供抗 DPI 封装且不可直接承载无加密内层 <code>proxy</code>；在彻底禁止 100% UDP 出口或高强度单租户宏观 NetFlow 流量分析场景下仍存在物理与拓扑边界。
     </div>
   </section>
 
   <footer>
-    WebRTC-Cloak V4.0 / v0.6.0 (Pure Rust · dimpl 0.9.0 DTLS 1.3/1.2 · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
+    WebRTC-Cloak V4.0 / v0.7.0 (Pure Rust · patches/dimpl DTLS 1.3 · No-op quinn-proto · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
   </footer>
 </div>
 
@@ -918,121 +919,169 @@ const SCENARIOS = {
     steps: [
       {
         title: "Step 1 · 本地应用首包触发会话创建与 Pending 暂存",
-        desc: "Hysteria 2 / WireGuard 发来首包，客户端先存入 pending 队列并生成 4:4 Base64 ufrag。",
+        desc: "Hysteria 2 / WireGuard 发来首包，客户端先存入 pending 队列并生成 Chrome 4:4 Base64 ufrag（与 BoringSSL 人设严格一致）。",
         dir: "app2cli", pill: "APP UDP #1", pillColor: "#3b82f6",
         cli: "STATE: STUN_WAIT", cliEx: "pending: 1 | ufrag=dYTo:zTJf", dpi: "DPI: IDLE", dpiSub: "尚未发往公网", dpiColor: "#64748b",
         srv: "STATE: LISTEN", srvEx: "silent_drop=true", verdict: "PASS", verdictCls: "pass",
-        proto: "Localhost UDP", hdr: "127.0.0.1:19543", dpiView: "公网零暴露", secAct: "生成随机会话与时间锚定 txid",
-        hex: "Local App -> client:19543 (queued in pending[0] until DTLS Ready)",
-        note: "首包绝不裸发公网，避免在握手完成前触发任何未知 UDP 特征或首包泄露。"
+        proto: "Localhost UDP", hdr: "127.0.0.1:19543", dpiView: "公网零暴露", secAct: "生成域隔离 HKDF 密钥与 ±10s txid",
+        hex: "Local App -> client:19543 (queued in pending[0] until DTLS 1.3 Ready)",
+        note: "首包绝不裸发公网；STUN 密钥按 HKDF(PSK, cloak|bypass, scope/port) 域隔离派生，彻底阻断跨端口与跨模式抓包重放。"
       },
       {
-        title: "Step 2 · ICE STUN 提名请求解锁运营商白名单",
-        desc: "携带 USERNAME(4:4)、ICE-CONTROLLING、USE-CANDIDATE、PRIORITY、HMAC-SHA1 与尾部 FINGERPRINT。",
+        title: "Step 2 · 域隔离 ICE STUN 常规提名解锁运营商白名单",
+        desc: "携带 Chrome 4:4 USERNAME、ICE-CONTROLLING、USE-CANDIDATE、PRIORITY、域隔离 HMAC-SHA1 与尾部 FINGERPRINT；开启 --lane-hunt 时先并发无 USE-CANDIDATE 探测再仅提名胜出者。",
         dir: "c2s", pill: "ICE STUN REQ (92B)", pillColor: "#2563eb",
-        cli: "STATE: STUN_WAIT", cliEx: "txid=timestamp_hmac", dpi: "DPI: STUN HIT!", dpiSub: "命中 WebRTC 白名单 ✓", dpiColor: "#10b981",
+        cli: "STATE: STUN_WAIT", cliEx: "scope=HKDF(port) | ±10s", dpi: "DPI: STUN HIT!", dpiSub: "命中 WebRTC 白名单 ✓", dpiColor: "#10b981",
         srv: "AUTH STUN OK", srvEx: "derive stun_key + SSRC", verdict: "PASS", verdictCls: "pass",
-        proto: "ICE STUN Binding Req (0x0001)", hdr: "b[0]=0x00 | Magic=2112A442", dpiView: "标准 WebRTC ICE-Lite 连通性检查", secAct: "校验 PSK + ±30s 防重放 + 拒尾注入",
-        hex: "00 01 00 48 21 12 a4 42 [12B txid] USERNAME(9B) ICE-CONTROLLING(8B) USE-CANDIDATE(0B) PRIORITY(4B) MI(20B) FP(4B)",
-        note: "严格遵守 RFC 5389 §15.4：MESSAGE-INTEGRITY 之后只允许精确 8 字节 FINGERPRINT；未认证包服务端 0 字节静默丢弃。"
+        proto: "ICE STUN Binding Req (0x0001)", hdr: "b[0]=0x00 | Magic=2112A442", dpiView: "标准 RFC 8445 Chrome ICE 提名", secAct: "域隔离 HKDF + ±10s + HuntUfragTable 墓碑",
+        hex: "00 01 00 48 21 12 a4 42 [12B txid] USERNAME(4:4) ICE-CONTROLLING(8B) USE-CANDIDATE(0B) PRIORITY(4B) MI(20B) FP(4B)",
+        note: "v0.7.0 将时间戳窗口收紧至 ±10s，SeenTxidCache 收紧至 2.5s/2x 且仅用于 DTLS 前初始握手（进入 DTLS 立刻熔断销毁）。"
       },
       {
         title: "Step 3 · 服务端返回 STUN Binding Success (64B)",
-        desc: "返回 XOR-MAPPED-ADDRESS（客户端真实公网 CGNAT 映射）、HMAC-SHA1 与 FINGERPRINT。",
+        desc: "返回 XOR-MAPPED-ADDRESS（客户端真实公网 CGNAT 映射）、域隔离 HMAC-SHA1 与 FINGERPRINT，双端进入默认锁定的 DTLS 1.3 握手。",
         dir: "s2c", pill: "STUN SUCCESS (64B)", pillColor: "#0891b2",
-        cli: "ICE STUN OK", cliEx: "start dimpl Auto(1.3/1.2)", dpi: "DPI: WHITELIST", dpiSub: "STUN 双向握手成立 ✓", dpiColor: "#10b981",
-        srv: "DTLS_HANDSHAKE", srvEx: "Dtls::new_auto()", verdict: "PASS", verdictCls: "pass",
+        cli: "ICE STUN OK", cliEx: "Dtls::new_13() 默认锁定", dpi: "DPI: WHITELIST", dpiSub: "STUN 双向握手成立 ✓", dpiColor: "#10b981",
+        srv: "DTLS_HANDSHAKE", srvEx: "V13Only | 0% HRR", verdict: "PASS", verdictCls: "pass",
         proto: "STUN Binding Success (0x0101)", hdr: "b[0]=0x01 | 64 Bytes", dpiView: "合法 STUN 应答，解锁五元组", secAct: "双方派生一致 stun_key 与 Video SSRC",
         hex: "01 01 00 2c 21 12 a4 42 [same txid] XOR-MAPPED(198.51.100.24:51001) MESSAGE-INTEGRITY(20B) FINGERPRINT(4B)",
-        note: "跨洋链路参考场景下此步约 1 RTT (~160ms)，同时精确反馈运营商 CGNAT 分配的外网映射端口（示例使用 RFC 5737 文档 IP）。"
+        note: "因 ICE STUN 已完成源地址鉴权与防放大，服务端在随后 DTLS 1.3 阶段直接 1-RTT 响应 ServerHello（0% HelloRetryRequest）。"
       },
       {
-        title: "Step 4 · RFC 9147 DTLS 1.3 Hybrid ClientHello (1150B) ⇄ HelloRetryRequest",
-        desc: "Dtls::new_auto 发出 6 套件 + 9 扩展（含 X25519 key_share、renegotiation_info、padding）的现代混合 ClientHello。",
-        dir: "c2s_s2c", pill: "DTLS1.3 CH ⇄ HRR", pillColor: "#9333ea",
-        cli: "DTLS_HANDSHAKE", cliEx: "1150B CH | 6 suites / 9 exts", dpi: "DPI: DTLS 1.3", dpiSub: "现代 WebRTC DTLS-SRTP", dpiColor: "#10b981",
-        srv: "SEND HRR COOKIE", srvEx: "stateless anti-amp cookie", verdict: "PASS", verdictCls: "pass",
-        proto: "DTLS 1.3/1.2 Hybrid CH (CT=22)", hdr: "b[0]=0x16 | 1150B padded", dpiView: "含 key_share + renegotiation_info + padding", secAct: "遇旧版 v0.3.5 服务端自动回退 DTLS 1.2",
-        hex: "ClientHello(1150B): [0x1301..0xCCA9] + supported_versions(1.3,1.2) + key_share(x25519) + use_srtp + EMS + reneg_info(0xFF01) + padding",
-        note: "彻底告别旧版 DTLS 1.2 仅 118B 极小 ClientHello 指纹；带 966B padding 符合防放大惯例，且双向兼容旧端滚动升级。"
+        title: "Step 4 · Chrome/BoringSSL 对齐 DTLS 1.3 ClientHello → 1-RTT 直出 ServerHello",
+        desc: "定制 patches/dimpl 发出首位空 GREASE + 末位 1B 0x00 GREASE 书立与中间扩展洗牌的 ClientHello（0% 0x0015 零填充、0% HRR），服务端 1-RTT 直接返回 ServerHello + 全加密证书。",
+        dir: "c2s_s2c", pill: "BoringSSL CH ⇄ 1-RTT SH", pillColor: "#9333ea",
+        cli: "DTLS_HANDSHAKE", cliEx: "GREASE bookends | 0% 0x0015", dpi: "DPI: CHROME DTLS1.3", dpiSub: "对齐 BoringSSL 套件与扩展序 ✓", dpiColor: "#10b981",
+        srv: "DIRECT SERVERHELLO", srvEx: "0% HRR · 1-RTT 直连", verdict: "PASS", verdictCls: "pass",
+        proto: "RFC 9147 DTLS 1.3 (V13Only)", hdr: "b[0]=0x16 → 0x2e (ep=2)", dpiView: "Chrome 套件序 + use_srtp [7,8,1] + GREASE 书立", secAct: "默认锁定 1.3 彻底杜绝 1 字节降级明文证书泄露",
+        hex: "ClientHello: [GREASE, 0x1301..0xC014] | exts[0]=GREASE() + shuffled_exts(key_share,use_srtp[7,8,1],...) + exts[last]=GREASE(00)  (NO 0x0015, NO HRR!)",
+        note: "相比 v0.6，v0.7.0 彻底移除 0x0015 全零填充与冗余 HelloRetryRequest，统一 V13Only/auto 下的 BoringSSL 线特征并默认锁定 DTLS 1.3。"
       },
       {
-        title: "Step 5 · 1-RTT 全加密双向证书握手 (0x2e Unified Ciphertext) + Hybrid PFS",
-        desc: "ServerHello 后双方证书、CertificateVerify 与 Finished 全部封装在 RFC 9147 0x2e 密文记录中，线上零明文证书！",
-        dir: "s2c_c2s", pill: "0x2e ENC CERT + FIN", pillColor: "#a855f7",
-        cli: "STATE: READY ✓", cliEx: "DTLS 1.3 | dual_ssrc=true", dpi: "DPI: ENC HS OK", dpiSub: "证书全程加密不可抓包 ✓", dpiColor: "#10b981",
+        title: "Step 5 · RFC 9147 §4.2 随机内层填充加密握手 (0x2e) + Hybrid PFS",
+        desc: "ServerHello 之后的 EE/CertReq/Cert/CV/Finished 与 ACK 全部启用 RFC 9147 §4.2 密文内层随机填充，抹除固定 Flight-4/Flight-5/ACK 长度指纹！",
+        dir: "s2c_c2s", pill: "0x2e PADDED ENC HS", pillColor: "#a855f7",
+        cli: "STATE: READY ✓", cliEx: "DTLS 1.3 | mi_key_mig", dpi: "DPI: ENC HS OK", dpiSub: "无固定包长 · 零明文证书 ✓", dpiColor: "#10b981",
         srv: "STATE: READY ✓", srvEx: "DTLS 1.3 | dual_ssrc=true", verdict: "PASS", verdictCls: "pass",
-        proto: "RFC 9147 DTLS13Ciphertext (0x2e)", hdr: "b[0]=0x2e | ep=2→3", dpiView: "无法查看 CN=WebRTC 或证书 DER 长度", secAct: "跨洋握手省 1 RTT (~853→667ms)",
-        hex: "S->C 708B: ServerHello(98B) + 5×DTLS13Ciphertext(0x2e: EE+CertReq+Cert+CV+Fin)  ⇄  C->S 507B: 3×DTLS13Ciphertext(0x2e: Cert+CV+Fin)",
-        note: "两端确认协商 DTLS 1.3 后自动解锁音视频双 SSRC 分流，同时结合 STUN PSK 与 64B DTLS KeyingMaterial 形成 Hybrid PFS。"
+        proto: "RFC 9147 DTLS13Ciphertext (0x2e)", hdr: "b[0]=0x2e + 随机内层填充", dpiView: "不可提取证书且抹除 709B/506B/72B 固定长度", secAct: "Hybrid PFS + 每会话 mi_key_mig Ready 保活密钥",
+        hex: "S->C: ServerHello + 0x2e Enc(EE+CertReq+Cert+CV+Fin + rand_inner_pad)  ⇄  C->S: 0x2e Enc(Cert+CV+Fin + rand_inner_pad)",
+        note: "两端进入 Ready 后自动激活音视频双 SSRC，同时用 HKDF 派生每会话 mi_key_mig 专供 Ready 态 Consent 保活与 1-RTT 迁移鉴权。"
       },
       {
-        title: "Step 6 · 音视频双 SSRC 零分片加密转发 (PT=111 Opus + PT=96 Video)",
-        desc: "小包 (<256B 如 QUIC ACK) 走 Audio SSRC (PT=111, 48kHz)；大包 (≥256B) 走 Video SSRC (PT=96, 90kHz)；共享全局 TWCC。",
-        dir: "c2s", pill: "PT=111 + PT=96 SRTP", pillColor: "#10b981",
-        cli: "READY (DUAL-SSRC)", cliEx: "MTU≤1488B | TWCC +1", dpi: "DPI: A/V CALL", dpiSub: "Opus 音频 + 30fps 视频双流", dpiColor: "#10b981",
+        title: "Step 6 · 动态 24/28B RFC 8285 双 SSRC 加密转发 (P=1 混合 + 30/60 FPS 视频时钟)",
+        desc: "Audio (PT=111, ≤50pps) 携带 ssrc-audio-level+TWCC (24B)；Video (PT=96, 30/60 FPS 量化 90kHz 时钟) 携带 abs-send-time+TWCC (24B) 与起流 MID (28B)，~12.5% 填充包置 P=1 (0xB0)。",
+        dir: "c2s", pill: "24/28B A/V SRTP (P=1)", pillColor: "#10b981",
+        cli: "READY (DUAL-SSRC)", cliEx: "0x90/0xB0 | 30/60FPS", dpi: "DPI: CHROME A/V", dpiSub: "多元素扩展头 + 真实帧率分布", dpiColor: "#10b981",
         srv: "UNWRAP → BACKEND", srvEx: "双 2048 槽 RFC 6479 环", verdict: "PASS", verdictCls: "pass",
-        proto: "SRTP Dual-SSRC AEAD (RFC 7714)", hdr: "b[0]=0x90 | PT=111 & 96", dpiView: "61..133B 音频 + 1238..1425B 视频", secAct: "超 1422B 主动丢弃防 PPPoE 分片",
-        hex: "Audio: 90 6f [seq] [48kHz TS] [a_ssrc] bede0001 [twcc] [Enc] [Tag] | Video: 90 e0 [seq] [90kHz TS] [v_ssrc] bede0001 [twcc+1] [Enc] [Tag]",
-        note: "两路 SSRC 强制互异确保 AEAD Nonce 数学上 100% 不相交，各自维护 2048 包滑动防重放窗口，共享全局 0xBEDE TWCC 序号。"
+        proto: "SRTP Dual-SSRC AEAD (RFC 8285)", hdr: "0x90/0xB0 | 24/28B 扩展头", dpiView: "abs-send-time + audio-level + TWCC + MID", secAct: "min_dt ≥ 1320 ticks (无 >200FPS/3包微帧)",
+        hex: "Audio(24B hdr): 90/b0 6f [seq] [48kHz] [a_ssrc] bede0002 [ID1 lvl][ID3 twcc][ID4 mid] | Video(24/28B): 90/b0 e0 [seq] [30/60FPS] [v_ssrc] bede0002/3 [ID2 ast][ID3 twcc][ID4 mid]",
+        note: "溢出至 Video 流的微小 ACK 包平滑展宽打破 <89B 尖峰；接近 MTU 1488B 边界时自动退回 20B TWCC 扩展头保 1422B 零分片通过。"
       },
       {
-        title: "Step 7 · 周期 Consent 保活 + Compound SRTCP + 优雅退场",
-        desc: "每 5s±20% 双向 STUN 保活 + Compound SRTCP (PT=200/201)；空闲拆除保持 PT=201(RR)+加密 BYE 与 DTLS 1.3 加密 close_notify。",
-        dir: "c2s_s2c", pill: "KA + RR/BYE + 0x2f", pillColor: "#0ea5e9",
-        cli: "CLOSING (250ms)", cliEx: "PT=201 RR+BYE | 0x2f", dpi: "DPI: CLEAN END", dpiSub: "标准 WebRTC 通话挂断 ✓", dpiColor: "#10b981",
-        srv: "CLOSING (250ms)", srvEx: "零 ICMP Port Unreach", verdict: "PASS", verdictCls: "pass",
-        proto: "STUN KA + SRTCP + DTLS1.3 Alert", hdr: "PT=201(RR) + E=1 idx", dpiView: "合规 RR+SDES(0x00)+加密 BYE", secAct: "Closing(250ms) 吸收在途尾包",
-        hex: "SRTCP(84B): 81 c9 00 07 [v_ssrc] [Enc(RR + SDES(13B CNAME+0x00) + BYE 203)] [16B Tag] [80 00 00 05]  +  DTLS13Ciphertext(0x2f, 24B)",
-        note: "V3.2 修正空闲拆除时保持 PT=201(RR) 不回跳 SR，且密文内 SDES 严格满足 RFC 3550 §6.5 结束符规范。"
+        title: "Step 7 · mi_key_mig 保活 + 长静默对称 SRTCP + 异步 BYE → close_notify 退场",
+        desc: "Ready 保活采用每会话 mi_key_mig + 每次重试新 txid；>60s 静默双端维持 25–45s 对称 RR；关闭时先发加密 SRTCP BYE，经 18–95ms (SIGTERM 22–65ms) 随机延迟再发加密 close_notify。",
+        dir: "c2s_s2c", pill: "PFS-KA + ASYNC TEARDOWN", pillColor: "#0ea5e9",
+        cli: "CLOSING (ASYNC)", cliEx: "BYE → +18..95ms → 0x2f", dpi: "DPI: CLEAN END", dpiSub: "零 <0.1ms 成对拆除指纹 ✓", dpiColor: "#10b981",
+        srv: "CLOSING (250ms)", srvEx: "HuntUfrag 90s 墓碑", verdict: "PASS", verdictCls: "pass",
+        proto: "mi_key_mig KA + Async BYE/Alert", hdr: "BYE → 随机延迟 → 填充 0x2f", dpiView: "自然错峰的 WebRTC 挂断序列", secAct: "会话销毁立写 90s ufrag 墓碑防延迟重放",
+        hex: "t=0ms: SRTCP(PT=201 RR + Enc(SDES+BYE))  --->  t=+18..95ms: DTLS13Ciphertext(0x2f, Enc(close_notify + rand_inner_pad))",
+        note: "PreWarm 预热会话免疫空闲超时（0 条 0xFFFE 探针）；Ready 态保活改用 mi_key_mig 彻底消灭服务端 SIGKILL 重启后的假 64B 僵死。"
+      }
+    ]
+  },
+
+  proxy: {
+    name: "零回环内嵌类 Hy2 代理 (proxy)",
+    accent: "cyan",
+    attacker: false,
+    steps: [
+      {
+        title: "Step 1 · 本地 SOCKS5 / --tcp-forward 零回环进入单线程 mio 引擎",
+        desc: "本地浏览器/应用直连 proxy --client 暴露的 SOCKS5 (127.0.0.1:19548) 或 --tcp-forward；内层 Sans-IO quinn-proto 与外层 WebRTC-Cloak 共享同一单线程 mio::Poll，0 本地 lo 回环、0 外部 hysteria 进程。",
+        dir: "app2cli", pill: "SOCKS5 / TCP-FWD", pillColor: "#3b82f6",
+        cli: "PROXY: QUIC+BRUTAL", cliEx: "No-op inner crypto (tag=0)", dpi: "DPI: WEBRTC A/V", dpiSub: "外层标准 WebRTC 封装", dpiColor: "#10b981",
+        srv: "PROXY SERVER READY", srvEx: "CtrlHello 100M/300M", verdict: "PASS", verdictCls: "pass",
+        proto: "In-Process Sans-IO quinn-proto", hdr: "CtrlHello 19B (0x57 0x43 0x01)", dpiView: "完全封装于外层 DTLS 1.3 + SRTP 密文内", secAct: "零 rustls · 零二次 AEAD · 外层独占 PFS 加密",
+        hex: "Control Stream: [57 43 01 | up_bps=100Mbps | down_bps=300Mbps] (clamped by server --max-up/--max-down 500Mbps)",
+        note: "内层 QUIC 采用自定义 No-op 加密（tag_len=0），彻底省去双层加解密开销，同时完整保留 QUIC 多流并发、Brutal 丢包补偿恒速与 RFC 9221 UDP Datagram（自动分片重组）。"
+      },
+      {
+        title: "Step 2 · 双向连续大流视频帧尾包整形 + 微包零延迟直通",
+        desc: "上下行大流 TCP→QUIC 按 5..=10 × mss + 500..=979B 帧尾整形，使 [450, 1150]B 区间稳定在 ~10.4–10.7%（模拟真实视频帧尾），同时交互微包 0 凑帧延迟 (p95 0.1–0.4ms) 且多流公平无饥饿。",
+        dir: "c2s_s2c", pill: "SHAPED 1.6-2.0 Gbps", pillColor: "#10b981",
+        cli: "UL/DL FRAME-SHAPED", cliEx: "tail 10.5% | p95 0.2ms", dpi: "DPI: VIDEO BURSTS", dpiSub: "逼真视频帧尾包长分布 ✓", dpiColor: "#10b981",
+        srv: "ASYNC DNS + ACL ✓", srvEx: "私网默认拒 · 2 线程 DNS", verdict: "PASS", verdictCls: "pass",
+        proto: "Brutal QUIC over Dual-SSRC SRTP", hdr: "5..10*mss + 500..979B 尾包", dpiView: "打破传统代理满载 100% 顶满 MTU 尖峰", secAct: "deferred_tcp_reads 队首公平 · 解析后 CIDR ACL",
+        hex: "Bulk TCP -> QUIC stream shaped bursts | Apple Silicon loopback direct: 1,586–2,037 Mbps (Fwd) / 1,653–1,778 Mbps (Rev)",
+        note: "服务端内置 2 线程异步 DNS 解析池与解析后 CIDR ACL（--acl-allow / --acl-deny，默认拒绝私网/回环除非显式 --allow-private，并支持 --outbound-ipv4-only）。"
+      },
+      {
+        title: "Step 3 · 原生 --reverse 反向内嵌代理（出口 NAT 零入站端口）",
+        desc: "出口位于家庭/内网 NAT 后时，proxy --server --reverse 主动外拨公网 proxy --client --reverse（或三跳 relay --upstream-mode reverse），反向建立 24×7 常驻代理出口。",
+        dir: "s2c_c2s", pill: "REVERSE DIAL-OUT", pillColor: "#a855f7",
+        cli: "PROXY --CLIENT --REV", cliEx: "监听 :19643 + SOCKS5", dpi: "DPI: OUTBOUND RTC", dpiSub: "NAT 内网主动发起 WebRTC", dpiColor: "#10b981",
+        srv: "PROXY --SERVER --REV", srvEx: "0 公网入站端口 ✓", verdict: "PASS", verdictCls: "pass",
+        proto: "Reverse Embedded Proxy", hdr: "外层反拨 · 内层代理角色不变", dpiView: "完整继承 --lane-hunt / MBB 0xFFFC / 1-RTT", secAct: "纯 UDP 精简场景可用 --no-default-features 裁剪",
+        hex: "NAT Exit (proxy --server --reverse) ===outbound WebRTC===> Entry (proxy --client --reverse :19643 -> SOCKS5 :19548)",
+        note: "注意：因内层 QUIC 关闭加密，proxy 严格依赖外层 WebRTC-Cloak 加密保护，严禁经无加密的 bypass 承载。"
+      },
+      {
+        title: "Step 4 · 132s 长静默零信标常驻 & 对端 SIGKILL 瞬时孤儿回收",
+        desc: "persistent_tunnel 免疫 120s 数据静默断线（132s 静默 0 条 0xFFFE SRTP 信标、0 DTLS 重连）；若反向对端遭 SIGKILL 后重连，NewConnection 事件立即清理旧 QUIC 与后端 TCP 句柄（0 泄漏）。",
+        dir: "c2s_s2c", pill: "PERSISTENT · 0 LEAK", pillColor: "#0ea5e9",
+        cli: "132s IDLE: ALIVE ✓", cliEx: "0 SRTP beacons | 0 drop", dpi: "DPI: QUIET CALL", dpiSub: "对称低频 SRTCP RR", dpiColor: "#10b981",
+        srv: "ORPHAN REAPED (0 FD)", srvEx: "MBB 无感过户不触发重置", verdict: "PASS", verdictCls: "pass",
+        proto: "Persistent Tunnel + Orphan GC", hdr: "NewConnection 触发旧流回收", dpiView: "长静默期无规律性 SRTP 探针暴露", secAct: "无感 MBB 0xFFFC 过户平滑转移，绝不中断活流",
+        hex: "[proxy] 132s silence -> 0 SRTP beacons, 0 DTLS teardowns | reverse peer SIGKILL -> 0 leaked TCP/QUIC FDs",
+        note: "实测长静默后首包毫秒级恢复；外层定时/优车道 MBB 换口直接移交外层管道，内层 QUIC 与所有 TCP/UDP 代理连接 0 感知。"
       }
     ]
   },
 
   attack: {
-    name: "主动探测与旁路注入",
+    name: "主动探测与红蓝攻防",
     accent: "purple",
     attacker: true,
     steps: [
       {
-        title: "攻击 1 · 互联网扫描器发送 7~8 类未认证探测向量",
-        desc: "随机垃圾 UDP、无 STUN 前置伪造 DTLS、错 PSK STUN、孤儿保活 STUN、伪造 SRTP 轮番探测公网端口。",
-        dir: "atk2srv", pill: "7x UNAUTH PROBES", pillColor: "#ef4444",
-        cli: "NORMAL TRAFFIC", cliEx: "unaffected", dpi: "SCANNER PROBE", dpiSub: "等待任意响应字节", dpiColor: "#a855f7",
-        srv: "SILENT DROP (0B)", srvEx: "7/7 全部 0 字节回复", verdict: "DROP", verdictCls: "drop",
-        proto: "Unauthenticated Probes", hdr: "缺 PSK HMAC / 非法首字节", dpiView: "端口如同黑洞，零响应指纹", secAct: "实网 selftest #09 7/7 零泄漏",
-        hex: "junk / forged_dtls / wrong_psk / orphan_ka / forged_srtp  ==>  Server returns 0 bytes (Silent Drop)",
-        note: "已在公网实测环境（示例 203.0.113.10:19643）通过 selftest 验证：7 类恶意探针全部 0 字节静默丢弃，正常业务零影响。"
+        title: "攻击 1 · 互联网扫描器未认证探针 & 跨端口/跨模式 STUN 重放",
+        desc: "扫描器轮番发送垃圾 UDP、伪造 DTLS、错 PSK STUN、孤儿保活，或将某端口/bypass 模式截获的合法 STUN 跨口重放给另一监听端口。",
+        dir: "atk2srv", pill: "PROBES & CROSS-PORT", pillColor: "#ef4444",
+        cli: "NORMAL TRAFFIC", cliEx: "unaffected", dpi: "SCANNER / REPLAY", dpiSub: "探测指纹与跨口重放", dpiColor: "#a855f7",
+        srv: "SILENT DROP (0B)", srvEx: "0/8 跨口跨模重放通过", verdict: "DROP", verdictCls: "drop",
+        proto: "Scoped STUN HKDF Isolation", hdr: "HKDF(cloak|bypass, scope/port)", dpiView: "端口如同黑洞，零响应指纹", secAct: "实测跨口/跨模重放 0/8 · 7 类探针 0B 回复",
+        hex: "junk / forged_dtls / cross-port STUN / bypass->cloak STUN  ==>  Server returns 0 bytes (Silent Drop)",
+        note: "v0.7.0 为每个监听端口及 cloak/bypass 域派生独立 HKDF 密钥；同时校验 ±10s 新鲜度与 SeenTxidCache（2.5s/2x 仅限 DTLS 前）。"
       },
       {
-        title: "攻击 2 · 旁路 MITM 精确 4 元组注入 Epoch=0 明文 Alert / 伪造 0x2e 密文",
-        desc: "攻击者冒充对端 IP:Port，向活会话注入明文 Fatal Alert、带 CID(C=1) 或 <18B 短 DTLS 1.3 密文试图 DoS 瞬杀会话。",
-        dir: "atk2cli", pill: "FORGED DTLS ALERT", pillColor: "#dc2626",
-        cli: "PRE-VALID DROP ✓", cliEx: "SRTP 隧道 100% 存活", dpi: "MITM INJECT", dpiSub: "企图诱导断流 Oracle", dpiColor: "#ef4444",
-        srv: "PRE-VALID DROP ✓", srvEx: "auth_drops += 1", verdict: "PASS", verdictCls: "pass",
-        proto: "Forged DTLS 1.2/1.3 Record", hdr: "ct=21 ep=0 / C=1 / len<18", dpiView: "目标会话毫无波澜，探测失败", secAct: "validate_dtls_datagram 入口拦截",
-        hex: "15 fe fd 00 00 ... (plaintext Alert) OR 3e 01 ... (C=1 / <18B)  ==>  Rejected BEFORE dimpl!",
-        note: "入口同时覆盖 DTLS 1.2 与 RFC 9147 DTLS 1.3 严格边界预检；即便 dimpl 报错也绝不销毁已就绪的 SRTP 隧道。"
+        title: "攻击 2 · 在途 1 字节 DTLS 1.2 降级篡改 & 伪造明文 Alert 注入",
+        desc: "中间人篡改 ClientHello 版本试图强迫降级至 DTLS 1.2 以窃取明文 CN=WebRTC 证书，或向活会话注入明文 Epoch=0 Alert / 畸形 0x2e 密文。",
+        dir: "atk2cli", pill: "1B DOWNGRADE / ALERT", pillColor: "#dc2626",
+        cli: "V13ONLY BLOCKED ✓", cliEx: "0 明文证书 · 会话 100% 存活", dpi: "MITM DOWNGRADE", dpiSub: "企图剥离 DTLS 1.3 加密", dpiColor: "#ef4444",
+        srv: "V13ONLY DROP ✓", srvEx: "0 ServerHello · 0 Alert", verdict: "PASS", verdictCls: "pass",
+        proto: "Default V13Only + Pre-Validation", hdr: "Dtls::new_13() + DOWNGRD\\x01", dpiView: "降级请求 0 字节无回应，活会话稳如泰山", secAct: "默认锁定 1.3；显式 auto 亦受 RFC 8446 哨兵保护",
+        hex: "1B downgrade CH -> 0 ServerHello, 0 plaintext cert | Epoch=0 Alert / C=1 / len<18 -> Rejected BEFORE dimpl!",
+        note: "validate_dtls_datagram 在入口过滤一切非法 DTLS 1.2/1.3 边界；即便进入 dimpl 报错也绝不摧毁已建立的 SRTP 隧道。"
       },
       {
-        title: "攻击 3 · 截获合法 STUN 并在 MESSAGE-INTEGRITY 后走私属性 / 跨口重放",
-        desc: "攻击者保留原 HMAC 并在 MI 后注入恶意属性，或把抓到的真实合法 STUN 包换个源端口重放给服务端。",
-        dir: "atk2srv", pill: "TAIL SMUGGLE/REPLAY", pillColor: "#dc2626",
-        cli: "SESSION INTACT", cliEx: "0% loss", dpi: "MITM TAMPER", dpiSub: "属性走私 & 跨口重放", dpiColor: "#ef4444",
-        srv: "RFC 5389 REJECT ✓", srvEx: "SeenTxidCache 拦截", verdict: "PASS", verdictCls: "pass",
-        proto: "Tampered / Replayed STUN", hdr: "MI 后夹带 / 异源重放 txid", dpiView: "假 REKEY 与重放全部 0B 丢弃", secAct: "next_pos+8==end & 90s FIFO 缓存",
-        hex: "... [20B HMAC] [00 06 'evil'] [FP] -> DROP | Cross-port replay of captured valid STUN -> Rejected by SeenTxidCache!",
-        note: "SeenTxidCache 绑定原始 peer IP:Port，跨源端口重放直接静默丢弃；同 peer 短窗口合法重传最多返回 6 次缓存 64B 应答。"
+        title: "攻击 3 · STUN 尾属性走私、抽卡 ufrag 冒用 & 关断后 >90s 保活重放",
+        desc: "攻击者在 MESSAGE-INTEGRITY 后夹带属性、拿抓到的 --lane-hunt 探测 ufrag 延迟重放，或等会话关闭 >90s（SeenTxidCache 过期）后重放旧保活包。",
+        dir: "atk2srv", pill: "HUNT & >90s REPLAY", pillColor: "#dc2626",
+        cli: "SESSION INTACT", cliEx: "0% loss", dpi: "MITM REPLAY", dpiSub: "抽卡冒用 & 延迟保活重放", dpiColor: "#ef4444",
+        srv: "TOMBSTONE + PFS ✓", srvEx: "HuntUfrag 20s/90s 墓碑", verdict: "PASS", verdictCls: "pass",
+        proto: "HuntUfragTable + mi_key_mig", hdr: "4s 窗口 / 20s & 90s 墓碑", dpiView: "所有重放均返回 0 字节，无响应 Oracle", secAct: "Ready 保活绑定已销毁的每会话 mi_key_mig",
+        hex: "MI tail smuggle -> DROP | Hunt probe >4s or diff IP -> 20s tombstone DROP | >90s post-close KA -> mi_key_mig mismatch (0B)!",
+        note: "Ready 态保活弃用静态 PSK 改用每会话 DTLS-PFS mi_key_mig，会话一旦关闭其密钥随之销毁，任何 >90s 的历史保活重放永无响应。"
       },
       {
-        title: "攻击 4 · 握手期抢注伪造 ServerHello / HelloRetryRequest 毒化套件协商",
-        desc: "在真实 ServerHello 到达间隙注入伪造套件 ServerHello 或混淆 HRR 魔数，企图让双端加解密套件失步。",
-        dir: "atk2cli", pill: "SPOOF SH / HRR", pillColor: "#dc2626",
-        cli: "LOCKED SUITE ✓", cliEx: "HRR 过滤 + Flight5 锁", dpi: "MITM POISON", dpiSub: "伪造套件协商", dpiColor: "#ef4444",
-        srv: "LOCKED SUITE ✓", srvEx: "AES-128-GCM 一致", verdict: "PASS", verdictCls: "pass",
-        proto: "Forged DTLS ServerHello", hdr: "TLS13_HRR_RANDOM 过滤", dpiView: "双端仍原子锁定真实协商套件", secAct: "CH 重发清空暂存 + Flight 5 锁定",
-        hex: "HRR magic random (CF 21 AD 74 ... 33 9C) ignored; suite locked ONLY after dimpl advances to Flight 5 / Connected!",
-        note: "同时兼容 DTLS 1.2 (0xC02B/0xCCA9) 与 DTLS 1.3 (0x1301/0x1303) 套件提取，免疫握手期抢注毒化。"
+        title: "攻击 4 · 加密 Flight-4 尾包损坏 & 单包伪造握手/ServerHello 毒化",
+        desc: "在途随机破坏加密拼接 Flight-4 尾部 Finished，或单包伪造 record_seq>0 握手 / 毒化 ServerHello 企图令握手死锁或套件失步。",
+        dir: "atk2cli", pill: "CORRUPT F4 / SPOOF SH", pillColor: "#dc2626",
+        cli: "FAST RECOVER ✓", cliEx: "<9ms 熔断 · 274-409ms 恢复", dpi: "MITM CORRUPTION", dpiSub: "破坏尾包 / 伪造握手注入", dpiColor: "#ef4444",
+        srv: "SEQ==0 GUARD ✓", srvEx: "RFC 9147 §4.5.2 静默丢弃", verdict: "PASS", verdictCls: "pass",
+        proto: "Coalesced HS + Seq==0 Resilience", hdr: "pkt[5..11]==0 | hs_fail>=3", dpiView: "10/10 尾包损坏正常建连；伪造注入 0 影响", secAct: "局部已处理拼接记录保留重传续接能力",
+        hex: "Flight-4 tail corrupt -> 10/10 recover in 274–409ms | Spoofed single HS pkt -> silent drop (2–4ms, 0 impact)",
+        note: "服务端严格核验 record_seq==0 才允许 epoch=0 ClientHello 复位，客户端 enable_peer_encryption 连续 3 次解密失败 <9ms 快速熔断重建。"
       }
     ]
   },
@@ -1054,33 +1103,33 @@ const SCENARIOS = {
       },
       {
         title: "Step 2 · 后台并行完成全新不可关联 DTLS 1.3 握手",
-        desc: "备用会话从全新本地端口 :52742 发起完整 ICE STUN + DTLS 1.3 握手，对外生成全新 ufrag、双 SSRC、CNAME 与 ECDHE PFS 密钥。",
+        desc: "备用会话从全新本地端口 :52742 发起完整域隔离 ICE STUN + BoringSSL 对齐 DTLS 1.3 握手，对外生成全新 ufrag、双 SSRC、CNAME 与 ECDHE PFS 密钥。",
         dir: "c2s_s2c", pill: "NEW DTLS 1.3 (:52742)", pillColor: "#9333ea",
         cli: "STANDBY: READY ✓", cliEx: "new ufrag + new SSRC", dpi: "DPI: NEW WEBRTC", dpiSub: "全新独立加密通话流", dpiColor: "#10b981",
         srv: "STANDBY READY ✓", srvEx: "new PFS key active", verdict: "PASS", verdictCls: "pass",
-        proto: "Unlinkable DTLS 1.3 Handshake", hdr: "0x2e 加密证书 · 全新标识", dpiView: "公网视角与旧流无任何明文字段关联", secAct: "Fail-Closed Hybrid PFS 刷新全新主密钥",
+        proto: "Unlinkable DTLS 1.3 Handshake", hdr: "0x2e 加密证书 · 0% HRR", dpiView: "公网视角与旧流无任何明文字段关联", secAct: "Fail-Closed Hybrid PFS 刷新全新主密钥",
         hex: "New Standby :52742 -> ufrag=WGVr:ytL3 ssrc=0xb8666cad DTLS 1.3 READY (old :58376 still serving traffic!)",
         note: "绝不复用旧流的 ufrag / SSRC / CNAME，确保即使观察者捕获换口前后两条流也无法从协议头直接关联。"
       },
       {
-        title: "Step 3 · AEAD 密文带内 0xFFFC 过户帧原子移交 backend_sock",
-        desc: "在切换主路径前，新会话在 AEAD 密文内发送 0xFFFC 帧（携带 old_ufrag 与双会话 HKDF-SHA256 证明），服务端验真后原子过户原 backend_sock。",
+        title: "Step 3 · AEAD 密文带内 0xFFFC 过户帧原子移交后端管道",
+        desc: "在切换主路径前，新会话在 AEAD 密文内发送 0xFFFC 帧（携带 old_ufrag 与双会话 HKDF-SHA256 证明），服务端验真后原子过户 backend_sock / relay / reverse / proxy 管道。",
         dir: "c2s_s2c", pill: "ENC 0xFFFC HANDOVER", pillColor: "#10b981",
-        cli: "PROMOTE :52742 ✓", cliEx: "0ms cutover | 0 loss", dpi: "DPI: SRTP VIDEO", dpiSub: "完全藏于 0x90 密文内", dpiColor: "#10b981",
+        cli: "PROMOTE :52742 ✓", cliEx: "0ms cutover | 0 loss", dpi: "DPI: SRTP VIDEO", dpiSub: "完全藏于 SRTP 密文内", dpiColor: "#10b981",
         srv: "HANDOVER OK (:51481)", srvEx: "0 backend port change!", verdict: "PASS", verdictCls: "pass",
-        proto: "In-Band 0xFFFC Atomic Handover", hdr: "HKDF(old_sk, new_sk, 'handover-v4')", dpiView: "线上与普通 SRTP 数据帧 0 差异", secAct: "单次消费幂等验真 · 支持跨 worker 无锁转发",
-        hex: "[server-rs#0] MBB HANDOVER (local) old->WGVr:ytL3 backend_sport=51481 (0 port change!)",
-        note: "即使内层是严格锁定源端口的有状态 UDP 后端（游戏/语音/VPN），也完全察觉不到外层已经换了全新端口与密钥——真正做到“换路不换门牌”。"
+        proto: "In-Band 0xFFFC Atomic Handover", hdr: "HKDF(old_sk, new_sk, 'handover-v4')", dpiView: "线上与普通 SRTP 数据帧 0 差异", secAct: "单次消费幂等验真 · 支持跨 worker 与内嵌 proxy",
+        hex: "[server-rs#0] MBB HANDOVER (local) old->WGVr:ytL3 backend_sport=51481 (0 port change, proxy conn intact!)",
+        note: "无论是源端口绑定的有状态 UDP 后端，还是内嵌 proxy 的活跃 QUIC/TCP 连接，均完全察觉不到外层已更换端口与密钥——真正“换路不换门牌”。"
       },
       {
-        title: "Step 4 · 0 ms 切流 + 旧口延迟 2–10s 发 BYE 优雅排空",
-        desc: "主流量瞬切至 :52742；旧口 :58376 进入 DrainingBeforeBye 继续接收在途慢回包，随机延迟 2–10s 后才发加密 SRTCP BYE + close_notify 退场。",
-        dir: "c2s", pill: "DELAYED BYE (2–10s)", pillColor: "#0ea5e9",
+        title: "Step 4 · 0 ms 切流 + 旧口延迟 2–10s 异步 BYE → close_notify 排空",
+        desc: "主流量瞬切至 :52742；旧口 :58376 进入 DrainingBeforeBye 继续接收在途慢回包，随机延迟 2–10s 后发加密 SRTCP BYE，再经 18–95ms 异步发 close_notify 退场。",
+        dir: "c2s", pill: "DELAYED ASYNC BYE", pillColor: "#0ea5e9",
         cli: "MBB 0ms DONE ✓", cliEx: "33,280/33,280 (0.00%)", dpi: "DPI: CLEAN END", dpiSub: "错峰自然挂断防关联 ✓", dpiColor: "#10b981",
         srv: "OLD CLOSED CLEANLY", srvEx: "backend=:51481 intact", verdict: "PASS", verdictCls: "pass",
-        proto: "Staggered Graceful Teardown", hdr: "DrainingBeforeBye (2–10s)", dpiView: "新流建立与旧流挂断错开，避免切流时序指纹", secAct: "实测 4 次连续换口 33,280 包 0 丢包 0 换口",
-        hex: "[client-rs#0] MBB 0ms rotation complete old=58376 -> new=52742 (delayed BYE in 5.1s) | drops=0",
-        note: "配合 2–10s 随机延迟 BYE 与 1s post-BYE 排空窗口，既避免在途下行包丢失，也防止“新流建好同一毫秒旧流立刻发 BYE”的关联特征。"
+        proto: "Staggered Async Teardown", hdr: "DrainingBeforeBye (2–10s) + 18..95ms", dpiView: "新流建立、BYE 与 close_notify 全程自然错峰", secAct: "实测 4 次连续换口 33,280 包 0 丢包 0 换口",
+        hex: "[client-rs#0] MBB 0ms rotation complete old=58376 -> new=52742 (delayed BYE in 5.1s + async close_notify) | drops=0",
+        note: "配合 2–10s 延迟 BYE、18–95ms 异步 close_notify 与 1s post-BYE 排空窗口，彻底消除切流与退场双侧时序关联指纹。"
       }
     ]
   },
@@ -1091,42 +1140,42 @@ const SCENARIOS = {
     attacker: false,
     steps: [
       {
-        title: "故障注入 · 运营商 CGNAT 发生单向上行黑洞（下行 SRTCP 仍在回！）",
-        desc: "CGNAT / 状态墙经典单向半残故障：旧五元组 :51000 上行 100% 被丢弃，但服务端下行 SRTCP/SRTP 仍能回流客户端。",
-        dir: "s2c", pill: "DL SRTCP ONLY!", pillColor: "#f59e0b",
+        title: "故障注入 · CGNAT 单向上行黑洞或服务端 SIGKILL 崩溃重启",
+        desc: "CGNAT 单向半残故障下旧五元组 :51000 上行 100% 丢失但下行 SRTCP 仍在回；或服务端遭 SIGKILL 重启丢弃全部内存会话状态。",
+        dir: "s2c", pill: "DL ONLY / SIGKILL!", pillColor: "#f59e0b",
         cli: "UPLINK BLACKHOLE", cliEx: "下行回包≠上行存活", dpi: "CGNAT :51000", dpiSub: "上行 100% 截断 · 下行放行", dpiColor: "#ef4444",
-        srv: "STILL SENDING RTCP", srvEx: "尚不知上行已断", verdict: "WARN", verdictCls: "warn",
-        proto: "Asymmetric Uplink Blackhole", hdr: "C→S 0% / S→C 100%", dpiView: "裸 HY2 永久卡死在 0 Mbps", secAct: "严禁用下行 SRTCP 刷新上行活性！",
-        hex: "Server keeps sending downlink Compound SRTCP -> Client verifies RTCP but does NOT reset uplink STUN consent timer!",
-        note: "若用任意收包刷新活性，会被服务端定期下发的 SRTCP 不断误续命，导致隧道永久假死。"
+        srv: "STILL SENDING / RESTART", srvEx: "mi_key_mig 已隔离", verdict: "WARN", verdictCls: "warn",
+        proto: "Asymmetric Blackhole / Crash", hdr: "C→S 0% / S→C 100%", dpiView: "裸 HY2 永久卡死在 0 Mbps", secAct: "严禁用下行 SRTCP 续命 · --keepalive 0 亦受 dl_deadlock 保护",
+        hex: "Downlink SRTCP never resets uplink STUN timer; SIGKILL restart rejects old mi_key_mig KA (0 false-64B zombie replies!)",
+        note: "v0.7.0 Ready 态保活使用每会话 mi_key_mig，服务端 SIGKILL 重启后绝不会用静态 PSK 返回假 64B 应答导致僵死，且 --keepalive 0 亦由 dl_deadlock 兜底。"
       },
       {
-        title: "RFC 5389 §7.2.1 · 同 txid 重传 3/3 确认为真实黑洞",
-        desc: "客户端发出 RFC 7675 STUN 保活无应答，按 1.1s → 1.6s → 2.0s 复用同一 txid 重传 2 次（共 ~4.7s），单包偶发丢包绝不误切。",
-        dir: "drop_dpi", pill: "STUN KA (3/3 SAME TXID)", pillColor: "#f59e0b",
-        cli: "KA RETRY 2/2", cliEx: "same txid · ~4.7s", dpi: "CGNAT :51000", dpiSub: "3 次上行全被黑洞吞噬", dpiColor: "#ef4444",
+        title: "每会话 mi_key_mig 保活重试 3/3 确认为真实黑洞（每次重试新 txid）",
+        desc: "客户端发出 mi_key_mig 签名 RFC 7675 STUN 保活无应答，按 1.1s → 1.6s → 2.0s 每次生成全新 txid 重试（Ready 态 0 缓存重放），单包偶发丢包绝不误切。",
+        dir: "drop_dpi", pill: "PFS-KA (3/3 FRESH TXID)", pillColor: "#f59e0b",
+        cli: "KA RETRY 2/2", cliEx: "mi_key_mig · ~4.7s", dpi: "CGNAT :51000", dpiSub: "3 次上行全被黑洞吞噬", dpiColor: "#ef4444",
         srv: "0 STUN RECEIVED", srvEx: "last_peer_rx 计时中", verdict: "WARN", verdictCls: "warn",
-        proto: "RFC 5389 Same-Txid Retransmit", hdr: "use_candidate = false", dpiView: "偶发单包丢包会在 1.1s 重传恢复", secAct: "3/3 均无应答 → 触发 V4.0 1-RTT 迁移",
-        hex: "[client-rs#0] RFC 7675 consent lost (3/3 STUN unanswered) -> old_path_drains 50s + 1-RTT ICE migration",
+        proto: "Per-Session PFS Consent KA", hdr: "mi_key_mig · fresh txid", dpiView: "偶发单包丢包会在 1.1s 重试恢复", secAct: "3/3 均无应答 → 触发 V4.0 1-RTT 迁移",
+        hex: "[client-rs#0] RFC 7675 consent lost (3/3 mi_key_mig STUN unanswered) -> old_path_drains 50s + 1-RTT ICE migration",
         note: "旧 socket 转入 50s 静默接收排空池（> 服务端 45s TTL），吸收在途尾包避免回弹明文 ICMP Port Unreachable，同时防止内核立刻复用坏口。"
       },
       {
-        title: "V4.0 1-RTT 迁移 STUN + 防反射加密 0xFFFD 路径挑战",
-        desc: "客户端保留 DTLS-PFS 主密钥与单调 SRTP 序列号，在新端口用每会话 HKDF 派生密钥 ice-pwd-v4 签名迁移 STUN；服务端回 64B STUN + 无填充 57B 0xFFFD 挑战。",
-        dir: "c2s_s2c", pill: "ICE MIG ⇄ 0xFFFD CHAL", pillColor: "#a855f7",
+        title: "V4.0 1-RTT 迁移 STUN + 防反射加密 61B 0xFFFD 路径挑战",
+        desc: "客户端保留 DTLS-PFS 主密钥与单调 SRTP 序列号，在新端口用 mi_key_mig 签名迁移 STUN；服务端回 64B STUN + 无填充 61B 0xFFFD 挑战（24B RTP + 4B ctrl + 17B body + 16B tag）。",
+        dir: "c2s_s2c", pill: "ICE MIG ⇄ 61B 0xFFFD", pillColor: "#a855f7",
         cli: "MIGRATING :51088", cliEx: "keep PFS key & seq", dpi: "DPI: ICE NOMINATE", dpiSub: "标准 RFC 8445 路径切换", dpiColor: "#22d3ee",
-        srv: "CHALLENGE (≤1.32x)", srvEx: "验证前绝不改路由!", verdict: "PASS", verdictCls: "pass",
-        proto: "RFC 8445 ICE + 0xFFFD Challenge", hdr: "121B ≤ 1.32x 防反射放大", dpiView: "标准 ICE 候选切换 + SRTP 密文", secAct: "每会话 HKDF 阻断同 PSK 劫持 · 限速 ≤4/s",
-        hex: "C->S: STUN(USE-CANDIDATE, mi_key_mig) -> S->C: 64B STUN OK + 57B Enc(0xFFFD Challenge, nonce, epoch)",
+        srv: "CHALLENGE (≤1.36x)", srvEx: "验证前绝不改路由!", verdict: "PASS", verdictCls: "pass",
+        proto: "RFC 8445 ICE + 61B 0xFFFD", hdr: "125B ≤ 1.36x 防反射放大", dpiView: "标准 ICE 候选切换 + SRTP 密文", secAct: "每会话 HKDF 阻断同 PSK 劫持 · 限速 ≤4/s",
+        hex: "C->S: STUN(92B USE-CANDIDATE, mi_key_mig) -> S->C: 64B STUN OK + 61B Enc(0xFFFD Challenge, nonce, epoch)",
         note: "服务端收到迁移请求后进入 4 槽位候选表，在收到客户端合法加密 0xFFFD 响应之前绝不修改 token_by_peer 或切走下行流量，彻底防源地址伪造劫持。"
       },
       {
         title: "1-RTT 满血恢复 · 0 DTLS 重握、0 后端换口（实测 P8 5.2s 复速）",
-        desc: "客户端回显加密 0xFFFD 响应，服务端原地切换 peer_addr 并保留原 backend_sock（跨 worker 无锁迁移），内层 HY2 无需重连直接拉回满速！",
+        desc: "客户端回显加密 0xFFFD 响应，服务端原地切换 peer_addr 并保留原 backend_sock（跨 worker 无锁迁移），内层 HY2/proxy 无需重连直接拉回满速！",
         dir: "c2s_s2c", pill: "0xFFFD OK · 0 PORT CHG", pillColor: "#10b981",
         cli: "STATE: READY ✓", cliEx: "new :51088 | 0 DTLS HS", dpi: "DPI: NEW 5-TUPLE", dpiSub: "新五元组畅通放行 ✓", dpiColor: "#10b981",
         srv: "MIGRATED IN-PLACE ✓", srvEx: "same backend_sock!", verdict: "PASS", verdictCls: "pass",
-        proto: "1-RTT In-Place Path Migration", hdr: "0 DTLS 重握 · 5s 旧路 ECMP 排空", dpiView: "无缝续传加密 WebRTC 媒体流", secAct: "兼容旧版 v0.3.8 服务端自动回退重握",
+        proto: "1-RTT In-Place Path Migration", hdr: "0 DTLS 重握 · 5s 旧路 ECMP 排空", dpiView: "无缝续传加密 WebRTC 媒体流", secAct: "若服务端已重启则自动平滑回退新 STUN+DTLS 1.3",
         hex: "[server-rs#0] ICE 1-RTT MIGRATION OK old=:51000 -> new=:51088 backend_sport=51481 (0 DTLS, 0 port change!)",
         note: "对比 P8 黑洞压测：t=3.5s 断上行后裸 HY2 永久死锁在 0 Mbps，而 V4.0 在 t=8.7s（约 5.2s）满血拉回 18.9 Mbps 全程不断流。"
       }
@@ -1140,43 +1189,43 @@ const SCENARIOS = {
     steps: [
       {
         title: "Step 1 · 独立临时端口直连线上服务端（零干扰现有业务）",
-        desc: "执行 webrtc-cloak selftest --server-host <IP> --psk-file ...，从全新本地端口完成 STUN + DTLS 1.3/1.2 握手，不碰线上 Hysteria 2。",
-        dir: "c2s_s2c", pill: "STUN + DTLS AUTO", pillColor: "#0891b2",
+        desc: "执行 webrtc-cloak selftest --server-host <IP> --psk-file ...（经 DNAT 映射可加 --stun-scope），从全新端口完成域隔离 STUN + DTLS 1.3 握手，不碰线上业务。",
+        dir: "c2s_s2c", pill: "SCOPED STUN + DTLS 1.3", pillColor: "#0891b2",
         cli: "SELFTEST #01~#05", cliEx: "NAT / RTT / RTCP", dpi: "DPI: WEBRTC", dpiSub: "正常独立 WebRTC 会话", dpiColor: "#10b981",
         srv: "ISOLATED SESSION", srvEx: "线上业务零影响 ✓", verdict: "PASS", verdictCls: "pass",
-        proto: "Live WAN Control Plane Audit", hdr: "20x Consent + RTCP", dpiView: "与常规会话完全一致", secAct: "测出真实 NAT、P50/P95 RTT 与 0% 丢包",
-        hex: "#01 NAT 198.51.100.24:51001 | #02 DTLS 1.3/1.2 | #03 p50 166.5ms jit 0.2ms 20/20 | #04 SeenTxidCache OK | #05 SRTCP rx=3",
-        note: "即使远端仍是旧版 v0.3.4 服务端，前 10 项（含公网 NAT、延迟、抖动、SRTCP、7 类主动探测与本机 CPU 算力）也可直接跑通。"
+        proto: "Live WAN Control Plane Audit", hdr: "20x mi_key_mig Consent + RTCP", dpiView: "与常规会话完全一致", secAct: "测出真实 NAT、P50/P95 RTT 与 0% 丢包",
+        hex: "#01 NAT 198.51.100.24:51001 | #02 DTLS 1.3 (0% HRR) | #03 p50 166.5ms 20/20 | #04 SeenTxidCache(2.5s/2x) OK | #05 SRTCP rx=3",
+        note: "全链路验证 v0.7.0 域隔离 STUN、默认 DTLS 1.3、mi_key_mig Consent 保活与服务端下发 Compound SRTCP 心跳。"
       },
       {
         title: "Step 2 · 加密带内 0xFFFE SRTP 回显实测公网数据面与 Path MTU",
-        desc: "在 AEAD 密文内部使用保留长度魔数 0xFFFE（>65400 永不与真实 UDP 冲突），由服务端直接 1:1 加密回显，绝不转发给后端 Hysteria 2。",
+        desc: "在 AEAD 密文内部使用保留长度魔数 0xFFFE（>65400 永不与真实 UDP 冲突），由服务端直接 1:1 加密回显，绝不转发给后端。",
         dir: "c2s_s2c", pill: "SRTP 0xFFFE ECHO", pillColor: "#10b981",
         cli: "SELFTEST #06~#07", cliEx: "30x1200B + MTU 1488B", dpi: "DPI: SRTP VIDEO", dpiSub: "线上与真实 SRTP 0 差异", dpiColor: "#10b981",
         srv: "IN-BAND ECHO ✓", srvEx: "backend rx=0pkts!", verdict: "PASS", verdictCls: "pass",
-        proto: "In-Band AEAD Probe (0xFFFE)", hdr: "b[0]=0x90 | Enc(0xFFFE)", dpiView: "完全处于 AEAD 密文内，零指纹差异", secAct: "1:1 零放大 · Ready 强鉴权 · 零后端污染",
-        hex: "#06 p50 167.1ms 30/30 ooo=0 +52.0B(+4.34%) | #07 Path MTU pass<=1422B (IPv4 1488B) | 1452B guard DROP",
-        note: "实网直接验证典型 PPPoE 1492B 链路下 1488B IPv4 零分片直通，且服务端日志证实转发给 Hysteria 2 的包数严格为 0。"
+        proto: "In-Band AEAD Probe (0xFFFE)", hdr: "0x90/0xB0 | Enc(0xFFFE)", dpiView: "完全处于 AEAD 密文内，零指纹差异", secAct: "1:1 零放大 · Ready 强鉴权 · 零后端污染",
+        hex: "#06 p50 167.1ms 30/30 ooo=0 | #07 Path MTU pass<=1422B (20B fallback -> IPv4 1488B) | 1452B guard DROP",
+        note: "实网直接验证 PPPoE 1492B 链路下 1488B IPv4 零分片直通（接近极限自动切 20B 扩展头保 1422B 通过），且转发后端包数严格为 0。"
       },
       {
         title: "Step 3 · 第二端口 NAT 轮换验真 + 7 类公网 Silent-Drop 并发攻击审计",
-        desc: "开启第二端口验证黑洞换口能力与 NAT 端口增量特征（d=4），随后 7 线程并行向公网端口发恶意探针验真 0 字节回复。",
+        desc: "开启第二端口验证黑洞换口能力与 NAT 端口增量特征，随后 7 线程并行向公网端口发恶意探针验真 0 字节回复。",
         dir: "c2s_s2c", pill: "PORT2 + 7x PROBES", pillColor: "#a855f7",
         cli: "SELFTEST #08~#09", cliEx: "NAT d=4 | 7/7=0B", dpi: "NAT + PROBE TEST", dpiSub: "测出同 IP 顺序 NAT", dpiColor: "#22d3ee",
         srv: "7/7 SILENT DROP ✓", srvEx: "legit session OK", verdict: "PASS", verdictCls: "pass",
         proto: "NAT Type + Security Audit", hdr: "0B leaked / 7 vectors", dpiView: "确认线上防火墙/服务端无指纹泄露", secAct: "攻击波结束后验真主测试会话仍存活",
         hex: "#08 NAT 198.51.100.24:51001->51005 (same IP, d=4) | #09 silent_drop 7/7 (0B leaked) | legit OK",
-        note: "顺带测出本机单核三套件加解密 + 全核并发算力 + P-256 临时证书签发速率，约 10 秒输出完整对齐成绩单。"
+        note: "顺带测出本机单核三套件加解密 + 全核并发算力 + P-256 临时证书签发速率，约 3–6 秒输出完整成绩单。"
       },
       {
-        title: "Step 4 · 双向优雅拆除（零僵尸会话残留）",
-        desc: "测试结束自动对两个临时测试会话发送加密 SRTCP BYE + DTLS close_notify，服务端 250ms 干净回收。",
-        dir: "c2s", pill: "BYE + CLOSE_NOTIFY", pillColor: "#0ea5e9",
-        cli: "12/12 PASSED ✓", cliEx: "elapsed 10.45s", dpi: "CLEAN TEARDOWN", dpiSub: "测试会话已关闭", dpiColor: "#10b981",
+        title: "Step 4 · 双向异步优雅拆除（零僵尸会话残留）",
+        desc: "测试结束自动对两个临时会话发送加密 SRTCP BYE，经 18–95ms 随机异步延迟后发加密填充 DTLS close_notify，服务端 250ms 干净回收。",
+        dir: "c2s", pill: "ASYNC BYE → CLOSE", pillColor: "#0ea5e9",
+        cli: "12/12 PASSED ✓", cliEx: "local 1668 Mbps", dpi: "CLEAN TEARDOWN", dpiSub: "测试会话已异步优雅关闭", dpiColor: "#10b981",
         srv: "GRACEFUL CLOSE ✓", srvEx: "0 zombie sessions", verdict: "PASS", verdictCls: "pass",
-        proto: "Graceful Teardown (2/2)", hdr: "SRTCP BYE + Alert", dpiView: "无连接残留，无 ICMP 弹包", secAct: "支持 --json 接入定时监控脚本",
+        proto: "Async Graceful Teardown (2/2)", hdr: "SRTCP BYE → +18..95ms → 0x2f", dpiView: "无连接残留，无 ICMP 弹包，无成对包指纹", secAct: "支持 --json 接入定时监控脚本",
         hex: "close session peer=198.51.100.24:51001 reason=graceful_close rx=0pkts tx=0pkts ka=22 rtcp=3/2 drops=0",
-        note: "客户端随时执行一行命令即可在约 10 秒内完成全链路公网体检；本地开发则用 --local 跑离线故障注入沙箱。"
+        note: "客户端随时一行命令完成全链路公网体检；本地开发运行 selftest --local 执行 12 项离线故障注入沙箱（全通 12/12）。"
       }
     ]
   }
@@ -1328,16 +1377,16 @@ const PACKETS = {
     showPadSim: true,
     fields: [
       {
-        off: "0", len: "1B", name: "V=2 P=0 X=1 CC=0", val: "0x90", tone: "tone-aad",
+        off: "0", len: "1B", name: "V=2 P=0/1 X=1 CC=0", val: "0x90 (~87.5%) / 0xB0 (~12.5%)", tone: "tone-aad",
         scope: "AEAD AAD (明文受完整认证)",
-        dpi: "标准 Chrome WebRTC 媒体包头（含 0xBEDE 扩展头，无外部明文填充标志 P=0）。",
-        v32: "废弃易暴露的 0xB0 (P=1) 外置填充，全部填充收进 AEAD 密文内，音频流与视频流统一 0x90 形态。"
+        dpi: "Chrome WebRTC 媒体包头（含 RFC 8285 扩展头，按 ~12.5% 比例在填充包中置 RFC 3550 P=1 呈 0xB0）。",
+        v32: "v0.7.0 贴合真实 Chrome BWE 分布：带 ≥4B 填充时约 1/8 置 P=1 (0xB0) 并在密文末字节写入 pad_len，打破 100% 恒定 0x90 的人工特征。"
       },
       {
         off: "1", len: "1B", name: "M | Payload Type", val: "PT=96 (Video) / PT=111 (Audio)", tone: "tone-aad",
         scope: "AEAD AAD · 双流自动分流",
-        dpi: "大包 ≥256B 打 PT=96 (VP8/H.264 视频，每 33ms 帧最多一次 M=1)；小包 <256B 打 PT=111 (Opus 音频，静音 ≥200ms 复讲置 M=1)。",
-        v32: "V3.2 新增：协商 DTLS 1.3 时自动激活音视频双 SSRC 分流，消除单路视频流夹杂 60~130B 极小 ACK 包的特征；旧版 DTLS 1.2 自动回退单流。"
+        dpi: "抖动阈值 (<180..307B) 且 ≤50 pps 的小包打 PT=111 (Opus 音频，静音 ≥200ms 置 M=1)；其余及溢出包打 PT=96 (Video，严格 M=1 帧尾因果)。",
+        v32: "v0.7.0 溢出至 Video 流的极小 ACK 包 (<160B) 自动平滑展宽，彻底消除视频流中的 <89B 异常尖峰与 3 包机械微帧。"
       },
       {
         off: "2..3", len: "2B", name: "Per-SSRC Sequence", val: "video_seq / audio_seq (+1)", tone: "tone-aad",
@@ -1346,40 +1395,40 @@ const PACKETS = {
         v32: "双流各自拥有独立的 2048 包 RFC 6479 环形防重放窗口，既容忍跨洋 ECMP 乱序又 100% 阻断重放包。"
       },
       {
-        off: "4..7", len: "4B", name: "90kHz / 48kHz 时钟", val: "3000/33ms (视频) · 960/20ms (音频)", tone: "tone-aad",
-        scope: "AEAD AAD · 纯墙钟斜率",
-        dpi: "视频流精确锁定 90,000 Hz 墙钟（实测误差 <0.3%）；音频流按 RFC 7587 锁定 48,000 Hz（每 20ms +960 tick）。",
-        v32: "u64 纳秒墙钟彻底消除 13.25h 截断回绕与突发小包导致的时钟斜率异常。"
+        off: "4..7", len: "4B", name: "30/60FPS 90kHz / 48kHz", val: "3000|1500±180 (视频) · 960/20ms (音频)", tone: "tone-aad",
+        scope: "AEAD AAD · 量化帧率时钟",
+        dpi: "视频流按 30/60 FPS 量化步进（min_dt ≥ 1320 ticks ≤ 68 FPS，单帧 6..56 包硬封顶 ≤60）；音频流按 RFC 7587 锁定 48 kHz (+960/20ms)。",
+        v32: "v0.7.0 彻底消除 >200 FPS 非法瞬时帧率与机械 3 包微帧，u64 纳秒墙钟永不截断回绕。"
       },
       {
-        off: "8..11", len: "4B", name: "Dual SSRC", val: "video_ssrc / audio_ssrc (互异)", tone: "tone-aad",
+        off: "8..11", len: "4B", name: "Dual SSRC", val: "video_ssrc / audio_ssrc (高 16 位互斥)", tone: "tone-aad",
         scope: "AEAD AAD + Nonce 域隔离",
         dpi: "每方向拥有独立随机的视频 SSRC 与音频 SSRC，与真实浏览器 WebRTC 音视频同行形态一致。",
-        v32: "audio_ssrc 由会话主密钥与 video_ssrc 确定性派生且强制互异，保证两路 AEAD Nonce 空间数学上 0 重叠。"
+        v32: "audio_ssrc 由会话主密钥与 video_ssrc 确定性派生且强制高 16 位互异，保证两路 AEAD Nonce 空间数学上 0 重叠。"
       },
       {
-        off: "12..19", len: "8B", name: "RFC 8285 0xBEDE TWCC", val: "be de 00 01 31 [global_twcc] 00", tone: "tone-aad",
-        scope: "AEAD AAD · 跨流共享传输序号",
-        dpi: "Chrome 标配 One-Byte 扩展头（ID=3, L=1 transport-wide-cc），跨音频与视频两条流全局单调 +1 递增。",
-        v32: "100% 对齐 libwebrtc draft-holmer-rmcat-transport-wide-cc 行为，独立 X 光审计确认 global_twcc_mono=True。"
+        off: "12..23/27", len: "12B / 16B", name: "动态多元素 RFC 8285 扩展头", val: "Video: ast(ID2)+twcc(ID3)[+mid(ID4)] | Audio: lvl(ID1)+twcc[+mid]", tone: "tone-aad",
+        scope: "AEAD AAD · 24B/28B 动态头 (MTU 极限退回 20B)",
+        dpi: "Chrome 标配多元素 One-Byte 扩展头：视频含 24-bit 6.18 定点 abs-send-time + 全局 TWCC (+ 起流 MID 扩至 28B)；音频含 ssrc-audio-level + TWCC (+ MID)。",
+        v32: "v0.7.0 彻底告别单一固定 20B 仅 TWCC 头部指纹；仅在接近 1488B MTU 极限时优雅回落 20B 保护零分片。"
       },
       {
-        off: "20..21", len: "2B", name: "inner_len / V4 带内控制帧", val: "Enc(≤65400 | 0xFFFE | 0xFFFD | 0xFFFC)", tone: "tone-enc",
+        off: "Hdr+0..1", len: "2B", name: "inner_len / 带内控制与复用魔数", val: "Enc(≤65400 | 0xFFFE..0xFFFA)", tone: "tone-enc",
         scope: "AEAD 密文内层（线上完全不可见）",
-        dpi: "DPI 仅见高熵密文，无法区分正常业务流量与 0xFFFE 诊断回显、0xFFFD 1-RTT 迁移挑战或 0xFFFC MBB 原子过户帧。",
-        v32: "全部保留魔数严格 > MAX_INNER_UDP_LEN (65400) 零冲突且永不转发后端，所有控制帧同步计入 SRTP 收发计数以保持 RFC 3550 RTCP 因果律。"
+        dpi: "DPI 仅见高熵密文，无法区分普通数据、0xFFFE 诊断回显、0xFFFD 迁移挑战、0xFFFC 过户或 0xFFFB/0xFFFA 反向隧道复用帧。",
+        v32: "全部保留魔数严格 > MAX_INNER_UDP_LEN (65400) 零冲突；PreWarm 与 proxy 长静默期绝不发送 0xFFFE 信标。"
       },
       {
-        off: "22..N", len: "Var", name: "原始 UDP 载荷 (密文)", val: "Enc(Hysteria2 / WG)", tone: "tone-enc",
+        off: "Hdr+2..N", len: "Var", name: "原始 UDP / 内嵌代理载荷 (密文)", val: "Enc(No-op QUIC Proxy / Hy2 / WG)", tone: "tone-enc",
         scope: "AEAD 密文主体",
-        dpi: "外观等同加密媒体帧；默认受 WAN MTU 1488B 保护（内层 UDP ≤1422B 放行，>1422B 主动丢弃引导 QUIC DPLPMTUD 收敛）。",
-        v32: "Hybrid PFS 混合密钥加密（AES-128-GCM / ChaCha20-Poly1305 / BLAKE2b），单核加密高达 10.1 Gbps (ARM64) / 2.2 Gbps (低功耗 x86_64)。"
+        dpi: "外观等同加密媒体帧；内嵌 proxy 大流自动整形出 ~10.5% 视频帧尾包；默认受 WAN MTU 1488B 零分片守护。",
+        v32: "Hybrid PFS 混合密钥加密（AES-128-GCM / ChaCha20-Poly1305 / BLAKE2b），Apple Silicon 单核高达 18.7 Gbps (GCM) / 4.0 Gbps (ChaCha20)。"
       },
       {
-        off: "N+1..", len: "0..31B", name: "内层随机填充 (密文)", val: "Enc(SplitMix64 pad)", tone: "tone-pad",
+        off: "N+1..", len: "0..63B", name: "密文内层随机填充 (含 P=1 尾字节)", val: "Enc(SplitMix64 pad [.. pad_len])", tone: "tone-pad",
         scope: "AEAD 密文内部填充（零明文泄露）",
-        dpi: "将固定包长尖峰打散均匀覆盖 16 个 mod-16 桶；≥1340B 大包自动收窄至 0..7B 并受 1460B UDP 硬上限约束。",
-        v32: "1200B 业务包实测平均增量仅 +52B (+4.34%)，兼顾低开销与防分片。"
+        dpi: "常规包 0..63B 打破 1200B QUIC 矩形窄箱；≥1340B 大包收窄至 0..7B；溢出视频小包 (<160B) 平滑展宽至最高 1040B。",
+        v32: "受 1460B IPv4 / 1440B IPv6 UDP 硬上限约束，在 PPPoE 1492B 下维持零分片与约 +2.8%~+3.4% 极低 L3 开销。"
       },
       {
         off: "Tail", len: "16B", name: "AEAD Auth Tag", val: "128-bit GCM/Poly1305", tone: "tone-auth",
@@ -1400,9 +1449,9 @@ const PACKETS = {
         v32: "首字节落入 RFC 7983 0..3 区间，第一时间命中运营商 WebRTC/STUN 白名单。"
       },
       {
-        off: "2..3", len: "2B", name: "Message Length", val: "4 字节严格对齐", tone: "tone-plain",
+        off: "2..3", len: "2B", name: "Message Length", val: "4 字节严格对齐 (92B / 88B / 68B / 64B)", tone: "tone-plain",
         scope: "STUN 头部",
-        dpi: "记录 20B 头部之后所有属性总长度（建连 92B、保活 88B、应答 64B）。",
+        dpi: "Cloak 建连提名 92B、保活/抽卡探针 88B、IPv4 应答 64B (IPv6 76B)；Bypass 非 DPI 极简探测固定 68B。",
         v32: "解析器强制要求 20 + msg_len == data.len() 且 msg_len % 4 == 0，拒绝尾部垃圾。"
       },
       {
@@ -1412,28 +1461,28 @@ const PACKETS = {
         v32: "客户端与服务端双向强校验。"
       },
       {
-        off: "8..19", len: "12B", name: "Transaction ID", val: "u32_ts ⊕ mask || tag", tone: "tone-auth",
-        scope: "隐蔽时间戳防重放锚点",
-        dpi: "外观呈均匀随机 96-bit 事务 ID；保活丢包时按 RFC 5389 §7.2.1 复用同一 txid 指数退避重试。",
-        v32: "服务端校验 ±30s 新鲜度并记入 90s 跨 worker 共享 SeenTxidCache（同 peer 限 6 次重传，跨源重放 0B 丢弃）。"
+        off: "8..19", len: "12B", name: "Transaction ID", val: "r8 || (u32_ts ⊕ mask(stun_psk, r8))", tone: "tone-auth",
+        scope: "±10s 新鲜度锚点 + 域隔离绑定",
+        dpi: "外观呈均匀随机 96-bit 事务 ID；Ready 态保活重试每次生成新 txid（0 缓存重放）。",
+        v32: "v0.7.0 时间戳窗收紧至 ±10s；SeenTxidCache 仅允许 DTLS 前 2.5s 内最多 2 次同 peer 重传，进入 DTLS 即 invalidate() 永久熔断。"
       },
       {
-        off: "20..", len: "Var", name: "ICE 属性簇", val: "USERNAME(4:4) + CTRL + [USE-CAND] + PRIO", tone: "tone-aad",
+        off: "20..", len: "Var", name: "ICE 属性簇 & RFC 8445 常规提名", val: "USERNAME(Chrome 4:4) + CTRL + [USE-CAND] + PRIO", tone: "tone-aad",
         scope: "受 HMAC-SHA1 完整保护",
-        dpi: "按 libwebrtc 顺序排列（4:4 Base64 ufrag、会话常量 ICE-CONTROLLING 与 PRIORITY）；仅初始提名带 USE-CANDIDATE。",
-        v32: "NEW-M-01：服务端仅允许带 USE-CANDIDATE 的请求新建会话，孤儿保活一律静默丢弃以配合客户端黑洞/重启自愈。"
+        dpi: "统一 Chrome 4:4 Base64 ufrag（消除 Firefox+Chrome 混血指纹）；--lane-hunt 共享 ufrag/tie_breaker 且递减 PRIORITY，仅胜出者置 USE-CANDIDATE。",
+        v32: "服务端 HuntUfragTable 强制 ICE-CONTROLLING，实施 4s 同 IP 探测窗 (≤16 包)、20s 未提名墓碑 (>±10s 偏斜) 与 90s 提名/关断墓碑。"
       },
       {
-        off: "End-28", len: "24B", name: "MESSAGE-INTEGRITY", val: "0x0008 + 20B HMAC-SHA1", tone: "tone-auth",
-        scope: "PSK 双向身份鉴权",
-        dpi: "标准 RFC 5389 §15.4 完整性属性。",
-        v32: "强制断言 next_pos + 8 == end，MI 之后绝不允许夹带任何额外走私属性！"
+        off: "End-28", len: "24B", name: "MESSAGE-INTEGRITY", val: "HKDF(scope) 初始鉴权 | mi_key_mig Ready 保活", tone: "tone-auth",
+        scope: "端点域隔离 + 每会话 PFS 鉴权",
+        dpi: "标准 RFC 5389 §15.4 20B HMAC-SHA1 属性；DNAT 映射支持显式 --stun-scope <TAG>。",
+        v32: "v0.7.0 彻底隔离端口与 cloak/bypass 域（0/8 跨口重放）；Ready 态保活改用每会话 DTLS-PFS mi_key_mig，根治 SIGKILL 假应答与 >90s 关断后重放。"
       },
       {
         off: "End-8", len: "8B", name: "FINGERPRINT", val: "0x8028 + CRC32^0x5354554E", tone: "tone-auth",
         scope: "强制唯一尾属性",
         dpi: "标准 RFC 5389 §15.5 魔数异或 CRC32 校验。",
-        v32: "必须位于报文绝对末尾且校验通过，缺省或提前出现均整包静默拒收。"
+        v32: "必须位于报文绝对末尾（next_pos + 8 == end），MI 后禁止任何额外走私属性。"
       }
     ]
   },
@@ -1442,39 +1491,39 @@ const PACKETS = {
     showPadSim: false,
     fields: [
       {
-        off: "0", len: "1B", name: "Plaintext CT / 1.3 Unified Header", val: "20..=23, 26(ACK) | 0x20..0x3F (001C_SL_EE)", tone: "tone-plain",
+        off: "0", len: "1B", name: "Plaintext CT / 1.3 Unified Header", val: "0x16 (CH/SH) | 0x20..0x3F (001C_SL_EE)", tone: "tone-plain",
         scope: "RFC 7983 & RFC 9147 记录首字节",
         dpi: "首包明文 ClientHello/ServerHello 为 0x16；进入 DTLS 1.3 加密阶段切换为标准短头 0x2e (ep=2) / 0x2f (ep=3)。",
-        v32: "V3.2 入口严格校验：DTLS 1.3 Unified Header 强制 C=0（无 CID）且密文 ≥18B，仍 100% 拒绝 Epoch=0 明文 Alert。"
+        v32: "入口严格校验 C=0（无 CID）、密文 ≥18B、epoch=0 拒明文 Alert，且服务端重置握手强制校验 record_seq==0 (pkt[5..11]==0)。"
       },
       {
-        off: "Flight 1/3", len: "1150B", name: "Hybrid ClientHello (1.3+1.2)", val: "6 suites · 9 exts · X25519 key_share · padding", tone: "tone-aad",
-        scope: "Dtls::new_auto 自动生成",
-        dpi: "同时宣告 3 个 TLS 1.3 + 3 个 TLS 1.2 AEAD 套件，携带 supported_versions、key_share(32B)、use_srtp、EMS、renegotiation_info(0xFF01) 及 966B padding。",
-        v32: "彻底解决旧版 DTLS 1.2 ClientHello 仅 118B 且缺 renegotiation_info 的指纹短板；遇旧版服务端自动无缝回退 DTLS 1.2。"
+        off: "Flight 1", len: "Var (无 0x0015)", name: "Chrome/BoringSSL 对齐 ClientHello", val: "GREASE 书立 + Chrome 套件序 + use_srtp [7,8,1]", tone: "tone-aad",
+        scope: "默认 V13Only (--dtls-min-version 1.3)",
+        dpi: "套件序 [GREASE, 0x1301..0xC014]、use_srtp [0x0007, 0x0008, 0x0001]、exts[0]=空 GREASE、exts[last]=1B 0x00 GREASE 且仅洗牌中间扩展，0% 0x0015 零块。",
+        v32: "v0.7.0 默认锁定 Dtls::new_13() 100% 免疫 1 字节降级明文证书泄露；显式开启 auto 时仍由 RFC 8446 §4.1.3 DOWNGRD\\x01 哨兵兜底。"
       },
       {
-        off: "Flight 2", len: "109B", name: "HelloRetryRequest Cookie", val: "stateless cookie + HRR magic random", tone: "tone-plain",
-        scope: "防 UDP 源伪造放大挑战",
-        dpi: "服务端无状态生成 Cookie 挑战，验证客户端真实源地址后才进入密钥交换。",
-        v32: "extract_dtls_server_hello_suite 显式过滤 RFC 8446 HRR 魔数，防止误把 HRR 当成 ServerHello 锁定套件。"
+        off: "Flight 2", len: "1-RTT Direct", name: "0% HelloRetryRequest — 直出 ServerHello", val: "已鉴权 ICE STUN 后跳过冗余 HRR", tone: "tone-plain",
+        scope: "patches/dimpl 1-RTT 极速建连",
+        dpi: "服务端省略与现代 WebRTC/ICE 冗余的 HRR Cookie 往返，收到 ClientHello 后直接发送 ServerHello + 加密握手。",
+        v32: "不仅再省 1 RTT、抹除静态 HRR 特征，且客户端 enable_peer_encryption() 连续 3 次解密失败 <9ms 快速熔断抗 ServerHello 毒化。"
       },
       {
-        off: "Flight 4/5", len: "708B / 507B", name: "全加密双向证书与签名 (0x2e)", val: "DTLS13Ciphertext(EE + CertReq + Cert + CV + Fin)", tone: "tone-enc",
-        scope: "RFC 9147 Epoch=2 握手密文",
-        dpi: "ServerHello 之后的所有握手报文（含双方 CN=WebRTC P-256 证书与签名）100% AEAD 加密，Wireshark 无密钥无法提取证书！",
-        v32: "跨洋 160ms RTT 握手从 853ms 降至 667ms（立省 1 RTT）；旧版 1.2 模式下证书也按 20~24h worker 缓存轮换。"
+        off: "Flight 2/3", len: "随机变长", name: "RFC 9147 §4.2 随机内层填充加密握手 (0x2e)", val: "DTLS13Ciphertext(EE + CertReq + Cert + CV + Fin + rand_pad)", tone: "tone-enc",
+        scope: "RFC 9147 Epoch=2 加密证书与抗尾包损坏",
+        dpi: "双方 CN=WebRTC P-256 证书与签名 100% AEAD 加密，且密文内层注入随机填充，彻底消除 709B / 506B 静态长度指纹！",
+        v32: "支持拼接 Flight-4 局部已处理记录在重传时续接丢失尾包 (Finished)，实测加密尾包损坏 10/10 在 274–409ms 恢复。"
       },
       {
-        off: "Flight 6+", len: "72B / 24B", name: "DTLS 1.3 ACK & 加密 close_notify", val: "DTLS13Ciphertext(0x2f, ep=3)", tone: "tone-enc",
+        off: "Flight 4+", len: "随机变长", name: "随机填充 DTLS 1.3 ACK & 异步 close_notify", val: "DTLS13Ciphertext(0x2f, ep=3 + rand_pad)", tone: "tone-enc",
         scope: "RFC 9147 应用层加密控制",
-        dpi: "握手确认与退出告警均封装在 0x2f 密文短头中，Ready 期严格过滤一切非法握手重注。",
-        v32: "优雅拆除发送加密 close_notify，并配合 250ms Closing 排空窗口防止 ICMP 端口不可达反弹。"
+        dpi: "ACK 与 close_notify 均带 RFC 9147 §4.2 随机内层填充（消除 72B / 24B 固定长度指纹）。",
+        v32: "关闭时与 SRTCP BYE 分离 18–95ms（SIGTERM 22–65ms）异步发送，并配合 250ms Closing 排空窗口防止 ICMP 弹包。"
       },
       {
-        off: "Export", len: "64B", name: "RFC 5764 KeyingMaterial", val: "EXTRACTOR-dtls_srtp (PFS)", tone: "tone-auth",
+        off: "Export", len: "64B", name: "RFC 5764 KeyingMaterial", val: "EXTRACTOR-dtls_srtp (Fail-Closed PFS)", tone: "tone-auth",
         scope: "内存内部导出（永不上线）",
-        dpi: "完全驻留内存，与 PSK STUN 密钥做 SHA-256 混合生成 Hybrid PFS 主密钥，再衍生双 SSRC。",
+        dpi: "完全驻留内存，与域隔离 STUN 密钥做 SHA-256 混合生成 Hybrid PFS 主密钥，再衍生双 SSRC 与每会话 mi_key_mig。",
         v32: "确保任何历史抓包即便未来 PSK 泄露也无法回溯解密，同时兼顾零外部 CA 依赖。"
       }
     ]
@@ -1493,16 +1542,16 @@ const PACKETS = {
         off: "1", len: "1B", name: "Packet Type (PT)", val: "恒为 200 (SR) 或 201 (RR)", tone: "tone-aad",
         scope: "SRTCP 明文头",
         dpi: "RFC 3550 §6.1 强制规定复合 RTCP 首包只能是 SR(200) 或 RR(201)，绝不可是明文 BYE(203)。",
-        v32: "V3.2 微修：空闲超时退场严格基于近期增量发包判定，保持 PT=201(RR)+加密 BYE，不再误跳回 PT=200(SR)。"
+        v32: "空闲超时退场基于近期增量发包保持 PT=201(RR)+加密 BYE；超过 60s 长静默双端对称维持 25–45s 极低频 RR，避免“STUN 活但 RTCP 为 0”异常。"
       },
       {
         off: "2..3", len: "2B", name: "Primary Length", val: "12 / 6 (SR) · 7 / 1 (RR)", tone: "tone-aad",
         scope: "SRTCP 明文头",
         dpi: "32-bit 字长减一，与 RC=0/1 对应的 52B/28B/32B/8B 字节级精确吻合。",
-        v32: "独立 RFC X 光审计全部 10/10 报文 length 字段精确通过。"
+        v32: "独立 RFC X 光审计全部 length 字段精确通过。"
       },
       {
-        off: "4..7", len: "4B", name: "Sender SSRC", val: "与视频 SRTP 流一致的 SSRC", tone: "tone-aad",
+        off: "4..7", len: "4B", name: "Sender SSRC", val: "与活跃 Audio/Video 流一致的 SSRC", tone: "tone-aad",
         scope: "SRTCP 明文头 + Nonce 绑定",
         dpi: "标识该控制报告归属的媒体发送源。",
         v32: "Nonce 首字节为 dir | 0x80，与视频/音频 SRTP Nonce 空间 100% 数学隔离。"
@@ -1511,7 +1560,7 @@ const PACKETS = {
         off: "8..N", len: "Var", name: "加密复合体 (SR/RR+SDES+FB+BYE)", val: "Enc(SR/RR + SDES(13B CNAME+0x00) + FB + BYE)", tone: "tone-enc",
         scope: "AEAD 密文体",
         dpi: "仅暴露前 8B 明文头，其余 SR/RR 字段、SDES CNAME、随机 REMB/TWCC 反馈及退场 BYE 全程加密。",
-        v32: "V3.2 补齐 SDES 子包可打印 Base64 CNAME (13B) + RFC 3550 §6.5 0x00 END 结束符，内部明文也 100% 合规。"
+        v32: "退场发出加密 BYE 后，经 18–95ms (SIGTERM 22–65ms) 随机异步延迟才发 DTLS close_notify，消除成对包时序指纹。"
       },
       {
         off: "Tail-20", len: "16B", name: "Unified Auth Tag", val: "16B AEAD / Blake2bMac<U16>", tone: "tone-auth",
@@ -1520,7 +1569,7 @@ const PACKETS = {
         v32: "全套件统一 16B 标签长度，无套件长度侧信道。"
       },
       {
-        off: "Tail-4", len: "4B", name: "E-bit | SRTCP Index", val: "0x80000000 | idx(1,2,3...)", tone: "tone-auth",
+        off: "Tail-4", len: "4B", name: "E-bit | SRTCP Index", val: "0x80000000 | idx(0,1,2...)", tone: "tone-auth",
         scope: "AEAD AAD + 64-bit 防重放索引",
         dpi: "最高位 E=1 表示已加密，低 31 位为单调递增 SRTCP 索引（位于报文最后 4 字节，严格遵循 RFC 7714 §9.1）。",
         v32: "内置 64-bit 滑动窗口防重放，重放的历史 BYE 包无法关闭活跃会话。"
@@ -1562,7 +1611,7 @@ function renderPacket() {
     </div>
     <div class="wire-hex" style="margin-bottom:10px">${sel.val}</div>
     <div class="sec"><strong>DPI / Wireshark 线上视角</strong>${sel.dpi}</div>
-    <div class="sec"><strong>V4.0 工程与安全加固点</strong>${sel.v32}</div>
+    <div class="sec"><strong>V4.0 (v0.7.0) 工程与安全加固点</strong>${sel.v32}</div>
   `;
 
   document.getElementById("padSimBox").style.display = pk.showPadSim ? "block" : "none";
@@ -1572,20 +1621,22 @@ document.querySelectorAll("#pktTabs .tab-btn").forEach(btn => {
   btn.onclick = () => { curPkt = btn.dataset.pkt; curFieldIdx = 0; renderPacket(); };
 });
 
-// Interactive Dual-SSRC + PPPoE MTU 1488 + AEAD inner padding simulator
+// Interactive Dual-SSRC + PPPoE MTU 1488 + v0.7.0 dynamic 24B/20B header & P=1 (0xB0) padding simulator
 function runPadSim() {
   const orig = parseInt(document.getElementById("rngOrigLen").value, 10);
   document.getElementById("lblOrigLen").textContent = orig;
   const maxWireUdp = 1488 - 28; // 1460B
-  const baseTotal = 20 + 2 + orig + 16; // 38 + orig
+  const minHdr = 20; // MTU-constrained fallback header (TWCC-only)
+  const prefHdr = 24; // Standard v0.7.0 multi-element RFC 8285 header (ast+twcc or audio-level+twcc)
+  const minTotal = minHdr + 2 + orig + 16; // 38 + orig
   const banner = document.getElementById("routeBanner");
   const hist = document.getElementById("padHist");
 
-  if (baseTotal > maxWireUdp) {
+  if (minTotal > maxWireUdp) {
     banner.className = "route-banner route-drop";
-    banner.innerHTML = `<span>⛔ PPPoE MTU 1488 防分片拦截 (DROP)</span><span>最小线长 ${baseTotal}B &gt; 1460B (IPv4 ${baseTotal + 28}B &gt; 1488B)</span>`;
+    banner.innerHTML = `<span>⛔ PPPoE MTU 1488 防分片拦截 (DROP)</span><span>最小线长 ${minTotal}B &gt; 1460B (IPv4 ${minTotal + 28}B &gt; 1488B)</span>`;
     document.getElementById("padSummary").innerHTML =
-      `原始载荷 <code>${orig}B</code> 封装后至少需要 <code>${baseTotal}B</code> UDP（<code>${baseTotal + 28}B</code> IPv4），超过默认 WAN MTU <code>1488B</code>，<code>wrap_into()</code> 主动返回 <code>None</code> 丢弃，引导内层 QUIC/Hysteria 2 DPLPMTUD 收敛至零分片。`;
+      `原始载荷 <code>${orig}B</code> 即便启用 <code>20B</code> MTU 回落头也至少需要 <code>${minTotal}B</code> UDP（<code>${minTotal + 28}B</code> IPv4），超过默认 WAN MTU <code>1488B</code>，<code>wrap_into()</code> 主动返回 <code>None</code> 丢弃，引导内层 QUIC/Proxy DPLPMTUD 收敛至零分片。`;
     hist.innerHTML = "";
     for (let b = 0; b < 16; b++) {
       const col = document.createElement("div");
@@ -1597,22 +1648,25 @@ function runPadSim() {
     return;
   }
 
-  const isAudio = orig < 256;
+  const hdrLen = (prefHdr + 2 + orig + 16 <= maxWireUdp) ? prefHdr : minHdr;
+  const baseTotal = hdrLen + 2 + orig + 16;
+  const isAudio = orig < 244; // Representative midpoint of jittered 180..=307B Opus threshold
   const headroom = maxWireUdp - baseTotal;
-  const maxPad = Math.min(headroom, orig >= 1340 ? 7 : 31);
+  const maxPad = Math.min(headroom, orig >= 1340 ? 7 : 63);
 
   if (isAudio) {
     banner.className = "route-banner route-audio";
-    banner.innerHTML = `<span>🎙️ 路由至 Audio SSRC · PT=111 (Opus) · 48kHz 时钟</span><span>小包 (&lt;256B) · 共享全局 0xBEDE TWCC</span>`;
+    banner.innerHTML = `<span>🎙️ 路由至 Audio SSRC · PT=111 (Opus ≤50pps) · ${hdrLen}B 多元素头</span><span>抖动阈值 &lt;180..307B · audio-level + TWCC</span>`;
   } else {
     banner.className = "route-banner route-video";
-    banner.innerHTML = `<span>🎬 路由至 Video SSRC · PT=96 (VP8/H.264) · 90kHz 30fps</span><span>大包 (≥256B) · 共享全局 0xBEDE TWCC</span>`;
+    banner.innerHTML = `<span>🎬 路由至 Video SSRC · PT=96 (30/60FPS 量化 90kHz) · ${hdrLen}B ${hdrLen === 20 ? 'MTU 回落头' : '多元素头'}</span><span>大包 / 溢出包 · ${hdrLen === 20 ? '仅 TWCC 保 1422B 零分片' : 'abs-send-time + TWCC (+MID 28B)'}</span>`;
   }
 
   const buckets = new Array(16).fill(0);
-  let minW = 99999, maxW = 0;
+  let minW = 99999, maxW = 0, p1Count = 0;
   for (let i = 0; i < 64; i++) {
     const pad = maxPad === 0 ? 0 : Math.floor(Math.random() * (maxPad + 1));
+    if (pad >= 4 && Math.random() < 0.125) p1Count++;
     const wire = baseTotal + pad;
     buckets[wire % 16]++;
     if (wire < minW) minW = wire;
@@ -1631,7 +1685,7 @@ function runPadSim() {
   });
 
   document.getElementById("padSummary").innerHTML =
-    `当前规则：内层 <code>${orig}B</code> → 密文随机填充 <code>0..=${maxPad}B</code> ${maxPad < 31 ? '<span style="color:#fcd34d">(已自动收窄守卫 1488B MTU)</span>' : '(全范围打散模长尖峰)'} · 线上 UDP 总长 <code>${minW}B ~ ${maxW}B</code> · 首字节恒为 <code>0x90 (P=0)</code>`;
+    `当前规则：内层 <code>${orig}B</code> + <code>${hdrLen}B</code> RTP 头 → 随机填充 <code>0..=${maxPad}B</code> ${maxPad < 63 ? '<span style="color:#fcd34d">(已自动收窄守卫 1488B MTU)</span>' : '(0..63B 宽填充打破矩形窄箱)'} · 线上 UDP <code>${minW}B ~ ${maxW}B</code> · 本批 <code>P=1 (0xB0)</code> 占比 <code>${p1Count}/64</code>`;
   document.getElementById("padModStats").textContent =
     `覆盖 ${covered}/16 个 mod-16 桶 · 最大 IPv4 包 ${maxW + 28}B ≤ 1488B (PPPoE 零分片 ✓)`;
 }

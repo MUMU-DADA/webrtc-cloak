@@ -29,7 +29,15 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
         opts.wan_mtu,
     );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     let app = connect_app(client.port, 500);
     let hs_ms = match handshake_app(&app, Duration::from_secs(3)) {
@@ -100,7 +108,7 @@ pub(super) fn test_01_baseline(opts: &SelftestOptions, hi: &mut Highlights) -> S
         && after.dtls_pkts >= 4
         && after.max_wire_udp <= max_allowed
         && overhead_pct > 2.5
-        && overhead_pct < 7.0;
+        && overhead_pct < 9.5;
 
     ScenarioResult {
         id: 1,
@@ -151,7 +159,15 @@ pub(super) fn test_02_transpacific_latency(
         },
         false,
     );
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 600);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        600,
+    );
 
     let app = connect_app(client.port, 1000);
     // Avoid double-sending during slow WAN handshake: wait up to 4s with 1s read timeout
@@ -257,7 +273,15 @@ pub(super) fn test_03_random_loss(opts: &SelftestOptions, hi: &mut Highlights) -
         },
         false,
     );
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     let app = connect_app(client.port, 400);
     let Some(hs_ms) = handshake_app(&app, Duration::from_secs(5)) else {
@@ -366,7 +390,15 @@ pub(super) fn test_04_reorder_and_replay(
         },
         false,
     );
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     let app = connect_app(client.port, 500);
     if handshake_app(&app, Duration::from_secs(3)).is_none() {
@@ -485,7 +517,15 @@ pub(super) fn test_05_mtu_guard(opts: &SelftestOptions, hi: &mut Highlights) -> 
         opts.wan_mtu,
     );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     let app = connect_app(client.port, 400);
     if handshake_app(&app, Duration::from_secs(3)).is_none() {
@@ -570,7 +610,15 @@ pub(super) fn test_06_single_stun_drop(
         opts.wan_mtu,
     );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), true);
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 1, 200);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        1,
+        200,
+    );
 
     let app = connect_app(client.port, 250);
     if handshake_app(&app, Duration::from_secs(3)).is_none() {

@@ -1,6 +1,6 @@
 //! RFC 5389/8445 ICE STUN 报文编解码、新鲜度校验与 HKDF 密钥派生。
 
-use super::{fill_random, rand_u32, rand_ufrag_chrome, unix_secs};
+use super::{fill_random, rand_ufrag_chrome, unix_secs};
 use crate::constants::{
     STUN_BINDING_REQUEST, STUN_BINDING_SUCCESS, STUN_HDR_LEN, STUN_MAX_USERNAME_LEN,
 };
@@ -8,7 +8,44 @@ use hmac::{Hmac, KeyInit, Mac as _};
 use sha1::Sha1;
 use sha2::{Digest as _, Sha256};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::sync::OnceLock;
 use subtle::ConstantTimeEq;
+
+static GLOBAL_STUN_SCOPE: OnceLock<String> = OnceLock::new();
+
+/// Set an optional process-wide explicit `--stun-scope <TAG>` override for NAT port-forwarded
+/// deployments where client destination port differs from server listen port.
+pub fn set_global_stun_scope(tag: String) {
+    let _ = GLOBAL_STUN_SCOPE.set(tag);
+}
+
+/// Derive a v0.7 endpoint-scoped STUN secret bound to `(role, scope_tag_or_port)`.
+/// - `is_bypass`: isolates Cloak vs Bypass STUN domains so captures from one mode never replay into the other.
+/// - `explicit_scope`: optional per-endpoint override (`--stun-scope <TAG>`); falls back to
+///   `GLOBAL_STUN_SCOPE`, otherwise defaults to `port.to_string()`. Because `--stun-scope 443`
+///   matches a client connecting to port `443`, DNAT / Docker / `nftables` redirect deployments
+///   only need `--stun-scope <PUBLIC_PORT>` on the server/responder side.
+pub fn derive_stun_scope_key_for(
+    psk: &[u8],
+    port: u16,
+    explicit_scope: Option<&str>,
+    is_bypass: bool,
+) -> [u8; 32] {
+    let mut info = Vec::with_capacity(64);
+    info.extend_from_slice(b"webrtc-cloak-v7:stun-scope:");
+    info.extend_from_slice(if is_bypass { b"bypass:" } else { b"cloak:" });
+    if let Some(tag) = explicit_scope.or_else(|| GLOBAL_STUN_SCOPE.get().map(String::as_str)) {
+        info.extend_from_slice(tag.as_bytes());
+    } else {
+        info.extend_from_slice(port.to_string().as_bytes());
+    }
+    hkdf_sha256_32(b"webrtc-cloak-v7-stun-salt", psk, &info)
+}
+
+/// Convenience wrapper for Cloak endpoints without an explicit per-config scope override.
+pub fn derive_stun_scope_key(psk: &[u8], port: u16) -> [u8; 32] {
+    derive_stun_scope_key_for(psk, port, None, false)
+}
 
 type HmacSha1 = Hmac<Sha1>;
 
@@ -47,8 +84,8 @@ pub(super) fn stun_crc32(data: &[u8]) -> u32 {
 
 /// RFC 5389 STUN Magic Cookie 固定值。
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
-/// STUN 请求事务 ID 嵌入时间戳允许的最大时钟偏差（秒），用于防重放。
-const STUN_MAX_SKEW_SECS: i64 = 30;
+/// STUN 请求事务 ID 嵌入时间戳允许的最大时钟偏差（±10 秒），收紧在途截获重放窗口。
+const STUN_MAX_SKEW_SECS: i64 = 10;
 /// STUN 属性类型：`USERNAME` (0x0006)。
 pub(super) const STUN_ATTR_USERNAME: u16 = 0x0006;
 /// STUN 属性类型：`MESSAGE-INTEGRITY` (0x0008)。
@@ -89,12 +126,29 @@ impl SessionIceParams {
     pub fn generate() -> Self {
         let mut tie_breaker = [0u8; 8];
         fill_random(&mut tie_breaker);
-        let local_pref = (rand_u32() & 0xFFFF) | 0x8000;
+        // Standard RFC 8445 preferred host candidate priority (local_pref = 65535 -> 0x7effffff).
+        let priority = (ICE_HOST_TYPE_PREF << 24) | (0xFFFFu32 << 8) | ICE_COMPONENT_RTP_REV;
+        // Strictly match our Chrome/BoringSSL GREASE DTLS 1.3 ClientHello persona:
+        // always emit exact 4-char Base64 ufrags (eliminates Firefox ufrag + Chrome GREASE chimera).
+        let ufrag_local = rand_ufrag_chrome();
+        let ufrag_remote = rand_ufrag_chrome();
+        Self {
+            ufrag_local,
+            ufrag_remote,
+            tie_breaker,
+            priority,
+        }
+    }
+
+    /// Derive a sibling ICE candidate sharing the exact same session `ufrag` and `tie_breaker`
+    /// with RFC 8445 monotonically decremented host `local_pref`.
+    pub fn with_candidate_index(&self, idx: u16) -> Self {
+        let local_pref = 0xFFFFu32.saturating_sub(idx as u32);
         let priority = (ICE_HOST_TYPE_PREF << 24) | (local_pref << 8) | ICE_COMPONENT_RTP_REV;
         Self {
-            ufrag_local: rand_ufrag_chrome(),
-            ufrag_remote: rand_ufrag_chrome(),
-            tie_breaker,
+            ufrag_local: self.ufrag_local.clone(),
+            ufrag_remote: self.ufrag_remote.clone(),
+            tie_breaker: self.tie_breaker,
             priority,
         }
     }
@@ -211,6 +265,7 @@ fn finalize_stun_with_key(
     out
 }
 
+#[cfg(test)]
 fn finalize_stun(msg_type: u16, txid: &[u8; 12], body_in: &[u8], psk: &[u8]) -> Vec<u8> {
     let mi_key = stun_hmac_key(psk);
     finalize_stun_with_key(msg_type, txid, body_in, &mi_key)
@@ -307,7 +362,27 @@ pub fn build_ice_stun_request_with_key(
     (pkt, txid)
 }
 
+/// Build a minimal RFC 5389 authenticated STUN Binding Request for `bypass` ECMP lane probing:
+///   USERNAME -> MESSAGE-INTEGRITY -> FINGERPRINT
+/// Deliberately omits WebRTC-exclusive ICE attributes (`ICE-CONTROLLING`, `USE-CANDIDATE`, `PRIORITY`)
+/// so bypass mode does not masquerade as a half-broken WebRTC session on a raw QUIC 5-tuple, while
+/// staying 100% compatible with both new and `v0.6.0` `bypass --responder` instances.
+pub fn build_bypass_stun_request(
+    psk: &[u8],
+    ice: &SessionIceParams,
+    txid_opt: Option<[u8; 12]>,
+) -> (Vec<u8>, [u8; 12]) {
+    let mi_key = stun_hmac_key(psk);
+    let txid = txid_opt.unwrap_or_else(|| make_fresh_stun_txid(psk));
+    let uname = ice.username();
+    let mut body = Vec::with_capacity(48);
+    push_stun_attr(&mut body, STUN_ATTR_USERNAME, uname.as_bytes());
+    let pkt = finalize_stun_with_key(STUN_BINDING_REQUEST, &txid, &body, &mi_key);
+    (pkt, txid)
+}
+
 /// Build an authenticated RFC 8445 ICE STUN Binding Success Response (64B IPv4 / 76B IPv6).
+#[cfg(test)]
 pub fn build_stun_success_response(txid: &[u8; 12], peer: SocketAddr, psk: &[u8]) -> Vec<u8> {
     let mut body = Vec::with_capacity(56);
     let (xma, xlen) = encode_xor_mapped(peer, txid);

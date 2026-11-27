@@ -16,10 +16,10 @@ use crate::constants::{
     MAX_INNER_UDP_LEN, SRTP_DATA_MIN_WIRE_LEN, STUN_BINDING_REQUEST, TRICKLE_WINDOW_15S_SECS,
 };
 use crate::protocol::{
-    build_stun_success_response, build_stun_success_response_with_key, combine_session_key,
-    demux_rfc7983, derive_ice_migration_key, derive_stun_material, new_dtls_instance,
-    parse_stun_with_key, peek_stun_request_username, rand_duration_range_ms, resolve_srtp_suite,
-    validate_dtls_datagram, PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
+    build_stun_success_response_with_key, combine_session_key, demux_rfc7983,
+    derive_ice_migration_key, derive_stun_material, new_dtls_instance, parse_stun_with_key,
+    peek_stun_request_username, rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram,
+    PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
 use crate::relay::RelayEgress;
 use crate::udp_batch::UdpSendBatch;
@@ -37,9 +37,25 @@ const MAX_MIG_PENDING_MAP: usize = 4096;
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum PendingUplink {
     BackendOwned(Token),
-    RelayBypass { ingress_tok: Token, up_tok: Token },
-    RelayCloak { ingress_tok: Token, up_tok: Token },
+    RelayBypass {
+        ingress_tok: Token,
+        up_tok: Token,
+    },
+    RelayCloak {
+        ingress_tok: Token,
+        up_tok: Token,
+    },
+    RelayReverse {
+        ingress_tok: Token,
+        peer_flow: SocketAddr,
+    },
     ReverseEntry(Token),
+    #[cfg(feature = "embedded-proxy")]
+    ProxyServer {
+        flow_addr: SocketAddr,
+    },
+    #[cfg(feature = "embedded-proxy")]
+    ProxyClient,
 }
 
 #[inline]
@@ -111,6 +127,38 @@ fn flush_server_uplink_batch(
                     }
                 }
             }
+            PendingUplink::RelayReverse {
+                ingress_tok,
+                peer_flow,
+            } => {
+                let (sent_pkts, sent_bytes) = match hook.as_mut() {
+                    Some(ServerHook::Relay(RelayEgress::Reverse(peer))) => {
+                        let (sp, sb) = tx_batch.flush_to(&peer.listen_sock);
+                        if sp > 0 {
+                            peer.record_downlink_sent(peer_flow, sp, sb, now);
+                        }
+                        (sp, sb)
+                    }
+                    Some(ServerHook::RelayReversePeer(peer)) => {
+                        let (sp, sb) = tx_batch.flush_to(&peer.listen_sock);
+                        if sp > 0 {
+                            peer.record_downlink_sent(peer_flow, sp, sb, now);
+                        }
+                        (sp, sb)
+                    }
+                    _ => {
+                        tx_batch.clear();
+                        (0, 0)
+                    }
+                };
+                if sent_pkts > 0 {
+                    if let Some(sess) = sessions_by_token.get_mut(&ingress_tok) {
+                        sess.rx_pkts += sent_pkts as u64;
+                        sess.rx_bytes += sent_bytes;
+                        record_server_media_bytes(sess, now, sent_bytes);
+                    }
+                }
+            }
             PendingUplink::ReverseEntry(tok) => {
                 let (sent_pkts, sent_bytes) =
                     if let Some(ServerHook::ReverseEntry(hub)) = hook.as_mut() {
@@ -126,6 +174,10 @@ fn flush_server_uplink_batch(
                         record_server_media_bytes(sess, now, sent_bytes);
                     }
                 }
+            }
+            #[cfg(feature = "embedded-proxy")]
+            PendingUplink::ProxyServer { .. } | PendingUplink::ProxyClient => {
+                tx_batch.clear();
             }
         }
     }
@@ -191,7 +243,7 @@ impl ServerWorker {
                             }
                             match s.backend {
                                 BackendPipe::Owned(_) => Some(PendingUplink::BackendOwned(tok)),
-                                BackendPipe::RelayFlow(flow_addr) => match hook.as_ref() {
+                                BackendPipe::RelayFlow(flow_addr) => match hook.as_mut() {
                                     Some(ServerHook::Relay(RelayEgress::Bypass(b))) => b
                                         .ready_upstream_tok(flow_addr)
                                         .map(|up_tok| PendingUplink::RelayBypass {
@@ -204,6 +256,26 @@ impl ServerWorker {
                                             ingress_tok: tok,
                                             up_tok,
                                         }),
+                                    Some(ServerHook::Relay(RelayEgress::Reverse(peer))) => peer
+                                        .active_ready_relay_flow()
+                                        .map(|peer_flow| PendingUplink::RelayReverse {
+                                            ingress_tok: tok,
+                                            peer_flow,
+                                        }),
+                                    Some(ServerHook::RelayReversePeer(peer)) => peer
+                                        .active_ready_relay_flow()
+                                        .map(|peer_flow| PendingUplink::RelayReverse {
+                                            ingress_tok: tok,
+                                            peer_flow,
+                                        }),
+                                    #[cfg(feature = "embedded-proxy")]
+                                    Some(ServerHook::Proxy(_)) => {
+                                        Some(PendingUplink::ProxyServer { flow_addr })
+                                    }
+                                    #[cfg(feature = "embedded-proxy")]
+                                    Some(ServerHook::ProxyClient(_)) => {
+                                        Some(PendingUplink::ProxyClient)
+                                    }
                                     _ => None,
                                 },
                                 BackendPipe::ReverseAgent
@@ -432,6 +504,207 @@ impl ServerWorker {
                                         }
                                     }
                                 }
+                                PendingUplink::RelayReverse { peer_flow, .. } => {
+                                    let frame = {
+                                        let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                                        sess.cipher
+                                            .as_mut()
+                                            .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf))
+                                    };
+                                    match frame {
+                                        Some(SrtpFrame::Data(pn)) => {
+                                            if pn > 0 && pn <= MAX_INNER_UDP_LEN {
+                                                let enc = match hook.as_mut() {
+                                                    Some(ServerHook::Relay(
+                                                        RelayEgress::Reverse(peer),
+                                                    )) => {
+                                                        tx_batch.next_slot_mut().and_then(|slot| {
+                                                            peer.encrypt_downlink_into_slot(
+                                                                peer_flow,
+                                                                &self.wbuf[..pn],
+                                                                slot,
+                                                                now,
+                                                            )
+                                                        })
+                                                    }
+                                                    Some(ServerHook::RelayReversePeer(peer)) => {
+                                                        tx_batch.next_slot_mut().and_then(|slot| {
+                                                            peer.encrypt_downlink_into_slot(
+                                                                peer_flow,
+                                                                &self.wbuf[..pn],
+                                                                slot,
+                                                                now,
+                                                            )
+                                                        })
+                                                    }
+                                                    _ => None,
+                                                };
+                                                if let Some((wn, dst_addr)) = enc {
+                                                    tx_batch.commit_slot(
+                                                        wn,
+                                                        pn as u64,
+                                                        Some(dst_addr),
+                                                    );
+                                                }
+                                            }
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.last_data_active = now;
+                                                sess.last_peer_rx = now;
+                                            }
+                                        }
+                                        Some(ctrl_frame) => {
+                                            flush_server_uplink_batch(
+                                                &mut pending_uplink,
+                                                &mut tx_batch,
+                                                &mut self.sessions_by_token,
+                                                &mut hook,
+                                                now,
+                                            );
+                                            handle_ready_srtp_frame(
+                                                self.worker_id,
+                                                tok,
+                                                peer_addr,
+                                                ctrl_frame,
+                                                &mut self.sessions_by_token,
+                                                &mut self.token_by_peer,
+                                                &mut self.token_by_ufrag,
+                                                &mut self.local_mig_pending,
+                                                &self.poll,
+                                                &mut self.relay,
+                                                &mut hook,
+                                                &self.listen_sock,
+                                                &self.cfg,
+                                                &self.registry,
+                                                self.telemetry.as_ref(),
+                                                &mut self.wbuf,
+                                                now,
+                                                &mut self.audit,
+                                            );
+                                        }
+                                        None => {
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.auth_drops += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "embedded-proxy")]
+                                PendingUplink::ProxyServer { flow_addr } => {
+                                    let frame = {
+                                        let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                                        sess.cipher
+                                            .as_mut()
+                                            .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf))
+                                    };
+                                    match frame {
+                                        Some(SrtpFrame::Data(pn)) => {
+                                            if pn > 0 && pn <= MAX_INNER_UDP_LEN {
+                                                if let Some(ServerHook::Proxy(engine)) =
+                                                    hook.as_mut()
+                                                {
+                                                    engine.on_tunnel_datagram(
+                                                        flow_addr,
+                                                        &self.wbuf[..pn],
+                                                    );
+                                                }
+                                            }
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.last_data_active = now;
+                                                sess.last_peer_rx = now;
+                                                sess.rx_pkts += 1;
+                                                sess.rx_bytes += pn as u64;
+                                                record_server_media_bytes(sess, now, pn as u64);
+                                            }
+                                        }
+                                        Some(ctrl_frame) => {
+                                            handle_ready_srtp_frame(
+                                                self.worker_id,
+                                                tok,
+                                                peer_addr,
+                                                ctrl_frame,
+                                                &mut self.sessions_by_token,
+                                                &mut self.token_by_peer,
+                                                &mut self.token_by_ufrag,
+                                                &mut self.local_mig_pending,
+                                                &self.poll,
+                                                &mut self.relay,
+                                                &mut hook,
+                                                &self.listen_sock,
+                                                &self.cfg,
+                                                &self.registry,
+                                                self.telemetry.as_ref(),
+                                                &mut self.wbuf,
+                                                now,
+                                                &mut self.audit,
+                                            );
+                                        }
+                                        None => {
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.auth_drops += 1;
+                                            }
+                                        }
+                                    }
+                                }
+                                #[cfg(feature = "embedded-proxy")]
+                                PendingUplink::ProxyClient => {
+                                    let frame = {
+                                        let sess = self.sessions_by_token.get_mut(&tok).unwrap();
+                                        sess.cipher
+                                            .as_mut()
+                                            .and_then(|c| c.unwrap_into_ex(pkt, &mut self.wbuf))
+                                    };
+                                    match frame {
+                                        Some(SrtpFrame::Data(pn)) => {
+                                            if pn > 0 && pn <= MAX_INNER_UDP_LEN {
+                                                if let Some(ServerHook::ProxyClient(engine)) =
+                                                    hook.as_mut()
+                                                {
+                                                    engine.on_tunnel_datagram(&self.wbuf[..pn]);
+                                                }
+                                            }
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.last_data_active = now;
+                                                sess.last_peer_rx = now;
+                                                sess.rx_pkts += 1;
+                                                sess.rx_bytes += pn as u64;
+                                                record_server_media_bytes(sess, now, pn as u64);
+                                            }
+                                        }
+                                        Some(ctrl_frame) => {
+                                            handle_ready_srtp_frame(
+                                                self.worker_id,
+                                                tok,
+                                                peer_addr,
+                                                ctrl_frame,
+                                                &mut self.sessions_by_token,
+                                                &mut self.token_by_peer,
+                                                &mut self.token_by_ufrag,
+                                                &mut self.local_mig_pending,
+                                                &self.poll,
+                                                &mut self.relay,
+                                                &mut hook,
+                                                &self.listen_sock,
+                                                &self.cfg,
+                                                &self.registry,
+                                                self.telemetry.as_ref(),
+                                                &mut self.wbuf,
+                                                now,
+                                                &mut self.audit,
+                                            );
+                                        }
+                                        None => {
+                                            if let Some(sess) = self.sessions_by_token.get_mut(&tok)
+                                            {
+                                                sess.auth_drops += 1;
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             continue;
                         }
@@ -498,7 +771,8 @@ impl ServerWorker {
                 });
 
                 if let Some(meta) = mig_meta {
-                    if let Some(parsed) = parse_stun_with_key(pkt, &self.cfg.psk, &meta.mi_key_mig)
+                    if let Some(parsed) =
+                        parse_stun_with_key(pkt, &self.stun_auth_psk, &meta.mi_key_mig)
                     {
                         if parsed.msg_type == STUN_BINDING_REQUEST
                             && parsed.authenticated
@@ -641,7 +915,56 @@ impl ServerWorker {
                     return;
                 }
 
-                let parsed = match parse_stun_with_key(pkt, &self.cfg.psk, &self.stun_mi_key) {
+                // v0.7.1: Authenticate Ready-state RFC 7675 consent keepalives (`USE-CANDIDATE=false`)
+                // strictly with the session's ephemeral DTLS-PFS `mi_key_mig` (NOT static `stun_mi_key`).
+                // Eliminates both:
+                //   (a) SIGKILL/crash restart zombie loop (restarted server lacks `mi_key_mig` -> 0B drop)
+                //   (b) >90s post-close keepalive replay oracle (destroyed session key -> 0B drop forever).
+                let ready_ka_ctx = peek_stun_request_username(pkt).and_then(|u| {
+                    let &tok = self.token_by_peer.get(&peer_addr)?;
+                    let sess = self.sessions_by_token.get(&tok)?;
+                    if sess.peer_addr == peer_addr
+                        && sess.username == u
+                        && sess.state == ServerState::Ready
+                    {
+                        sess.mi_key_mig.map(|mk| (tok, mk))
+                    } else {
+                        None
+                    }
+                });
+                if let Some((tok, mk)) = ready_ka_ctx {
+                    if let Some(parsed) = parse_stun_with_key(pkt, &self.stun_auth_psk, &mk) {
+                        if parsed.msg_type == STUN_BINDING_REQUEST
+                            && parsed.authenticated
+                            && !parsed.use_candidate
+                        {
+                            let txid_status = {
+                                let mut cache = self.seen_txids.lock().unwrap();
+                                cache.check(parsed.txid, peer_addr, now, false)
+                            };
+                            if !matches!(txid_status, TxidCheck::Fresh) {
+                                self.unauth_drops += 1;
+                                return;
+                            }
+                            let resp =
+                                build_stun_success_response_with_key(&parsed.txid, peer_addr, &mk);
+                            {
+                                let mut cache = self.seen_txids.lock().unwrap();
+                                cache.record_single_use(parsed.txid, peer_addr, now);
+                            }
+                            self.audit.record(1, &resp);
+                            let _ = self.listen_sock.send_to(&resp, peer_addr);
+                            if let Some(sess) = self.sessions_by_token.get_mut(&tok) {
+                                sess.keepalives += 1;
+                                sess.last_peer_rx = now;
+                            }
+                            return;
+                        }
+                    }
+                }
+
+                let parsed = match parse_stun_with_key(pkt, &self.stun_auth_psk, &self.stun_mi_key)
+                {
                     Some(p) if p.msg_type == STUN_BINDING_REQUEST && p.authenticated => p,
                     _ => {
                         self.unauth_drops += 1;
@@ -650,20 +973,24 @@ impl ServerWorker {
                 };
 
                 let uname = parsed.username.unwrap_or_default();
-                let same_active = self
+                let (same_active, same_ready, allow_retransmit) = self
                     .token_by_peer
                     .get(&peer_addr)
                     .and_then(|tok| self.sessions_by_token.get(tok))
                     .map(|s| {
-                        s.peer_addr == peer_addr
+                        let active = s.peer_addr == peer_addr
                             && s.username == uname
-                            && !matches!(s.state, ServerState::Closing(_, _))
+                            && !matches!(s.state, ServerState::Closing(_, _));
+                        let ready = active && s.state == ServerState::Ready;
+                        let retx =
+                            active && !s.dtls_started && s.state == ServerState::DtlsHandshake;
+                        (active, ready, retx)
                     })
-                    .unwrap_or(false);
+                    .unwrap_or((false, false, false));
 
                 let txid_status = {
                     let mut cache = self.seen_txids.lock().unwrap();
-                    cache.check(parsed.txid, peer_addr, now, same_active)
+                    cache.check(parsed.txid, peer_addr, now, allow_retransmit)
                 };
 
                 match txid_status {
@@ -688,12 +1015,21 @@ impl ServerWorker {
                 }
 
                 if same_active {
+                    // Ready sessions MUST use per-session DTLS-PFS `mi_key_mig` for keepalives;
+                    // reject static-PSK keepalives on an already-Ready session.
+                    if same_ready {
+                        self.unauth_drops += 1;
+                        return;
+                    }
                     if let Some(&tok) = self.token_by_peer.get(&peer_addr) {
-                        let resp =
-                            build_stun_success_response(&parsed.txid, peer_addr, &self.cfg.psk);
+                        let resp = build_stun_success_response_with_key(
+                            &parsed.txid,
+                            peer_addr,
+                            &self.stun_mi_key,
+                        );
                         {
                             let mut cache = self.seen_txids.lock().unwrap();
-                            cache.record(parsed.txid, peer_addr, now, &resp);
+                            cache.record_single_use(parsed.txid, peer_addr, now);
                         }
                         self.audit.record(1, &resp);
                         let _ = self.listen_sock.send_to(&resp, peer_addr);
@@ -705,13 +1041,33 @@ impl ServerWorker {
                     }
                 }
 
-                // NEW-M-01: Reject orphan STUN keepalives (without USE-CANDIDATE)
+                // v0.7 RFC 8445 regular ICE connectivity check (`USE-CANDIDATE = false`):
+                // Reply 64B ONLY for ICE-CONTROLLING unlocked same-IP hunt probes without creating
+                // a ServerSession. Unnominated entries remain tombstoned for 20s (> STUN freshness);
+                // once nominated (`USE-CANDIDATE = true`), `ufrag` is locked for 90s.
                 if !parsed.use_candidate {
-                    self.unauth_drops += 1;
+                    if parsed.tie_breaker.is_none()
+                        || !self.registry.allow_hunt_probe(&uname, peer_addr, now)
+                    {
+                        self.unauth_drops += 1;
+                        return;
+                    }
+                    let resp = build_stun_success_response_with_key(
+                        &parsed.txid,
+                        peer_addr,
+                        &self.stun_mi_key,
+                    );
+                    {
+                        let mut cache = self.seen_txids.lock().unwrap();
+                        cache.record_single_use(parsed.txid, peer_addr, now);
+                    }
+                    self.audit.record(1, &resp);
+                    let _ = self.listen_sock.send_to(&resp, peer_addr);
                     return;
                 }
 
-                // P0-3: Reject duplicate ufrag hijacking an active/handshaking session on another peer!
+                // P0-3 + v0.7 nomination lock: reject duplicate ufrag hijacking or cross-IP replay,
+                // and immediately burn all unused sibling `--lane-hunt` probes for this `ufrag`.
                 let same_peer_rekey_same_ufrag = self
                     .token_by_peer
                     .get(&peer_addr)
@@ -720,7 +1076,8 @@ impl ServerWorker {
                     .unwrap_or(false);
                 if !same_peer_rekey_same_ufrag
                     && (self.token_by_ufrag.contains_key(&uname)
-                        || self.registry.lookup_ufrag(&uname).is_some())
+                        || self.registry.lookup_ufrag(&uname).is_some()
+                        || !self.registry.lock_hunt_ufrag(&uname, peer_addr, now))
                 {
                     self.unauth_drops += 1;
                     return;
@@ -824,7 +1181,7 @@ impl ServerWorker {
                 }
 
                 let (stun_key, s_c2s, s_s2c) =
-                    derive_stun_material(&self.cfg.psk, &parsed.txid, &uname);
+                    derive_stun_material(&self.stun_auth_psk, &parsed.txid, &uname);
                 let tok = alloc_token(&mut self.next_token_id);
                 let tie_breaker = parsed.tie_breaker.unwrap_or([0u8; 8]);
 
@@ -870,7 +1227,11 @@ impl ServerWorker {
                         )
                     };
 
-                let resp = build_stun_success_response(&parsed.txid, peer_addr, &self.cfg.psk);
+                let resp = build_stun_success_response_with_key(
+                    &parsed.txid,
+                    peer_addr,
+                    &self.stun_mi_key,
+                );
                 {
                     let mut cache = self.seen_txids.lock().unwrap();
                     cache.record(parsed.txid, peer_addr, now, &resp);
@@ -904,6 +1265,8 @@ impl ServerWorker {
                     mig_challenge_cnt: 0,
                     ssrc_c2s: s_c2s,
                     ssrc_s2c: s_s2c,
+                    initial_stun_txid: parsed.txid,
+                    dtls_started: false,
                     dtls: dtls_opt,
                     dtls_resets: 0,
                     dtls_next_timeout: None,
@@ -920,6 +1283,7 @@ impl ServerWorker {
                             SERVER_SRTCP_INIT_MIN_MS,
                             SERVER_SRTCP_INIT_MAX_MS,
                         ),
+                    pending_close_notify_at: None,
                     rate_15s: RollingByteWindow::new(
                         now,
                         Duration::from_secs(TRICKLE_WINDOW_15S_SECS),
@@ -965,6 +1329,42 @@ impl ServerWorker {
                             sess.auth_drops += 1;
                             return;
                         }
+                        if !sess.dtls_started {
+                            sess.dtls_started = true;
+                            self.seen_txids
+                                .lock()
+                                .unwrap()
+                                .invalidate(sess.initial_stun_txid);
+                        }
+                        // P2-1 + R2-P1-3 fix: Only a brand-new ClientWorker fail-fast reset has
+                        // `epoch == 0 && record_seq == 0 (pkt[5..11] == [0; 6]) && msg_seq == 0`.
+                        // Normal ClientHello RTO retransmissions carry `record_seq >= 1` and MUST
+                        // reach `sess.dtls` so `dimpl` resends Flight-4 under the existing keys!
+                        let is_fresh_epoch0_ch = sess.state == ServerState::DtlsHandshake
+                            && sess.dtls_suite_id.is_some()
+                            && pkt.len() >= 25
+                            && pkt[0] == 22
+                            && pkt[3] == 0
+                            && pkt[4] == 0
+                            && pkt[5..11] == [0; 6]
+                            && pkt[13] == 1
+                            && pkt[17] == 0
+                            && pkt[18] == 0;
+                        if is_fresh_epoch0_ch && sess.dtls_resets < MAX_DTLS_RESETS {
+                            sess.dtls_resets += 1;
+                            sess.dtls_suite_id = None;
+                            sess.dtls_km = None;
+                            let cert = self.cert_cache.get(now);
+                            let mut fresh = Box::new(new_dtls_instance(
+                                self.cfg.dtls_min_version,
+                                self.dtls_pool.pick(),
+                                cert,
+                                now,
+                            ));
+                            let _ = fresh.handle_timeout(now);
+                            sess.dtls = Some(fresh);
+                            sess.dtls_next_timeout = None;
+                        }
                         let mut dtls_err = false;
                         if let Some(ref mut dtls) = sess.dtls {
                             if sess.dtls_next_timeout.map(|t| now >= t).unwrap_or(false) {
@@ -982,23 +1382,10 @@ impl ServerWorker {
                             if sess.state == ServerState::Ready {
                                 sess.dtls = None;
                                 sess.dtls_next_timeout = None;
-                            } else if sess.state == ServerState::DtlsHandshake
-                                && sess.dtls_resets < MAX_DTLS_RESETS
-                                && sess.dtls_suite_id.is_none()
-                            {
-                                sess.dtls_resets += 1;
-                                sess.dtls_km = None;
-                                let cert = self.cert_cache.get(now);
-                                let mut fresh = Box::new(new_dtls_instance(
-                                    self.cfg.dtls_min_version,
-                                    self.dtls_pool.pick(),
-                                    cert,
-                                    now,
-                                ));
-                                let _ = fresh.handle_timeout(now);
-                                sess.dtls = Some(fresh);
-                                sess.dtls_next_timeout = None;
                             }
+                            // R3-P2-1: Per RFC 9147 §4.5.2, never wipe an in-progress server
+                            // `DtlsHandshake` on a bad/spoofed packet; only a verified fresh
+                            // `epoch=0, record_seq=0` ClientHello triggers `is_fresh_epoch0_ch`.
                             return;
                         }
                         if sess.state == ServerState::DtlsHandshake {

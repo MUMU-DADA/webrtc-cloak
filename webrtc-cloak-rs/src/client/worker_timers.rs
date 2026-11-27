@@ -1,6 +1,9 @@
 //! 客户端超时驱动、黑洞 1-RTT 迁移、MBB 备选拉起与会话清理。
 
-use super::dtls::{drain_client_dtls, graceful_teardown_client, spawn_client_session};
+use super::dtls::{
+    drain_client_dtls, schedule_async_teardown_client, send_client_dtls_close_notify,
+    spawn_client_session,
+};
 use super::lane_hunt::{HuntPurpose, MbbHuntReason};
 use super::worker::ClientWorker;
 use super::{
@@ -13,13 +16,11 @@ use super::{
 use crate::constants::{
     unspecified_addr_for, BLACKHOLE_DRAIN_SECS, CLOSING_DRAIN_MS, DTLS_IDLE_TIMEOUT_THRESHOLD_SECS,
     POST_BYE_CLOSING_DRAIN_MS, SOCK_BUF_8MIB, SRTCP_ACTIVE_MEDIA_WINDOW_SECS, SRTCP_IDLE_MAX_MS,
-    SRTCP_IDLE_MIN_MS, SRTCP_TRICKLE_MAX_MS, SRTCP_TRICKLE_MIN_MS, SRTP_HANDOVER_MAGIC,
-    SRTP_PATH_CHALLENGE_MAGIC, WORKER_ACTIVE_POLL_SECS, WORKER_IDLE_POLL_SECS,
-    WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
+    SRTCP_IDLE_MIN_MS, SRTCP_LONG_TRICKLE_MAX_MS, SRTCP_LONG_TRICKLE_MIN_MS, SRTCP_TRICKLE_MAX_MS,
+    SRTCP_TRICKLE_MIN_MS, SRTP_HANDOVER_MAGIC, SRTP_PATH_CHALLENGE_MAGIC, WORKER_ACTIVE_POLL_SECS,
+    WORKER_IDLE_POLL_SECS, WORKER_MIN_FAST_WAIT_MS, WORKER_MIN_NORMAL_WAIT_MS,
 };
-use crate::protocol::{
-    build_ice_stun_request, build_ice_stun_request_with_key, rand_duration_range_ms,
-};
+use crate::protocol::{build_ice_stun_request_with_key, rand_duration_range_ms};
 use mio::{Interest, Token};
 use std::collections::VecDeque;
 use std::net::SocketAddr;
@@ -57,6 +58,8 @@ const CLIENT_MBB_TRICKLE_RECHECK_MAX_MS: u64 = 180_000;
 const CLIENT_MBB_FAIL_BACKOFF_MIN_MS: u64 = 45_000;
 /// MBB 备选会话握手失败后的最大重试退避间隔（毫秒）。
 const CLIENT_MBB_FAIL_BACKOFF_MAX_MS: u64 = 90_000;
+/// 客户端进入长细流期（与服务端 `SERVER_LONG_TRICKLE_SECS` 对齐）后同步切换至极低频（25..45s）对称 RTCP RR。
+const CLIENT_LONG_TRICKLE_SECS: u64 = 60;
 /// MBB 定时轮换检查的最小 poll 步进下限（毫秒）。
 const WORKER_MIN_ROTATE_WAIT_MS: u64 = 20;
 
@@ -183,8 +186,6 @@ impl ClientWorker {
                 }
             }
         }
-
-        let keepwarm_dur = self.prewarm_keepwarm_interval();
 
         for (&tok, sess) in self.sessions_by_token.iter_mut() {
             match sess.state {
@@ -316,7 +317,13 @@ impl ClientWorker {
                                         sess.local_port
                                     ),
                                 );
-                                    graceful_teardown_client(sess, &mut self.dtls_buf);
+                                    if let Some(delay) = schedule_async_teardown_client(sess, now) {
+                                        if delay < wait {
+                                            wait = delay.max(Duration::from_millis(
+                                                WORKER_MIN_FAST_WAIT_MS,
+                                            ));
+                                        }
+                                    }
                                     sess.state = HandshakeState::Closing(
                                         now + Duration::from_millis(CLOSING_DRAIN_MS),
                                     );
@@ -338,7 +345,7 @@ impl ClientWorker {
                                 if let Some(mk) = sess.mi_key_mig {
                                     // Fresh txid on each retry prevents an on-path spoofed-IP racer from stalling us!
                                     let (pkt, txid) = build_ice_stun_request_with_key(
-                                        &self.cfg.psk,
+                                        &self.stun_auth_psk,
                                         &mk,
                                         &sess.ice,
                                         None,
@@ -463,15 +470,22 @@ impl ClientWorker {
                         }
                     }
 
-                    // Sequence/Nonce exhaustion or silent data-plane deadlock guard (e.g. --keepalive 0)
+                    // Sequence/Nonce exhaustion or silent data-plane deadlock guard (e.g. --keepalive 0
+                    // or post-crash/blackhole session where prior packets arrived before peer died).
                     let seq_exhausted = sess
                         .cipher
                         .as_ref()
                         .map(|c| c.is_seq_exhausted())
                         .unwrap_or(false);
-                    let dl_deadlock = sess.tx_pkts >= CLIENT_DL_DEADLOCK_MIN_TX_PKTS
-                        && sess.rx_pkts == 0
-                        && sess.srtcp_rx == 0
+                    let deadlock_secs =
+                        if self.cfg.keepalive_secs == 0 && is_client_in_trickle(sess, now) {
+                            55
+                        } else {
+                            CLIENT_DL_DEADLOCK_SECS
+                        };
+                    let dl_deadlock = sess.tx_pkts_since_dl_rx >= CLIENT_DL_DEADLOCK_MIN_TX_PKTS
+                        && now.duration_since(sess.last_auth_dl_rx)
+                            > Duration::from_secs(deadlock_secs)
                         && sess
                             .ready_at
                             .map(|r| {
@@ -491,7 +505,11 @@ impl ClientWorker {
                                 sess.local_port
                             ),
                         );
-                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                        if let Some(delay) = schedule_async_teardown_client(sess, now) {
+                            if delay < wait {
+                                wait = delay.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        }
                         sess.state =
                             HandshakeState::Closing(now + Duration::from_millis(CLOSING_DRAIN_MS));
                         to_rotate.push((tok, sess.client_addr, true));
@@ -550,33 +568,15 @@ impl ClientWorker {
                         }
                     }
 
-                    if sess.is_prewarm {
-                        if let Some(kw_at) = sess.next_keepwarm_at {
-                            if now >= kw_at {
-                                if let Some(ref mut cipher) = sess.cipher {
-                                    if let Some(wn) =
-                                        cipher.wrap_probe_into(b"WC_LANE_KEEPWARM", &mut self.wbuf)
-                                    {
-                                        if sess.upstream.send(&self.wbuf[..wn]).is_ok() {
-                                            sess.tx_pkts += 1;
-                                        }
-                                    }
-                                }
-                                sess.next_keepwarm_at = Some(now + keepwarm_dur);
-                            } else {
-                                let rem = kw_at.saturating_duration_since(now);
-                                if rem < wait {
-                                    wait =
-                                        rem.max(Duration::from_millis(WORKER_MIN_NORMAL_WAIT_MS));
-                                }
-                            }
-                        } else {
-                            sess.next_keepwarm_at = Some(now + keepwarm_dur);
-                        }
-                    } else if !self.reverse_agent
+                    if !sess.is_prewarm
+                        && !self.persistent_tunnel
                         && now.duration_since(sess.last_data_active) > self.idle_dur
                     {
-                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                        if let Some(delay) = schedule_async_teardown_client(sess, now) {
+                            if delay < wait {
+                                wait = delay.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        }
                         sess.state = HandshakeState::Closing(
                             now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                         );
@@ -609,9 +609,22 @@ impl ClientWorker {
                                 if now >= rto_at {
                                     if sess.ka_retries < sess.ka_max_retries {
                                         sess.ka_retries += 1;
-                                        // Retransmit the EXACT same STUN transaction (same txid) with
-                                        // jittered exponential RTO backoff matching RFC 5389 / libwebrtc.
-                                        let _ = sess.upstream.send(&sess.ka_pkt);
+                                        // v0.7.1: sign Ready-state STUN keepalives with per-session
+                                        // DTLS-PFS `mi_key_mig` (NOT static `stun_mi_key`) and mint
+                                        // a fresh txid on retry so a SIGKILL-restarted server drops
+                                        // stale keepalives silently instead of looping forever.
+                                        let ka_key =
+                                            sess.mi_key_mig.as_ref().unwrap_or(&self.stun_mi_key);
+                                        let (pkt, txid) = build_ice_stun_request_with_key(
+                                            &self.stun_auth_psk,
+                                            ka_key,
+                                            &sess.ice,
+                                            None,
+                                            false,
+                                        );
+                                        let _ = sess.upstream.send(&pkt);
+                                        sess.ka_txid = Some(txid);
+                                        sess.ka_pkt = pkt;
                                         sess.ka_sent_at = Some(now);
                                         let next_rto = if sess.ka_retries == 1 {
                                             rand_duration_range_ms(
@@ -640,7 +653,15 @@ impl ClientWorker {
                                                     sess.local_port
                                                 ),
                                             );
-                                            graceful_teardown_client(sess, &mut self.dtls_buf);
+                                            if let Some(delay) =
+                                                schedule_async_teardown_client(sess, now)
+                                            {
+                                                if delay < wait {
+                                                    wait = delay.max(Duration::from_millis(
+                                                        WORKER_MIN_FAST_WAIT_MS,
+                                                    ));
+                                                }
+                                            }
                                             sess.ka_txid = None;
                                             sess.ka_pkt.clear();
                                             sess.ka_retries = 0;
@@ -651,6 +672,7 @@ impl ClientWorker {
                                             continue;
                                         }
                                         let active_recently = self.reverse_agent
+                                            || self.persistent_tunnel
                                             || now.duration_since(sess.last_data_active)
                                                 <= Duration::from_secs(ACTIVE_ROTATE_WINDOW_SECS);
                                         if active_recently
@@ -694,7 +716,15 @@ impl ClientWorker {
                                             }
                                         ),
                                     );
-                                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                                        if let Some(delay) =
+                                            schedule_async_teardown_client(sess, now)
+                                        {
+                                            if delay < wait {
+                                                wait = delay.max(Duration::from_millis(
+                                                    WORKER_MIN_FAST_WAIT_MS,
+                                                ));
+                                            }
+                                        }
                                         sess.ka_txid = None;
                                         sess.ka_pkt.clear();
                                         sess.ka_retries = 0;
@@ -714,8 +744,14 @@ impl ClientWorker {
                                 }
                             }
                         } else if now >= sess.next_keepalive_at {
-                            let (pkt, txid) =
-                                build_ice_stun_request(&self.cfg.psk, &sess.ice, None, false);
+                            let ka_key = sess.mi_key_mig.as_ref().unwrap_or(&self.stun_mi_key);
+                            let (pkt, txid) = build_ice_stun_request_with_key(
+                                &self.stun_auth_psk,
+                                ka_key,
+                                &sess.ice,
+                                None,
+                                false,
+                            );
                             let _ = sess.upstream.send(&pkt);
                             sess.ka_txid = Some(txid);
                             sess.ka_pkt = pkt;
@@ -736,6 +772,9 @@ impl ClientWorker {
                     }
                     if now >= sess.next_srtcp_at {
                         let in_trickle = is_client_in_trickle(sess, now);
+                        let long_trickle = in_trickle
+                            && now.duration_since(sess.last_active_burst)
+                                >= Duration::from_secs(CLIENT_LONG_TRICKLE_SECS);
                         let is_active_media = !in_trickle
                             && now.duration_since(sess.last_data_active)
                                 <= Duration::from_secs(SRTCP_ACTIVE_MEDIA_WINDOW_SECS);
@@ -750,7 +789,12 @@ impl ClientWorker {
                             }
                         }
                         sess.next_srtcp_at = now
-                            + if is_active_media {
+                            + if long_trickle {
+                                rand_duration_range_ms(
+                                    SRTCP_LONG_TRICKLE_MIN_MS,
+                                    SRTCP_LONG_TRICKLE_MAX_MS,
+                                )
+                            } else if is_active_media {
                                 rand_duration_range_ms(
                                     CLIENT_SRTCP_ACTIVE_MIN_MS,
                                     CLIENT_SRTCP_ACTIVE_MAX_MS,
@@ -769,7 +813,11 @@ impl ClientWorker {
                 }
                 HandshakeState::DrainingBeforeBye(bye_at) => {
                     if now >= bye_at {
-                        graceful_teardown_client(sess, &mut self.dtls_buf);
+                        if let Some(delay) = schedule_async_teardown_client(sess, now) {
+                            if delay < wait {
+                                wait = delay.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        }
                         sess.state = HandshakeState::Closing(
                             now + Duration::from_millis(POST_BYE_CLOSING_DRAIN_MS),
                         );
@@ -781,7 +829,21 @@ impl ClientWorker {
                     }
                 }
                 HandshakeState::Closing(deadline) => {
+                    if let Some(cn_at) = sess.pending_close_notify_at {
+                        if now >= cn_at {
+                            sess.pending_close_notify_at = None;
+                            send_client_dtls_close_notify(sess, &mut self.dtls_buf);
+                        } else {
+                            let rem = cn_at.saturating_duration_since(now);
+                            if rem < wait {
+                                wait = rem.max(Duration::from_millis(WORKER_MIN_FAST_WAIT_MS));
+                            }
+                        }
+                    }
                     if now >= deadline {
+                        if sess.pending_close_notify_at.take().is_some() {
+                            send_client_dtls_close_notify(sess, &mut self.dtls_buf);
+                        }
                         to_close.push((tok, "graceful_close"));
                     } else {
                         let rem = deadline.saturating_duration_since(now);
@@ -892,8 +954,13 @@ impl ClientWorker {
                     KA_MAX_RETRIES
                 };
                 if let Some(mk) = sess.mi_key_mig {
-                    let (pkt, txid) =
-                        build_ice_stun_request_with_key(&self.cfg.psk, &mk, &sess.ice, None, true);
+                    let (pkt, txid) = build_ice_stun_request_with_key(
+                        &self.stun_auth_psk,
+                        &mk,
+                        &sess.ice,
+                        None,
+                        true,
+                    );
                     let _ = sess.upstream.send(&pkt);
                     sess.state = HandshakeState::Migrating;
                     sess.mig_txid = Some(txid);

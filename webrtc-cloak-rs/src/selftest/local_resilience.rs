@@ -36,7 +36,15 @@ pub(super) fn test_07_asymmetric_blackhole(
         opts.wan_mtu,
     );
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
-    let client = ManagedClient::start(proxy.port, psk, opts.cipher_pref, opts.wan_mtu, 1, 200);
+    let client = ManagedClient::start(
+        proxy.port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        1,
+        200,
+    );
 
     let app = connect_app(client.port, 200);
     if handshake_app(&app, Duration::from_secs(3)).is_none() {
@@ -123,6 +131,7 @@ pub(super) fn test_08_server_restart(
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
     let client = ManagedClient::start(
         proxy.port,
+        server_port,
         psk.clone(),
         opts.cipher_pref,
         opts.wan_mtu,
@@ -229,6 +238,7 @@ pub(super) fn test_09_active_probing_defense(
     let proxy = ImpairmentProxy::start(server_port, psk.clone(), NetProfile::default(), false);
     let client = ManagedClient::start(
         proxy.port,
+        server_port,
         psk.clone(),
         opts.cipher_pref,
         opts.wan_mtu,
@@ -268,16 +278,20 @@ pub(super) fn test_09_active_probing_defense(
     forged_dtls[12] = 51;
     forged_dtls[13] = DTLS_HS_CLIENT_HELLO; // ClientHello
 
+    let scoped_psk = crate::protocol::derive_stun_scope_key(&psk, server_addr.port());
+    let wrong_port_psk =
+        crate::protocol::derive_stun_scope_key(&psk, server_addr.port().wrapping_add(1));
+
     // 3. Valid-format STUN signed with WRONG PSK
     let (wrong_psk_stun, _) = build_ice_stun_request(b"wrong-attacker-psk", &ice, None, true);
 
     // 4. Real STUN with 1 bit flipped inside MESSAGE-INTEGRITY HMAC
-    let (mut tampered_mi_stun, _) = build_ice_stun_request(&psk, &ice, None, true);
+    let (mut tampered_mi_stun, _) = build_ice_stun_request(&scoped_psk, &ice, None, true);
     let mi_idx = tampered_mi_stun.len().saturating_sub(14);
     tampered_mi_stun[mi_idx] ^= 0x01;
 
     // 5. Real STUN with injected trailing attribute after FINGERPRINT (smuggling)
-    let (mut smuggled_stun, _) = build_ice_stun_request(&psk, &ice, None, true);
+    let (mut smuggled_stun, _) = build_ice_stun_request(&scoped_psk, &ice, None, true);
     smuggled_stun.extend_from_slice(&[0x80, 0x22, 0x00, 0x04, b'E', b'V', b'I', b'L']);
     let new_body_len = (smuggled_stun.len() - STUN_HDR_LEN) as u16;
     smuggled_stun[2..4].copy_from_slice(&new_body_len.to_be_bytes());
@@ -285,8 +299,8 @@ pub(super) fn test_09_active_probing_defense(
     // 6. Cross-port replay of real captured authenticated client STUN packet
     let replay_stun = captured_stun;
 
-    // 7. Orphan STUN keepalive (valid PSK + fresh txid, USE-CANDIDATE=false, unknown peer -> NEW-M-01)
-    let (orphan_ka_stun, _) = build_ice_stun_request(&psk, &ice, None, false);
+    // 7. Cross-endpoint STUN replay signed for a different server port with the same PSK (v0.7 scope lock)
+    let (orphan_ka_stun, _) = build_ice_stun_request(&wrong_port_psk, &ice, None, true);
 
     // 8. Forged/tampered SRTP packet (0x90 RTP header + random payload/tag)
     let mut forged_srtp = vec![0u8; 96];
@@ -369,7 +383,15 @@ pub(super) fn test_10_multistream_throughput(
         opts.wan_mtu,
     );
     // Direct client -> server (no impairment proxy) to measure true tunnel forwarding engine
-    let client = ManagedClient::start(server_port, psk, opts.cipher_pref, opts.wan_mtu, 5, 250);
+    let client = ManagedClient::start(
+        server_port,
+        server_port,
+        psk,
+        opts.cipher_pref,
+        opts.wan_mtu,
+        5,
+        250,
+    );
 
     // Phase A: 4 concurrent independent UDP sessions handshaking simultaneously
     let streams = 4usize;
