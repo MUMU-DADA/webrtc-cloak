@@ -2,7 +2,9 @@
 
 use super::local_resilience::{test_11_cpu_single_core_crypto, test_12_cpu_multicore_and_p256};
 use super::remote_probes::run_remote_steps_06_to_09;
-use super::remote_session::{remote_dtls_handshake, remote_stun_handshake, LiveReadySession};
+use super::remote_session::{
+    check_pre_dtls_stun_retransmit, remote_dtls_handshake, remote_stun_handshake, LiveReadySession,
+};
 use super::report::{pad_right, print_json_report, print_pretty_report, Palette};
 use super::{percentile, Highlights, ScenarioResult, ScenarioStatus, SelftestOptions};
 use crate::constants::PROBE_IO_BUF_LEN;
@@ -15,6 +17,15 @@ pub(super) fn run_remote_selftest(
     opts: &SelftestOptions,
     server_addr: SocketAddr,
     psk: &[u8],
+) -> bool {
+    run_remote_selftest_inner(opts, server_addr, psk, true)
+}
+
+fn run_remote_selftest_inner(
+    opts: &SelftestOptions,
+    server_addr: SocketAddr,
+    psk: &[u8],
+    include_cpu_bench: bool,
 ) -> bool {
     let cpu = detect_cpu_accel();
     let p = Palette::new(opts.color);
@@ -113,6 +124,16 @@ pub(super) fn run_remote_selftest(
         }
     };
 
+    let dyn_timeout_ms = ((stun_rtt_ms * 4.0) as u64).clamp(600, 2500);
+
+    // Pre-DTLS SeenTxidCache check (must run before ClientHello burns the initial STUN txid)
+    let pre_dtls_cache = stun_ok_opt.as_ref().map(|stun_ok| {
+        let t_pre = Instant::now();
+        thread::sleep(Duration::from_millis(40));
+        let res = check_pre_dtls_stun_retransmit(stun_ok, dyn_timeout_ms);
+        (res, stun_ok.raw_resp.clone(), t_pre.elapsed().as_secs_f64())
+    });
+
     // #02 WAN DTLS Mutual-Cert HS
     let t2 = Instant::now();
     let mut sess_opt: Option<LiveReadySession> = None;
@@ -191,8 +212,6 @@ pub(super) fn run_remote_selftest(
         results.push(r);
     }
 
-    let dyn_timeout_ms = ((stun_rtt_ms * 4.0) as u64).clamp(600, 2500);
-
     // #03 WAN Consent RTT / Jitter / Loss
     let t3 = Instant::now();
     if let Some(ref mut sess) = sess_opt {
@@ -259,59 +278,62 @@ pub(super) fn run_remote_selftest(
         results.push(r);
     }
 
-    // #04 WAN STUN Retransmit Cache (SeenTxidCache)
+    // #04 WAN STUN Retransmit Cache (pre-DTLS) & Ready Anti-Replay (v0.7 single-use mi_key_mig)
     let t4 = Instant::now();
     if let Some(ref mut sess) = sess_opt {
-        let res = if let Some((_rtt1, req_bytes, txid, resp1)) =
-            sess.send_stun_consent(psk, dyn_timeout_ms)
-        {
-            thread::sleep(Duration::from_millis(50));
-            if let Some((rtt2, resp2)) =
-                sess.send_raw_stun_expect(&req_bytes, txid, psk, dyn_timeout_ms)
-            {
+        let (pre_ok, pre_desc, pre_elapsed) = match pre_dtls_cache {
+            Some((Some((rtt2, resp2)), resp1, el)) => {
                 let exact = resp1 == resp2;
-                ScenarioResult {
-                    id: 4,
-                    code: "wan_txid_cache",
-                    name: "WAN STUN Retransmit Cache",
-                    condition: "Same-txid retry check",
-                    status: ScenarioStatus::from_bool(exact),
-                    metrics: format!(
-                        "cached {}B {} | rtt {:.1}ms",
+                (
+                    exact,
+                    format!(
+                        "pre-DTLS {}B {} ({:.1}ms)",
                         resp2.len(),
-                        if exact { "exact match" } else { "MISMATCH" },
+                        if exact { "match" } else { "MISMATCH" },
                         rtt2
                     ),
-                    detail: format!(
-                        "resp1={}B resp2={}B equal={}",
-                        resp1.len(),
-                        resp2.len(),
-                        exact
-                    ),
-                    elapsed_s: t4.elapsed().as_secs_f64(),
-                }
-            } else {
-                ScenarioResult {
-                    id: 4,
-                    code: "wan_txid_cache",
-                    name: "WAN STUN Retransmit Cache",
-                    condition: "Same-txid retry check",
-                    status: ScenarioStatus::Fail,
-                    metrics: "No reply on same-txid retry".into(),
-                    detail: "Server did not return cached STUN reply".into(),
-                    elapsed_s: t4.elapsed().as_secs_f64(),
-                }
+                    el,
+                )
+            }
+            Some((None, _, el)) => (false, "pre-DTLS cache MISS".into(), el),
+            None => (false, "no initial STUN".into(), 0.0),
+        };
+
+        let replay_wait_ms = ((stun_rtt_ms * 2.5) as u64).clamp(250, 700);
+        let res = if let Some((_rtt1, req_bytes, txid, _resp1)) =
+            sess.send_stun_consent(psk, dyn_timeout_ms)
+        {
+            thread::sleep(Duration::from_millis(40));
+            let ready_replay = sess.send_raw_stun_expect(&req_bytes, txid, psk, replay_wait_ms);
+            let ready_blocked = ready_replay.is_none();
+            let ok = pre_ok && ready_blocked;
+            ScenarioResult {
+                id: 4,
+                code: "wan_txid_cache",
+                name: "WAN STUN Cache & Anti-Replay",
+                condition: "Pre-DTLS cache + Ready 0B",
+                status: ScenarioStatus::from_bool(ok),
+                metrics: format!(
+                    "{} | Ready replay {}",
+                    pre_desc,
+                    if ready_blocked { "0B DROP" } else { "LEAKED" }
+                ),
+                detail: format!(
+                    "pre_dtls_ok={} ready_replay_dropped={}",
+                    pre_ok, ready_blocked
+                ),
+                elapsed_s: pre_elapsed + t4.elapsed().as_secs_f64(),
             }
         } else {
             ScenarioResult {
                 id: 4,
                 code: "wan_txid_cache",
-                name: "WAN STUN Retransmit Cache",
-                condition: "Same-txid retry check",
+                name: "WAN STUN Cache & Anti-Replay",
+                condition: "Pre-DTLS cache + Ready 0B",
                 status: ScenarioStatus::Fail,
-                metrics: "Initial consent probe timed out".into(),
-                detail: "First STUN keepalive failed".into(),
-                elapsed_s: t4.elapsed().as_secs_f64(),
+                metrics: "Initial mi_key_mig consent timed out".into(),
+                detail: "First Ready-state STUN keepalive failed".into(),
+                elapsed_s: pre_elapsed + t4.elapsed().as_secs_f64(),
             }
         };
         report_step(4, res.name, &res);
@@ -320,8 +342,8 @@ pub(super) fn run_remote_selftest(
         let r = ScenarioResult {
             id: 4,
             code: "wan_txid_cache",
-            name: "WAN STUN Retransmit Cache",
-            condition: "Same-txid retry check",
+            name: "WAN STUN Cache & Anti-Replay",
+            condition: "Pre-DTLS cache + Ready 0B",
             status: ScenarioStatus::Skip,
             metrics: "Skipped (session not ready)".into(),
             detail: "Requires established session".into(),
@@ -430,13 +452,15 @@ pub(super) fn run_remote_selftest(
     }
 
     // #11 & #12 Local Host CPU Crypto Compute Benchmarks
-    let r11 = test_11_cpu_single_core_crypto(opts, &mut hi);
-    report_step(11, r11.name, &r11);
-    results.push(r11);
+    if include_cpu_bench {
+        let r11 = test_11_cpu_single_core_crypto(opts, &mut hi);
+        report_step(11, r11.name, &r11);
+        results.push(r11);
 
-    let r12 = test_12_cpu_multicore_and_p256(opts, &mut hi);
-    report_step(12, r12.name, &r12);
-    results.push(r12);
+        let r12 = test_12_cpu_multicore_and_p256(opts, &mut hi);
+        report_step(12, r12.name, &r12);
+        results.push(r12);
+    }
 
     let total_s = suite_t0.elapsed().as_secs_f64();
     if opts.json {
@@ -446,4 +470,74 @@ pub(super) fn run_remote_selftest(
     }
 
     results.iter().all(|r| r.status != ScenarioStatus::Fail)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::constants::DEFAULT_WAN_MTU;
+    use crate::protocol::{CipherPref, DtlsMinVersion};
+    use crate::selftest::reserve_free_port;
+    use crate::server::{run_server, ServerConfig};
+    use crate::telemetry::TelemetryConfig;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[test]
+    fn remote_selftest_network_checks_pass_against_v07_server() {
+        let srv_port = reserve_free_port();
+        let backend_port = reserve_free_port();
+        let srv_addr: SocketAddr = format!("127.0.0.1:{}", srv_port).parse().unwrap();
+        let backend_addr: SocketAddr = format!("127.0.0.1:{}", backend_port).parse().unwrap();
+        let psk = b"remote-selftest-v071-regression-psk".to_vec();
+        let stop = Arc::new(AtomicBool::new(false));
+        let srv_stop = Arc::clone(&stop);
+        let srv_psk = psk.clone();
+
+        let srv_h = thread::spawn(move || {
+            let _ = run_server(ServerConfig {
+                listen_addr: srv_addr,
+                backend_addr,
+                psk: srv_psk,
+                stun_scope: None,
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: DEFAULT_WAN_MTU,
+                udp_batch: 0,
+                idle_timeout_secs: 60,
+                stats_interval_secs: 0,
+                wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
+                quiet: true,
+                stop: Some(srv_stop),
+            });
+        });
+
+        thread::sleep(Duration::from_millis(120));
+
+        let opts = SelftestOptions {
+            server_addr: Some(srv_addr),
+            server_label: Some(srv_addr.to_string()),
+            psk: Some(psk.clone()),
+            cipher_pref: CipherPref::Auto,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            wan_mtu: DEFAULT_WAN_MTU,
+            probe_count: 5,
+            active_probes: true,
+            color: false,
+            json: true,
+        };
+        let passed = run_remote_selftest_inner(&opts, srv_addr, &psk, false);
+
+        stop.store(true, Ordering::Relaxed);
+        let _ = srv_h.join();
+
+        assert!(
+            passed,
+            "live remote selftest (#01-#10) must pass against v0.7+ server"
+        );
+    }
 }
