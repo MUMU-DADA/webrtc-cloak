@@ -9,6 +9,7 @@ mod worker_io;
 pub(crate) use self::registry::{SeenTxidCache, SharedV4Registry, TxidCheck};
 use self::worker::run_server_worker;
 pub(crate) use self::worker::ServerWorker;
+pub(crate) use self::worker_io::RelayPassthroughPolicy;
 use crate::constants::{
     outer_udp_hdr_len, unspecified_addr_for, SharedPoll, SOCK_BUF_4MIB, TRICKLE_RATE_15S_BYTES,
 };
@@ -254,7 +255,7 @@ pub(super) fn record_server_media_bytes(sess: &mut ServerSession, now: Instant, 
     }
 }
 
-pub(super) fn make_udp_socket(
+pub(crate) fn make_udp_socket(
     bind_addr: SocketAddr,
     connect_to: Option<SocketAddr>,
     reuse_port: bool,

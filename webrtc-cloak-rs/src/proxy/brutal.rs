@@ -71,8 +71,9 @@ const PKT_INFO_SLOTS: usize = 5;
 const MIN_SAMPLE_COUNT: u64 = 20;
 /// 最低 ACK 比率下限（0.70 => 最多补偿 30% 丢包，约 1.43x 发包速率，防黑洞放大风暴）。
 const DEFAULT_MIN_ACK_RATE: f64 = 0.70;
-/// 拥塞窗口相对有效 BDP 的弹性系数（留出微抖动余量，配合 quinn 内置 1.25x Pacer 平滑突发射出）。
-const CWND_BDP_GAIN: f64 = 1.20;
+/// 拥塞窗口相对有效 BDP 的弹性系数（quinn-proto 内置 Pacer 已固定按 1.25× cwnd/rtt 放行，
+/// 取 1.00 可精确得到 1.25× 目标速率的线速上限，覆盖 SRTP/QUIC 封装与抖动裕量且避免 1.50× 过冲打爆出口 fq 队列）。
+const CWND_BDP_GAIN: f64 = 1.00;
 /// 单连接最大拥塞窗口硬上限（32 MiB）。
 const MAX_CWND_BYTES: u64 = 32 * 1024 * 1024;
 /// 冷启动首包未测出 RTT 前的默认估计 RTT（毫秒）。

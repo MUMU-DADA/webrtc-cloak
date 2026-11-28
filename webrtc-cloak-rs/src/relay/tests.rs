@@ -1,4 +1,4 @@
-use super::{run_relay, RelayConfig, RelayUpstreamConfig};
+use super::{run_relay, PassthroughConfig, RelayConfig, RelayUpstreamConfig};
 use crate::bypass::{run_bypass_responder, BypassConfig, BypassResponderConfig};
 use crate::client::{run_client, ClientConfig, LaneHuntConfig};
 use crate::constants::{DEFAULT_WAN_MTU, STUN_HDR_LEN};
@@ -223,6 +223,9 @@ fn relay_bypass_end_to_end_lane_hunt_mbb_blackhole_and_telemetry() {
             quiet: true,
             stop: Some(Arc::clone(&stop)),
         }),
+        hot_config_path: None,
+        reload_trigger: None,
+        passthrough_fallback: false,
     };
     let relay_handle = thread::spawn(move || run_relay(relay_cfg).unwrap());
 
@@ -497,6 +500,9 @@ fn relay_cloak_end_to_end_double_dtls_dual_stack_and_mbb() {
             quiet: true,
             stop: Some(Arc::clone(&stop)),
         }),
+        hot_config_path: None,
+        reload_trigger: None,
+        passthrough_fallback: false,
     };
     let relay_handle = thread::spawn(move || run_relay(relay_cfg).unwrap());
 
@@ -722,6 +728,9 @@ fn relay_single_packet_mode_and_unauth_silent_drop() {
             quiet: true,
             stop: Some(Arc::clone(&stop)),
         }),
+        hot_config_path: None,
+        reload_trigger: None,
+        passthrough_fallback: false,
     };
     let rh = thread::spawn(move || run_relay(relay_cfg).unwrap());
 
@@ -826,4 +835,603 @@ fn relay_single_packet_mode_and_unauth_silent_drop() {
     ch.join().unwrap();
     rh.join().unwrap();
     eh.join().unwrap();
+}
+
+#[test]
+fn relay_passthrough_zero_crypto_e2e_and_mbb() {
+    let psk_e2e = b"test-e2e-direct-psk-passthrough".to_vec();
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // 1. Plain UDP echo backend behind Exit Server
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    echo.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let stop_e = Arc::clone(&stop);
+    let echo_handle = thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop_e.load(Ordering::Acquire) {
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        }
+    });
+
+    // 2. Exit Server (end-to-end DTLS 1.3 + Dual-SSRC SRTP with Client)
+    let exit_addr = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let exit_status = SocketAddr::from(([127, 0, 0, 1], free_tcp_port_v4()));
+    let exit_cfg = ServerConfig {
+        listen_addr: exit_addr,
+        backend_addr: echo_addr,
+        psk: psk_e2e.clone(),
+        stun_scope: Some("pass-scope".to_string()),
+        cipher_pref: CipherPref::Auto,
+        dtls_required: true,
+        dtls_min_version: DtlsMinVersion::V13Only,
+        workers: 1,
+        max_sessions: 32,
+        wan_mtu: DEFAULT_WAN_MTU,
+        udp_batch: 16,
+        idle_timeout_secs: 30,
+        stats_interval_secs: 0,
+        wire_audit_file: None,
+        telemetry: TelemetryConfig {
+            status_file: None,
+            status_http: Some(exit_status),
+            status_interval_secs: 1,
+        },
+        quiet: true,
+        stop: Some(Arc::clone(&stop)),
+    };
+    let exit_handle = thread::spawn(move || run_server(exit_cfg).unwrap());
+
+    // 3. Zero-Decrypt Pass-Through Relay (ZERO PSK on relay, optional IPv6 -> IPv4 dual-stack)
+    let relay_addr = UdpSocket::bind(SocketAddr::from((Ipv6Addr::LOCALHOST, 0)))
+        .map(|s| s.local_addr().unwrap())
+        .unwrap_or_else(|_| SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4())));
+    let relay_status = SocketAddr::from(([127, 0, 0, 1], free_tcp_port_v4()));
+    let relay_cfg = RelayConfig {
+        ingress: ServerConfig {
+            listen_addr: relay_addr,
+            backend_addr: exit_addr,
+            psk: Vec::new(), // ZERO PSK on relay!
+            stun_scope: None,
+            cipher_pref: CipherPref::Auto,
+            dtls_required: true,
+            dtls_min_version: DtlsMinVersion::V13Only,
+            workers: 1,
+            max_sessions: 32,
+            wan_mtu: DEFAULT_WAN_MTU,
+            udp_batch: 16,
+            idle_timeout_secs: 30,
+            stats_interval_secs: 0,
+            wire_audit_file: None,
+            telemetry: TelemetryConfig {
+                status_file: None,
+                status_http: Some(relay_status),
+                status_interval_secs: 1,
+            },
+            quiet: true,
+            stop: Some(Arc::clone(&stop)),
+        },
+        upstream: RelayUpstreamConfig::Passthrough(PassthroughConfig {
+            target_addr: exit_addr,
+            max_sessions: 32,
+            wan_mtu: DEFAULT_WAN_MTU,
+            udp_batch: 16,
+            idle_timeout_secs: 30,
+        }),
+        hot_config_path: None,
+        reload_trigger: None,
+        passthrough_fallback: false,
+    };
+    let relay_handle = thread::spawn(move || run_relay(relay_cfg).unwrap());
+
+    // 4. Client dialing relay_addr using exit's E2E PSK + fast 2s MBB rotation
+    let client_listen = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let client_status = SocketAddr::from(([127, 0, 0, 1], free_tcp_port_v4()));
+    let client_cfg = ClientConfig {
+        listen_addr: client_listen,
+        server_addr: relay_addr,
+        psk: psk_e2e,
+        stun_scope: Some("pass-scope".to_string()),
+        cipher_pref: CipherPref::Auto,
+        dtls_decoy: true,
+        dtls_min_version: DtlsMinVersion::V13Only,
+        rotate_interval_secs: 2,
+        rotate_max_bytes: 0,
+        rotate_cooldown_secs: 1,
+        workers: 1,
+        max_sessions: 32,
+        wan_mtu: DEFAULT_WAN_MTU,
+        udp_batch: 16,
+        retry_ms: 120,
+        max_retries: 8,
+        keepalive_secs: 2,
+        idle_timeout_secs: 30,
+        stats_interval_secs: 0,
+        lane_hunt: LaneHuntConfig::default(),
+        telemetry: TelemetryConfig {
+            status_file: None,
+            status_http: Some(client_status),
+            status_interval_secs: 1,
+        },
+        quiet: true,
+        stop: Some(Arc::clone(&stop)),
+    };
+    let client_handle = thread::spawn(move || run_client(client_cfg).unwrap());
+
+    let _ = wait_for_status(exit_status, |_| true, Duration::from_secs(5));
+    let _ = wait_for_status(relay_status, |_| true, Duration::from_secs(5));
+    let _ = wait_for_status(client_status, |_| true, Duration::from_secs(5));
+
+    let app = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app.set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let warm_pkt = b"relay-passthrough-warmup";
+    let mut rbuf = [0u8; 1500];
+    let warm_deadline = Instant::now() + Duration::from_secs(8);
+    let mut warm_ok = false;
+    while Instant::now() < warm_deadline {
+        let _ = app.send_to(warm_pkt, client_listen);
+        if let Ok((n, _)) = app.recv_from(&mut rbuf) {
+            if &rbuf[..n] == warm_pkt {
+                warm_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(warm_ok, "relay-passthrough warmup failed");
+
+    app.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    for seq in 0u32..20 {
+        let mut payload = vec![0x42u8; 1050];
+        payload[1..5].copy_from_slice(&seq.to_be_bytes());
+        app.send_to(&payload, client_listen).unwrap();
+        loop {
+            let (n, _) = app.recv_from(&mut rbuf).unwrap();
+            if &rbuf[..n] == warm_pkt {
+                continue;
+            }
+            assert_eq!(&rbuf[..n], &payload[..]);
+            break;
+        }
+    }
+
+    let rst = wait_for_status(
+        relay_status,
+        |v| v["sessions"]["active"].as_u64().unwrap_or(0) >= 1,
+        Duration::from_secs(4),
+    );
+    assert_eq!(rst["role"], "relay-passthrough");
+    assert_eq!(rst["dtls_version"], "passthrough");
+    assert_eq!(rst["cipher"], "e2e");
+
+    let est1 = wait_for_status(
+        exit_status,
+        |v| v["sessions"]["backend_sport"].as_u64().unwrap_or(0) != 0,
+        Duration::from_secs(4),
+    );
+    let exit_backend_sport = est1["sessions"]["backend_sport"].as_u64().unwrap() as u16;
+
+    // Wait for E2E MBB rotation through zero-decrypt passthrough relay
+    let mbb_deadline = Instant::now() + Duration::from_secs(8);
+    let mut mbb_done = false;
+    let mut seq = 100u32;
+    while Instant::now() < mbb_deadline {
+        let mut payload = vec![0x49u8; 800];
+        payload[1..5].copy_from_slice(&seq.to_be_bytes());
+        seq += 1;
+        app.send_to(&payload, client_listen).unwrap();
+        let (n, _) = app.recv_from(&mut rbuf).unwrap();
+        assert_eq!(&rbuf[..n], &payload[..]);
+        let cst = http_get_json(client_status);
+        if cst["events"]["mbb_rotations_total"].as_u64().unwrap_or(0) >= 1 {
+            mbb_done = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+    assert!(
+        mbb_done,
+        "E2E MBB rotation through relay-passthrough failed"
+    );
+    let est2 = http_get_json(exit_status);
+    assert_eq!(
+        est2["sessions"]["backend_sport"].as_u64().unwrap() as u16,
+        exit_backend_sport,
+        "Exit backend port must stay intact across E2E MBB through passthrough relay!"
+    );
+
+    stop.store(true, Ordering::SeqCst);
+    client_handle.join().unwrap();
+    relay_handle.join().unwrap();
+    exit_handle.join().unwrap();
+    echo_handle.join().unwrap();
+}
+
+#[test]
+fn relay_hot_switch_cloak_to_passthrough_zero_drop_and_back() {
+    let psk_leg1 = b"hot-switch-leg1-psk-a".to_vec();
+    let psk_exit = b"hot-switch-exit-psk-b".to_vec();
+    let stop_all = Arc::new(AtomicBool::new(false));
+    let stop_cli_a = Arc::new(AtomicBool::new(false));
+    let reload_trigger = Arc::new(AtomicBool::new(false));
+
+    let hot_file = std::env::temp_dir().join(format!(
+        "webrtc-cloak-relay-hot-{}-{}.conf",
+        std::process::id(),
+        free_udp_port_v4()
+    ));
+
+    // 1. Echo backend + Exit server (using psk_exit + shared stun_scope so both relay-cloak and E2E client match)
+    let echo = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let echo_addr = echo.local_addr().unwrap();
+    echo.set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let stop_e = Arc::clone(&stop_all);
+    let echo_h = thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !stop_e.load(Ordering::Acquire) {
+            if let Ok((n, peer)) = echo.recv_from(&mut buf) {
+                let _ = echo.send_to(&buf[..n], peer);
+            }
+        }
+    });
+
+    let exit_addr = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let exit_h = {
+        let stop = Arc::clone(&stop_all);
+        let psk = psk_exit.clone();
+        thread::spawn(move || {
+            run_server(ServerConfig {
+                listen_addr: exit_addr,
+                backend_addr: echo_addr,
+                psk,
+                stun_scope: Some("shared-hot-scope".to_string()),
+                cipher_pref: CipherPref::Auto,
+                dtls_required: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                workers: 1,
+                max_sessions: 32,
+                wan_mtu: DEFAULT_WAN_MTU,
+                udp_batch: 16,
+                idle_timeout_secs: 30,
+                stats_interval_secs: 0,
+                wire_audit_file: None,
+                telemetry: TelemetryConfig::default(),
+                quiet: true,
+                stop: Some(stop),
+            })
+            .unwrap();
+        })
+    };
+
+    // 2. Relay starting in `cloak` mode with --hot-config
+    let relay_addr = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let relay_status = SocketAddr::from(([127, 0, 0, 1], free_tcp_port_v4()));
+    let relay_h = {
+        let stop = Arc::clone(&stop_all);
+        let trig = Arc::clone(&reload_trigger);
+        let hf = hot_file.to_string_lossy().to_string();
+        let p1 = psk_leg1.clone();
+        let p2 = psk_exit.clone();
+        thread::spawn(move || {
+            run_relay(RelayConfig {
+                ingress: ServerConfig {
+                    listen_addr: relay_addr,
+                    backend_addr: exit_addr,
+                    psk: p1,
+                    stun_scope: Some("shared-hot-scope".to_string()),
+                    cipher_pref: CipherPref::Auto,
+                    dtls_required: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: DEFAULT_WAN_MTU,
+                    udp_batch: 16,
+                    idle_timeout_secs: 30,
+                    stats_interval_secs: 0,
+                    wire_audit_file: None,
+                    telemetry: TelemetryConfig {
+                        status_file: None,
+                        status_http: Some(relay_status),
+                        status_interval_secs: 1,
+                    },
+                    quiet: true,
+                    stop: Some(Arc::clone(&stop)),
+                },
+                upstream: RelayUpstreamConfig::Cloak(ClientConfig {
+                    listen_addr: relay_addr,
+                    server_addr: exit_addr,
+                    psk: p2,
+                    stun_scope: Some("shared-hot-scope".to_string()),
+                    cipher_pref: CipherPref::Auto,
+                    dtls_decoy: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    rotate_interval_secs: 0,
+                    rotate_max_bytes: 0,
+                    rotate_cooldown_secs: 60,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: DEFAULT_WAN_MTU,
+                    udp_batch: 16,
+                    retry_ms: 120,
+                    max_retries: 8,
+                    keepalive_secs: 2,
+                    idle_timeout_secs: 30,
+                    stats_interval_secs: 0,
+                    lane_hunt: LaneHuntConfig::default(),
+                    telemetry: TelemetryConfig::default(),
+                    quiet: true,
+                    stop: Some(stop),
+                }),
+                hot_config_path: Some(hf),
+                reload_trigger: Some(trig),
+                passthrough_fallback: false,
+            })
+            .unwrap();
+        })
+    };
+
+    let _ = wait_for_status(relay_status, |_| true, Duration::from_secs(5));
+
+    // 3. Client A (legacy cloak client using psk_leg1)
+    let cli_a_listen = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let cli_a_h = {
+        let stop = Arc::clone(&stop_cli_a);
+        let p1 = psk_leg1.clone();
+        thread::spawn(move || {
+            run_client(ClientConfig {
+                listen_addr: cli_a_listen,
+                server_addr: relay_addr,
+                psk: p1,
+                stun_scope: Some("shared-hot-scope".to_string()),
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 0,
+                rotate_cooldown_secs: 60,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: DEFAULT_WAN_MTU,
+                udp_batch: 0,
+                retry_ms: 120,
+                max_retries: 8,
+                keepalive_secs: 2,
+                idle_timeout_secs: 30,
+                stats_interval_secs: 0,
+                lane_hunt: LaneHuntConfig::default(),
+                telemetry: TelemetryConfig::default(),
+                quiet: true,
+                stop: Some(stop),
+            })
+            .unwrap();
+        })
+    };
+
+    let app_a = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app_a
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut buf = [0u8; 1500];
+    let mut a_ok = false;
+    let dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < dl {
+        let _ = app_a.send_to(b"CLI_A_INIT", cli_a_listen);
+        if let Ok((n, _)) = app_a.recv_from(&mut buf) {
+            if &buf[..n] == b"CLI_A_INIT" {
+                a_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(a_ok, "Client A failed initial cloak handshake");
+
+    // 4. Hot-switch Relay from `cloak` -> `passthrough` (AB dual-mode transition!)
+    std::fs::write(
+        &hot_file,
+        format!(
+            "upstream_mode=passthrough\nupstream_host={}\nupstream_port={}\n",
+            exit_addr.ip(),
+            exit_addr.port()
+        ),
+    )
+    .unwrap();
+    reload_trigger.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(120));
+
+    // 5. Start Client B (end-to-end psk_exit direct through SAME relay_addr via passthrough!)
+    let cli_b_listen = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let cli_b_h = {
+        let stop = Arc::clone(&stop_all);
+        let p2 = psk_exit.clone();
+        thread::spawn(move || {
+            run_client(ClientConfig {
+                listen_addr: cli_b_listen,
+                server_addr: relay_addr,
+                psk: p2,
+                stun_scope: Some("shared-hot-scope".to_string()),
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 0,
+                rotate_cooldown_secs: 60,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: DEFAULT_WAN_MTU,
+                udp_batch: 0,
+                retry_ms: 120,
+                max_retries: 8,
+                keepalive_secs: 2,
+                idle_timeout_secs: 30,
+                stats_interval_secs: 0,
+                lane_hunt: LaneHuntConfig::default(),
+                telemetry: TelemetryConfig::default(),
+                quiet: true,
+                stop: Some(stop),
+            })
+            .unwrap();
+        })
+    };
+
+    let app_b = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app_b
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut b_ok = false;
+    let dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < dl {
+        let _ = app_b.send_to(b"CLI_B_PASS_INIT", cli_b_listen);
+        if let Ok((n, _)) = app_b.recv_from(&mut buf) {
+            if &buf[..n] == b"CLI_B_PASS_INIT" {
+                b_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        b_ok,
+        "Client B (passthrough) failed to connect during AB transition!"
+    );
+
+    // 6. Prove BOTH Client A (draining cloak) AND Client B (live passthrough) echo simultaneously!
+    app_a
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    app_b
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .unwrap();
+    for i in 0u8..10 {
+        let msg_a = format!("CLI_A_DRAIN_{}", i);
+        app_a.send_to(msg_a.as_bytes(), cli_a_listen).unwrap();
+        let (na, _) = app_a.recv_from(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..na],
+            msg_a.as_bytes(),
+            "Client A dropped during AB drain!"
+        );
+
+        let msg_b = format!("CLI_B_PASS_{}", i);
+        app_b.send_to(msg_b.as_bytes(), cli_b_listen).unwrap();
+        let (nb, _) = app_b.recv_from(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..nb],
+            msg_b.as_bytes(),
+            "Client B dropped during AB transition!"
+        );
+    }
+
+    // 7. Gracefully stop Client A -> Relay drains cloak to 0 and promotes to PurePassthrough!
+    stop_cli_a.store(true, Ordering::SeqCst);
+    cli_a_h.join().unwrap();
+
+    // Wait briefly for Closing drain (250ms) + promotion, while Client B keeps streaming!
+    let prom_deadline = Instant::now() + Duration::from_secs(4);
+    let mut promoted = false;
+    while Instant::now() < prom_deadline {
+        let msg_b = b"CLI_B_AFTER_PROMOTE";
+        app_b.send_to(msg_b, cli_b_listen).unwrap();
+        let (nb, _) = app_b.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..nb], msg_b);
+        let st = http_get_json(relay_status);
+        if st["dtls_version"] == "passthrough" && st["cipher"] == "e2e" {
+            promoted = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+    assert!(
+        promoted,
+        "Relay did not auto-promote to pure zero-crypto passthrough after cloak sessions drained!"
+    );
+
+    // 8. Hot-switch BACK from PurePassthrough -> cloak! Client B MUST keep working while Client C connects!
+    std::fs::write(
+        &hot_file,
+        format!(
+            "upstream_mode=cloak\nupstream_host={}\nupstream_port={}\n",
+            exit_addr.ip(),
+            exit_addr.port()
+        ),
+    )
+    .unwrap();
+    reload_trigger.store(true, Ordering::SeqCst);
+    thread::sleep(Duration::from_millis(120));
+
+    // Existing passthrough Client B MUST remain 100% alive!
+    for i in 0u8..5 {
+        let msg_b = format!("CLI_B_BACK_DRAIN_{}", i);
+        app_b.send_to(msg_b.as_bytes(), cli_b_listen).unwrap();
+        let (nb, _) = app_b.recv_from(&mut buf).unwrap();
+        assert_eq!(
+            &buf[..nb],
+            msg_b.as_bytes(),
+            "Client B dropped when switching passthrough -> cloak!"
+        );
+    }
+
+    // Brand-new Client C (psk_leg1) connects via cloak immediately!
+    let cli_c_listen = SocketAddr::from(([127, 0, 0, 1], free_udp_port_v4()));
+    let cli_c_h = {
+        let stop = Arc::clone(&stop_all);
+        let p1 = psk_leg1;
+        thread::spawn(move || {
+            run_client(ClientConfig {
+                listen_addr: cli_c_listen,
+                server_addr: relay_addr,
+                psk: p1,
+                stun_scope: Some("shared-hot-scope".to_string()),
+                cipher_pref: CipherPref::Auto,
+                dtls_decoy: true,
+                dtls_min_version: DtlsMinVersion::V13Only,
+                rotate_interval_secs: 0,
+                rotate_max_bytes: 0,
+                rotate_cooldown_secs: 60,
+                workers: 1,
+                max_sessions: 16,
+                wan_mtu: DEFAULT_WAN_MTU,
+                udp_batch: 0,
+                retry_ms: 120,
+                max_retries: 8,
+                keepalive_secs: 2,
+                idle_timeout_secs: 30,
+                stats_interval_secs: 0,
+                lane_hunt: LaneHuntConfig::default(),
+                telemetry: TelemetryConfig::default(),
+                quiet: true,
+                stop: Some(stop),
+            })
+            .unwrap();
+        })
+    };
+    let app_c = UdpSocket::bind("127.0.0.1:0").unwrap();
+    app_c
+        .set_read_timeout(Some(Duration::from_millis(250)))
+        .unwrap();
+    let mut c_ok = false;
+    let dl = Instant::now() + Duration::from_secs(6);
+    while Instant::now() < dl {
+        let _ = app_c.send_to(b"CLI_C_CLOAK_BACK", cli_c_listen);
+        if let Ok((n, _)) = app_c.recv_from(&mut buf) {
+            if &buf[..n] == b"CLI_C_CLOAK_BACK" {
+                c_ok = true;
+                break;
+            }
+        }
+    }
+    assert!(
+        c_ok,
+        "Client C failed to connect after switching back to cloak!"
+    );
+
+    stop_all.store(true, Ordering::SeqCst);
+    cli_b_h.join().unwrap();
+    cli_c_h.join().unwrap();
+    relay_h.join().unwrap();
+    exit_h.join().unwrap();
+    echo_h.join().unwrap();
+    let _ = std::fs::remove_file(&hot_file);
 }

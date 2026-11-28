@@ -21,13 +21,26 @@ use crate::protocol::{
     peek_stun_request_username, rand_duration_range_ms, resolve_srtp_suite, validate_dtls_datagram,
     PacketKind, RollingByteWindow, SrtpCloakCipher, SrtpFrame,
 };
-use crate::relay::RelayEgress;
+use crate::relay::{PassthroughTable, RelayEgress};
 use crate::udp_batch::UdpSendBatch;
 use mio::Token;
 use std::collections::{HashMap, VecDeque};
 use std::io::ErrorKind;
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
+
+/// 中继热切换过渡期与双模共存时的透传分流策略。
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RelayPassthroughPolicy {
+    /// 纯 `cloak` / `bypass` 模式（严格静默丢弃一切未认证报文）。
+    Disabled,
+    /// `passthrough -> cloak/bypass` 切换排空期：仅既有透传五元组继续走透传，新连接一律进入 `ServerWorker`。
+    DrainExistingOnly,
+    /// `cloak/bypass -> passthrough` 切换排空期：既有 `ServerWorker` 会话继续排空，新连接一律零解密透传。
+    PreferPassthrough,
+    /// 双模并存：既有透传走透传，新连接先试本地 PSK，认证失败的 STUN（如端到端直连出口 PSK）自动落入透传。
+    FallbackOnUnauth,
+}
 
 /// 服务端在 DTLS Flight 5 完成前每会话最多缓存的 0-RTT 早到 SRTP 包数。
 const EARLY_SRTP_CAP: usize = 32;
@@ -184,13 +197,74 @@ fn flush_server_uplink_batch(
 }
 
 impl ServerWorker {
+    #[inline]
+    fn is_tracked_peer(&self, peer_addr: SocketAddr, pkt: &[u8]) -> bool {
+        if self.token_by_peer.contains_key(&peer_addr)
+            || self.local_mig_pending.contains_key(&peer_addr)
+            || self.cross_worker_pending.contains_key(&peer_addr)
+        {
+            return true;
+        }
+        if demux_rfc7983(pkt) == PacketKind::Stun {
+            if let Some(u) = peek_stun_request_username(pkt) {
+                if self.token_by_ufrag.contains_key(u) || self.registry.lookup_ufrag(u).is_some() {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    #[inline]
+    fn should_route_passthrough(
+        &self,
+        peer_addr: SocketAddr,
+        pkt: &[u8],
+        pt: Option<&PassthroughTable>,
+        policy: RelayPassthroughPolicy,
+    ) -> bool {
+        let Some(table) = pt else {
+            return false;
+        };
+        match policy {
+            RelayPassthroughPolicy::Disabled => false,
+            RelayPassthroughPolicy::DrainExistingOnly => table.has_peer(peer_addr),
+            RelayPassthroughPolicy::PreferPassthrough => !self.is_tracked_peer(peer_addr, pkt),
+            RelayPassthroughPolicy::FallbackOnUnauth => {
+                if table.has_peer(peer_addr) {
+                    return true;
+                }
+                if self.is_tracked_peer(peer_addr, pkt) {
+                    return false;
+                }
+                if demux_rfc7983(pkt) == PacketKind::Stun {
+                    let auth_ok = parse_stun_with_key(pkt, &self.stun_auth_psk, &self.stun_mi_key)
+                        .is_some_and(|p| p.msg_type == STUN_BINDING_REQUEST && p.authenticated);
+                    !auth_ok
+                } else {
+                    true
+                }
+            }
+        }
+    }
+
     pub(crate) fn handle_listen_readable_with(
         &mut self,
         now: Instant,
+        hook: Option<ServerHook<'_>>,
+    ) {
+        self.handle_listen_readable_relay(now, hook, None, RelayPassthroughPolicy::Disabled);
+    }
+
+    pub(crate) fn handle_listen_readable_relay(
+        &mut self,
+        now: Instant,
         mut hook: Option<ServerHook<'_>>,
+        mut pt: Option<&mut PassthroughTable>,
+        pt_policy: RelayPassthroughPolicy,
     ) {
         if self.rx_batch.is_some() {
-            self.handle_listen_readable_batched_with(now, hook);
+            self.handle_listen_readable_batched_with(now, hook, pt, pt_policy);
             return;
         }
         loop {
@@ -199,6 +273,22 @@ impl ServerWorker {
                 Err(e) if e.kind() == ErrorKind::WouldBlock => break,
                 Err(_) => break,
             };
+            if n == 0 {
+                continue;
+            }
+            if pt_policy != RelayPassthroughPolicy::Disabled
+                && self.should_route_passthrough(
+                    peer_addr,
+                    &self.rbuf[..n],
+                    pt.as_deref(),
+                    pt_policy,
+                )
+            {
+                if let Some(table) = pt.as_deref_mut() {
+                    table.forward_uplink(peer_addr, &self.rbuf[..n], now);
+                }
+                continue;
+            }
             self.dispatch_listen_packet_with(n, peer_addr, now, &mut hook);
         }
     }
@@ -207,6 +297,8 @@ impl ServerWorker {
         &mut self,
         now: Instant,
         mut hook: Option<ServerHook<'_>>,
+        mut pt: Option<&mut PassthroughTable>,
+        pt_policy: RelayPassthroughPolicy,
     ) {
         let Some(mut rx_batch) = self.rx_batch.take() else {
             return;
@@ -231,6 +323,14 @@ impl ServerWorker {
                     continue;
                 };
                 if pkt.is_empty() {
+                    continue;
+                }
+                if pt_policy != RelayPassthroughPolicy::Disabled
+                    && self.should_route_passthrough(peer_addr, pkt, pt.as_deref(), pt_policy)
+                {
+                    if let Some(table) = pt.as_deref_mut() {
+                        table.forward_uplink(peer_addr, pkt, now);
+                    }
                     continue;
                 }
 

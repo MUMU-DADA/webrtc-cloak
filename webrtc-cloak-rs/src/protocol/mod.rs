@@ -77,9 +77,25 @@ mod unix_signal {
     static PIPE_READ_FD: AtomicI32 = AtomicI32::new(-1);
     static PIPE_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
 
+    static SIGNAL_RELOAD: AtomicBool = AtomicBool::new(false);
+    static RELOAD_READ_FD: AtomicI32 = AtomicI32::new(-1);
+    static RELOAD_WRITE_FD: AtomicI32 = AtomicI32::new(-1);
+
     extern "C" fn handle_shutdown_signal(_sig: libc::c_int) {
         SIGNAL_STOP.store(true, Ordering::SeqCst);
         let fd = PIPE_WRITE_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            let b = 1u8;
+            // SAFETY: `libc::write` is async-signal-safe per POSIX.1-2008; non-blocking fd avoids blocking.
+            unsafe {
+                let _ = libc::write(fd, (&b as *const u8).cast::<libc::c_void>(), 1);
+            }
+        }
+    }
+
+    extern "C" fn handle_reload_signal(_sig: libc::c_int) {
+        SIGNAL_RELOAD.store(true, Ordering::SeqCst);
+        let fd = RELOAD_WRITE_FD.load(Ordering::Acquire);
         if fd >= 0 {
             let b = 1u8;
             // SAFETY: `libc::write` is async-signal-safe per POSIX.1-2008; non-blocking fd avoids blocking.
@@ -123,6 +139,26 @@ mod unix_signal {
         }
     }
 
+    pub(super) fn install_reload() {
+        if RELOAD_WRITE_FD.load(Ordering::Acquire) < 0 {
+            let mut fds = [-1 as libc::c_int; 2];
+            // SAFETY: valid 2-element array passed to POSIX `pipe`.
+            if unsafe { libc::pipe(fds.as_mut_ptr()) } == 0 {
+                set_nonblock_cloexec(fds[0]);
+                set_nonblock_cloexec(fds[1]);
+                RELOAD_READ_FD.store(fds[0], Ordering::Release);
+                RELOAD_WRITE_FD.store(fds[1], Ordering::Release);
+            }
+        }
+        unsafe {
+            let mut sa: libc::sigaction = std::mem::zeroed();
+            sa.sa_sigaction = handle_reload_signal as *const () as usize;
+            libc::sigemptyset(&mut sa.sa_mask);
+            sa.sa_flags = libc::SA_RESTART;
+            let _ = libc::sigaction(libc::SIGHUP, &sa, std::ptr::null_mut());
+        }
+    }
+
     #[inline]
     pub(super) fn read_fd() -> Option<libc::c_int> {
         let fd = PIPE_READ_FD.load(Ordering::Acquire);
@@ -131,6 +167,41 @@ mod unix_signal {
         } else {
             None
         }
+    }
+
+    #[inline]
+    pub(super) fn reload_read_fd() -> Option<libc::c_int> {
+        let fd = RELOAD_READ_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            Some(fd)
+        } else {
+            None
+        }
+    }
+
+    #[inline]
+    pub(super) fn drain_reload_pipe() {
+        let fd = RELOAD_READ_FD.load(Ordering::Acquire);
+        if fd >= 0 {
+            let mut buf = [0u8; 64];
+            loop {
+                // SAFETY: valid non-blocking pipe fd and buffer.
+                let n =
+                    unsafe { libc::read(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len()) };
+                if n <= 0 {
+                    break;
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub(super) fn take_reload() -> bool {
+        let had = SIGNAL_RELOAD.swap(false, Ordering::SeqCst);
+        if had {
+            drain_reload_pipe();
+        }
+        had
     }
 
     #[inline]
@@ -201,6 +272,59 @@ pub fn is_shutdown_requested(stop: Option<&Arc<AtomicBool>>, quiet: bool) -> boo
     #[cfg(not(unix))]
     let _ = quiet;
     false
+}
+
+/// Install OS `SIGHUP` handler for zero-downtime configuration hot-reload (`--hot-config`).
+/// On Unix, uses async-signal-safe `sigaction` + self-pipe (zero extra threads).
+pub fn install_reload_handler() {
+    #[cfg(unix)]
+    {
+        unix_signal::install_reload();
+    }
+}
+
+/// Register a worker's `mio::Poll` to wake immediately upon `SIGHUP`.
+pub fn register_reload_poll(poll: &mio::Poll, quiet: bool, enabled: bool) {
+    if quiet || !enabled {
+        return;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(rfd) = unix_signal::reload_read_fd() {
+            let mut src = mio::unix::SourceFd(&rfd);
+            let _ = poll.registry().register(
+                &mut src,
+                crate::constants::RELOAD_PIPE_TOKEN,
+                mio::Interest::READABLE,
+            );
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = poll;
+}
+
+/// Drain the Unix `SIGHUP` self-pipe after receiving `RELOAD_PIPE_TOKEN`.
+#[cfg(unix)]
+pub fn drain_reload_pipe() {
+    unix_signal::drain_reload_pipe();
+}
+
+/// Check and atomically consume a pending hot-reload request (from test `trigger` or OS `SIGHUP`).
+#[inline]
+pub fn take_reload_requested(trigger: Option<&Arc<AtomicBool>>, quiet: bool) -> bool {
+    let mut requested = false;
+    if let Some(flag) = trigger {
+        if flag.swap(false, Ordering::SeqCst) {
+            requested = true;
+        }
+    }
+    #[cfg(unix)]
+    if !quiet && unix_signal::take_reload() {
+        requested = true;
+    }
+    #[cfg(not(unix))]
+    let _ = quiet;
+    requested
 }
 
 /// Wake all registered production workers immediately (Windows `ctrlc` path).

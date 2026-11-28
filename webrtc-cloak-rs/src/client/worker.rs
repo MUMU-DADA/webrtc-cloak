@@ -7,7 +7,8 @@ use super::dtls::{
 use super::lane_hunt::{HuntPurpose, LaneHunt};
 use super::{
     cancel_standby_for_client, log, make_udp_socket, record_client_media_bytes, ClientConfig,
-    ClientDownlink, ClientSession, HandshakeState, OldPathDrain, PendingReconnect, KA_MAX_RETRIES,
+    ClientDownlink, ClientSession, HandshakeState, OldPathDrain, PendingReconnect,
+    CLIENT_TOK_SLOT_STRIDE, KA_MAX_RETRIES,
 };
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
@@ -56,6 +57,8 @@ pub(crate) struct ClientWorker {
     pub(super) hunt_fail_streak: u8,
     pub(super) best_observed_rtt_ms: Option<f64>,
     pub(super) consecutive_trial_failures: u8,
+    #[cfg(feature = "embedded-proxy")]
+    pub(super) token_slot: usize,
     pub(super) next_token_id: usize,
     pub(super) cert_cache: CertCache,
     pub(super) dtls_pool: DtlsConfigPool,
@@ -158,6 +161,8 @@ pub(super) fn run_client_worker(
         hunt_fail_streak: 0,
         best_observed_rtt_ms: None,
         consecutive_trial_failures: 0,
+        #[cfg(feature = "embedded-proxy")]
+        token_slot: 0,
         next_token_id: 1,
         cert_cache: CertCache::new(),
         dtls_pool,
@@ -265,7 +270,7 @@ impl ClientWorker {
         poll: SharedPoll,
         telemetry: Option<Arc<TelemetryHub>>,
     ) -> Self {
-        Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, true)
+        Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, true, 0)
     }
 
     fn new_embedded(
@@ -275,6 +280,7 @@ impl ClientWorker {
         poll: SharedPoll,
         telemetry: Option<Arc<TelemetryHub>>,
         prewarm_on_start: bool,
+        token_slot: usize,
     ) -> Self {
         super::CLIENT_QUIET.with(|q| q.set(cfg.quiet));
         let stun_auth_psk = derive_stun_scope_key_for(
@@ -306,6 +312,11 @@ impl ClientWorker {
         let batch_enabled = is_udp_batch_active(cfg.udp_batch);
         let rx_batch = batch_enabled.then(|| UdpRecvBatch::new(cfg.udp_batch, rbuf_len));
         let tx_batch = batch_enabled.then(|| UdpSendBatch::new(cfg.udp_batch, wbuf_len));
+        let slot_start = if token_slot == 0 {
+            1
+        } else {
+            token_slot * CLIENT_TOK_SLOT_STRIDE
+        };
         let mut worker = ClientWorker {
             worker_id,
             cfg,
@@ -327,7 +338,9 @@ impl ClientWorker {
             hunt_fail_streak: 0,
             best_observed_rtt_ms: None,
             consecutive_trial_failures: 0,
-            next_token_id: 1,
+            #[cfg(feature = "embedded-proxy")]
+            token_slot,
+            next_token_id: slot_start,
             cert_cache: CertCache::new(),
             dtls_pool,
             stun_auth_psk,
@@ -466,7 +479,7 @@ impl ClientWorker {
         telemetry: Option<Arc<TelemetryHub>>,
         tunnel_key: SocketAddr,
     ) -> Self {
-        let mut w = Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, false);
+        let mut w = Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, false, 0);
         w.reverse_agent = true;
         w.persistent_tunnel = true;
         w.ensure_reverse_tunnel(tunnel_key, Instant::now());
@@ -554,10 +567,48 @@ impl ClientWorker {
         telemetry: Option<Arc<TelemetryHub>>,
         tunnel_key: SocketAddr,
     ) -> Self {
-        let mut w = Self::new_embedded(worker_id, cfg, dtls_pool, poll, telemetry, false);
+        Self::new_for_proxy_client_slot(worker_id, cfg, dtls_pool, poll, telemetry, tunnel_key, 0)
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    pub(crate) fn new_for_proxy_client_slot(
+        worker_id: usize,
+        cfg: ClientConfig,
+        dtls_pool: DtlsConfigPool,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+        tunnel_key: SocketAddr,
+        token_slot: usize,
+    ) -> Self {
+        let mut w = Self::new_embedded(
+            worker_id, cfg, dtls_pool, poll, telemetry, false, token_slot,
+        );
         w.persistent_tunnel = true;
         w.ensure_persistent_tunnel(tunnel_key, Instant::now());
         w
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    #[inline]
+    pub(crate) fn token_slot(&self) -> usize {
+        self.token_slot
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    #[inline]
+    pub(crate) fn owns_token(&self, tok: Token) -> bool {
+        let start = if self.token_slot == 0 {
+            1
+        } else {
+            self.token_slot * CLIENT_TOK_SLOT_STRIDE
+        };
+        let end = (self.token_slot + 1) * CLIENT_TOK_SLOT_STRIDE;
+        tok.0 >= start && tok.0 < end
+    }
+
+    #[cfg(feature = "embedded-proxy")]
+    pub(crate) fn config(&self) -> &ClientConfig {
+        &self.cfg
     }
 
     #[cfg(feature = "embedded-proxy")]

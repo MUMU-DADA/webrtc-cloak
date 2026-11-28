@@ -140,10 +140,39 @@ impl ServerWorker {
         poll: SharedPoll,
         telemetry: Option<Arc<TelemetryHub>>,
     ) -> std::io::Result<Self> {
-        super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
         let mut listen_sock = make_udp_socket(cfg.listen_addr, None, reuse_port, SOCK_BUF_8MIB)?;
         poll.registry()
             .register(&mut listen_sock, listen_token, Interest::READABLE)?;
+        Self::new_with_bound_socket(
+            worker_id,
+            cfg,
+            reuse_port,
+            relay_mode,
+            reverse_entry,
+            listen_sock,
+            dtls_pool,
+            seen_txids,
+            registry,
+            poll,
+            telemetry,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn new_with_bound_socket(
+        worker_id: usize,
+        cfg: ServerConfig,
+        reuse_port: bool,
+        relay_mode: bool,
+        reverse_entry: bool,
+        listen_sock: MioUdpSocket,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        super::SERVER_QUIET.with(|q| q.set(cfg.quiet));
 
         let actual_port = listen_sock
             .local_addr()
@@ -260,6 +289,44 @@ impl ServerWorker {
             poll,
             telemetry,
         )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_for_relay_with_socket(
+        worker_id: usize,
+        cfg: ServerConfig,
+        reuse_port: bool,
+        listen_sock: MioUdpSocket,
+        dtls_pool: DtlsConfigPool,
+        seen_txids: Arc<Mutex<SeenTxidCache>>,
+        registry: Arc<SharedV4Registry>,
+        poll: SharedPoll,
+        telemetry: Option<Arc<TelemetryHub>>,
+    ) -> std::io::Result<Self> {
+        Self::new_with_bound_socket(
+            worker_id,
+            cfg,
+            reuse_port,
+            true,
+            false,
+            listen_sock,
+            dtls_pool,
+            seen_txids,
+            registry,
+            poll,
+            telemetry,
+        )
+    }
+
+    /// 排空结束后收回仍绑定且已注册于 `mio::Poll` 的主监听套接字（用于无缝切入纯透传模式）。
+    pub(crate) fn into_listen_sock(mut self) -> MioUdpSocket {
+        self.graceful_shutdown_all();
+        self.listen_sock
+    }
+
+    #[inline]
+    pub(crate) fn has_live_sessions(&self) -> bool {
+        !self.sessions_by_token.is_empty()
     }
 
     #[allow(clippy::too_many_arguments)]

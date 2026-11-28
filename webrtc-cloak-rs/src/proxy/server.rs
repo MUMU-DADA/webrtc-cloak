@@ -16,7 +16,7 @@ use super::quic_crypto::{
     build_endpoint_config, build_quic_server_config, build_transport_config,
     compute_inner_quic_mtu, DEFAULT_QUIC_IDLE_TIMEOUT_SECS,
 };
-use super::{log, make_udp_socket, proxy_tunnel_key, PROXY_QUIET};
+use super::{log, make_udp_socket, proxy_tunnel_key, FineTimer, PROXY_QUIET, PROXY_TIMER_TOKEN};
 use crate::client::{ClientConfig, ClientWorker};
 #[cfg(unix)]
 use crate::constants::SHUTDOWN_PIPE_TOKEN;
@@ -51,10 +51,12 @@ use std::time::{Duration, Instant};
 const PROXY_SERVER_TOK_BASE: usize = 1usize << (usize::BITS - 2);
 /// 异步 DNS 线程池唤醒主循环的保留令牌。
 const PROXY_DNS_WAKE_TOKEN: Token = Token(usize::MAX - 3);
-/// 单次事件循环每条流最多搬运字节数。
-const STREAM_IO_BUDGET: usize = 64 * 1024;
-/// 单次 QUIC 刷包上限（按连接）。
-const MAX_QUIC_TRANSMITS_PER_CONN: usize = 64;
+/// 单次事件循环每条流最多搬运字节数（RX QUIC->TCP 读预算；TX TCP->QUIC 仍按单视频帧整形边界分批喂入）。
+const STREAM_IO_BUDGET: usize = 256 * 1024;
+/// 单次 `drive()` 刷包总上限（对齐 quinn-proto 2ms Pacer 突发容量与 32 包 sendmmsg 批处理）。
+const MAX_QUIC_TRANSMITS_PER_CONN: usize = 128;
+/// 单次 `drive()` 内最多连续流水线化的整形视频帧轮次（严格逐帧排空短尾包后再喂下一帧，零帧间黏连）。
+const MAX_VIDEO_FRAME_ROUNDS_PER_PASS: usize = 16;
 /// 远端 TCP 出站连接建立超时（秒）。
 const TCP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// 出站 UDP 会话空闲回收时间（秒）。
@@ -403,7 +405,7 @@ impl ProxyServerEngine {
             more_tx_pending: false,
             tx_scratch: Vec::with_capacity(2048),
             tx_batch,
-            io_buf: vec![0u8; 32 * 1024],
+            io_buf: vec![0u8; 64 * 1024],
             udp_buf: vec![0u8; 65_536],
             total_streams_accepted: 0,
             total_acl_denied: 0,
@@ -1598,24 +1600,7 @@ impl ProxyServerEngine {
             self.remove_quic_conn(ch, &reason);
         }
 
-        // 3.5) 执行一轮延迟的边缘触发读写续传（!ready 流原序保前防饥饿，确保高吞吐下载不饿死并发交互流）
-        let n_tcp = self.deferred_tcp_reads.len();
-        let mut skipped_tcp = VecDeque::new();
-        for _ in 0..n_tcp {
-            if let Some(tok) = self.deferred_tcp_reads.pop_front() {
-                if let Some(ch) = self.tcp_outbounds.get(&tok).map(|o| o.conn_handle) {
-                    let ready = self.conns.get(&ch).is_none_or(|q| q.burst_drained);
-                    if ready {
-                        self.handle_outbound_tcp_readable(tok);
-                    } else {
-                        skipped_tcp.push_back(tok);
-                    }
-                }
-            }
-        }
-        while let Some(tok) = skipped_tcp.pop_back() {
-            self.deferred_tcp_reads.push_front(tok);
-        }
+        // 3.5) 执行一轮延迟的 QUIC->TCP 边缘触发续传
         let n_quic = self.deferred_quic_reads.len();
         for _ in 0..n_quic {
             if let Some((ch, sid)) = self.deferred_quic_reads.pop_front() {
@@ -1625,10 +1610,42 @@ impl ProxyServerEngine {
             }
         }
 
-        // 4) 批量刷出所有 QUIC 下行报文（有 sendmmsg 批处理时合并单次系统调用直发公网！）
-        self.flush_all_transmits(outer, now);
+        // 4) 帧级流水线：保持每帧（5..=10 满包 + 500..=979B 真实短尾包）严格独立排空、零帧间黏连，
+        // 同时在单次 drive() 与共享 sendmmsg tx_batch 内连续填充完当前 2ms Pacer 令牌桶，消除每 ~8 包折返 epoll 的瓶颈。
+        self.more_tx_pending = false;
+        let mut tx_batch = self.tx_batch.take();
+        let mut batch_flow: Option<SocketAddr> = None;
+        let mut total_emitted = 0usize;
+        for round in 0..MAX_VIDEO_FRAME_ROUNDS_PER_PASS {
+            let pumped = self.pump_ready_deferred_tcp_reads();
+            if round > 0 && !pumped {
+                break;
+            }
+            let budget = MAX_QUIC_TRANSMITS_PER_CONN.saturating_sub(total_emitted);
+            if budget == 0 {
+                self.more_tx_pending = true;
+                break;
+            }
+            let emitted =
+                self.flush_all_transmits_into(outer, now, &mut tx_batch, &mut batch_flow, budget);
+            total_emitted += emitted;
+            if self.more_tx_pending || (round > 0 && emitted == 0) {
+                break;
+            }
+            let has_more_ready = self.deferred_tcp_reads.iter().any(|tok| {
+                self.tcp_outbounds
+                    .get(tok)
+                    .and_then(|o| self.conns.get(&o.conn_handle))
+                    .is_none_or(|q| q.burst_drained)
+            });
+            if !has_more_ready {
+                break;
+            }
+        }
+        Self::finish_tx_batch(outer, now, &mut tx_batch, &mut batch_flow);
+        self.tx_batch = tx_batch;
 
-        // 5) 计算精确的下一次唤醒时间（支持 2ms Brutal Pacer 定时唤醒）
+        // 5) 计算精确的下一次唤醒时间（配合 Linux timerfd 实现 1.6ms Brutal Pacer 精准唤醒）
         let has_ready_tcp_read = self.deferred_tcp_reads.iter().any(|tok| {
             self.tcp_outbounds
                 .get(tok)
@@ -1651,24 +1668,98 @@ impl ProxyServerEngine {
         wait
     }
 
-    fn flush_all_transmits(&mut self, outer: &mut ServerOuter<'_>, now: Instant) {
-        self.more_tx_pending = false;
-        let full_pkt_thresh = (self.inner_mtu as usize).saturating_sub(64);
-        let handles: Vec<ConnectionHandle> = self.conns.keys().copied().collect();
+    /// 轮询 deferred_tcp_reads：为每条 `burst_drained == true` 的连接喂入恰好 1 个整形视频帧，
+    /// 未排空连接的流原序保前防饥饿。返回本轮是否至少喂入了 1 条流。
+    fn pump_ready_deferred_tcp_reads(&mut self) -> bool {
+        let n_tcp = self.deferred_tcp_reads.len();
+        if n_tcp == 0 {
+            return false;
+        }
+        let mut pumped = false;
+        let mut skipped_tcp = VecDeque::new();
+        for _ in 0..n_tcp {
+            if let Some(tok) = self.deferred_tcp_reads.pop_front() {
+                if let Some(ch) = self.tcp_outbounds.get(&tok).map(|o| o.conn_handle) {
+                    let ready = self.conns.get(&ch).is_none_or(|q| q.burst_drained);
+                    if ready {
+                        self.handle_outbound_tcp_readable(tok);
+                        pumped = true;
+                    } else {
+                        skipped_tcp.push_back(tok);
+                    }
+                }
+            }
+        }
+        while let Some(tok) = skipped_tcp.pop_back() {
+            self.deferred_tcp_reads.push_front(tok);
+        }
+        pumped
+    }
+
+    fn finish_tx_batch(
+        outer: &mut ServerOuter<'_>,
+        now: Instant,
+        tx_batch: &mut Option<UdpSendBatch>,
+        batch_flow: &mut Option<SocketAddr>,
+    ) {
+        let Some(ref mut batch) = tx_batch else {
+            return;
+        };
+        if batch.is_empty() {
+            return;
+        }
         match outer {
             ServerOuter::Forward(ingress) => {
-                if let Some(mut tx_batch) = self.tx_batch.take() {
+                let (sp, sb) = batch.flush_to(&ingress.listen_sock);
+                if sp > 0 {
+                    if let Some(fa) = *batch_flow {
+                        ingress.record_downlink_sent(fa, sp, sb, now);
+                    }
+                }
+                *batch_flow = None;
+            }
+            ServerOuter::Reverse { worker, tunnel_key } => {
+                if let Some(up_tok) = worker.ready_upstream_tok(*tunnel_key) {
+                    let _ = worker.flush_batched_uplink(up_tok, batch, now);
+                } else {
+                    batch.clear();
+                }
+            }
+        }
+    }
+
+    fn flush_all_transmits_into(
+        &mut self,
+        outer: &mut ServerOuter<'_>,
+        now: Instant,
+        tx_batch: &mut Option<UdpSendBatch>,
+        batch_flow: &mut Option<SocketAddr>,
+        max_pkts: usize,
+    ) -> usize {
+        let full_pkt_thresh = (self.inner_mtu as usize).saturating_sub(64);
+        let handles: Vec<ConnectionHandle> = self.conns.keys().copied().collect();
+        let mut total_emitted = 0usize;
+        match outer {
+            ServerOuter::Forward(ingress) => {
+                if let Some(ref mut batch) = tx_batch {
                     for ch in handles {
                         let Some(q) = self.conns.get_mut(&ch) else {
                             continue;
                         };
                         let flow_addr = q.flow_addr;
+                        if *batch_flow != Some(flow_addr) && !batch.is_empty() {
+                            let (sp, sb) = batch.flush_to(&ingress.listen_sock);
+                            if sp > 0 {
+                                if let Some(prev_fa) = *batch_flow {
+                                    ingress.record_downlink_sent(prev_fa, sp, sb, now);
+                                }
+                            }
+                        }
+                        *batch_flow = Some(flow_addr);
                         let mut count = 0usize;
                         let mut saw_tail = false;
-                        let mut sent_pkts_for_flow = 0usize;
-                        let mut sent_bytes_for_flow = 0u64;
 
-                        while count < MAX_QUIC_TRANSMITS_PER_CONN {
+                        while count < max_pkts {
                             self.tx_scratch.clear();
                             let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                                 break;
@@ -1684,21 +1775,23 @@ impl ProxyServerEngine {
                                 saw_tail = true;
                             }
                             let pkt = &self.tx_scratch[..t.size];
-                            if tx_batch.is_full() {
-                                let (sp, sb) = tx_batch.flush_to(&ingress.listen_sock);
-                                sent_pkts_for_flow += sp;
-                                sent_bytes_for_flow += sb;
+                            if batch.is_full() {
+                                let (sp, sb) = batch.flush_to(&ingress.listen_sock);
+                                if sp > 0 {
+                                    ingress.record_downlink_sent(flow_addr, sp, sb, now);
+                                }
                             }
-                            if let Some(slot) = tx_batch.next_slot_mut() {
+                            if let Some(slot) = batch.next_slot_mut() {
                                 if let Some((wn, peer_addr)) =
                                     ingress.encrypt_downlink_into_slot(flow_addr, pkt, slot, now)
                                 {
-                                    tx_batch.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
+                                    batch.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
                                 }
                             }
                             count += 1;
                         }
-                        if count >= MAX_QUIC_TRANSMITS_PER_CONN {
+                        total_emitted += count;
+                        if count >= max_pkts {
                             self.more_tx_pending = true;
                         } else if !q.burst_drained
                             && (saw_tail
@@ -1709,21 +1802,7 @@ impl ProxyServerEngine {
                             q.burst_drained = true;
                             q.burst_bytes_rem = 0;
                         }
-                        if !tx_batch.is_empty() {
-                            let (sp, sb) = tx_batch.flush_to(&ingress.listen_sock);
-                            sent_pkts_for_flow += sp;
-                            sent_bytes_for_flow += sb;
-                        }
-                        if sent_pkts_for_flow > 0 {
-                            ingress.record_downlink_sent(
-                                flow_addr,
-                                sent_pkts_for_flow,
-                                sent_bytes_for_flow,
-                                now,
-                            );
-                        }
                     }
-                    self.tx_batch = Some(tx_batch);
                 } else {
                     for ch in handles {
                         let Some(q) = self.conns.get_mut(&ch) else {
@@ -1732,7 +1811,7 @@ impl ProxyServerEngine {
                         let flow_addr = q.flow_addr;
                         let mut count = 0usize;
                         let mut saw_tail = false;
-                        while count < MAX_QUIC_TRANSMITS_PER_CONN {
+                        while count < max_pkts {
                             self.tx_scratch.clear();
                             let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                                 break;
@@ -1754,7 +1833,8 @@ impl ProxyServerEngine {
                             );
                             count += 1;
                         }
-                        if count >= MAX_QUIC_TRANSMITS_PER_CONN {
+                        total_emitted += count;
+                        if count >= max_pkts {
                             self.more_tx_pending = true;
                         } else if !q.burst_drained
                             && (saw_tail
@@ -1770,14 +1850,14 @@ impl ProxyServerEngine {
             }
             ServerOuter::Reverse { worker, tunnel_key } => {
                 let ready_tok = worker.ready_upstream_tok(*tunnel_key);
-                if let (Some(up_tok), Some(mut tx_batch)) = (ready_tok, self.tx_batch.take()) {
+                if let (Some(up_tok), Some(ref mut batch)) = (ready_tok, tx_batch) {
                     for ch in handles {
                         let Some(q) = self.conns.get_mut(&ch) else {
                             continue;
                         };
                         let mut count = 0usize;
                         let mut saw_tail = false;
-                        while count < MAX_QUIC_TRANSMITS_PER_CONN {
+                        while count < max_pkts {
                             self.tx_scratch.clear();
                             let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                                 break;
@@ -1793,19 +1873,20 @@ impl ProxyServerEngine {
                                 saw_tail = true;
                             }
                             let pkt = &self.tx_scratch[..t.size];
-                            if tx_batch.is_full() {
-                                let _ = worker.flush_batched_uplink(up_tok, &mut tx_batch, now);
+                            if batch.is_full() {
+                                let _ = worker.flush_batched_uplink(up_tok, batch, now);
                             }
-                            if let Some(slot) = tx_batch.next_slot_mut() {
+                            if let Some(slot) = batch.next_slot_mut() {
                                 if let Some(wn) =
                                     worker.wrap_uplink_into_slot(up_tok, pkt, slot, now)
                                 {
-                                    tx_batch.commit_slot(wn, pkt.len() as u64, None);
+                                    batch.commit_slot(wn, pkt.len() as u64, None);
                                 }
                             }
                             count += 1;
                         }
-                        if count >= MAX_QUIC_TRANSMITS_PER_CONN {
+                        total_emitted += count;
+                        if count >= max_pkts {
                             self.more_tx_pending = true;
                         } else if !q.burst_drained
                             && (saw_tail
@@ -1817,10 +1898,6 @@ impl ProxyServerEngine {
                             q.burst_bytes_rem = 0;
                         }
                     }
-                    if !tx_batch.is_empty() {
-                        let _ = worker.flush_batched_uplink(up_tok, &mut tx_batch, now);
-                    }
-                    self.tx_batch = Some(tx_batch);
                 } else {
                     for ch in handles {
                         let Some(q) = self.conns.get_mut(&ch) else {
@@ -1828,7 +1905,7 @@ impl ProxyServerEngine {
                         };
                         let mut count = 0usize;
                         let mut saw_tail = false;
-                        while count < MAX_QUIC_TRANSMITS_PER_CONN {
+                        while count < max_pkts {
                             self.tx_scratch.clear();
                             let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                                 break;
@@ -1846,7 +1923,8 @@ impl ProxyServerEngine {
                             worker.send_uplink_single(*tunnel_key, &self.tx_scratch[..t.size], now);
                             count += 1;
                         }
-                        if count >= MAX_QUIC_TRANSMITS_PER_CONN {
+                        total_emitted += count;
+                        if count >= max_pkts {
                             self.more_tx_pending = true;
                         } else if !q.burst_drained
                             && (saw_tail
@@ -1861,6 +1939,7 @@ impl ProxyServerEngine {
                 }
             }
         }
+        total_emitted
     }
 
     fn gc_timers(&mut self, now: Instant) {
@@ -1939,6 +2018,7 @@ pub fn run_proxy_server(mut cfg: ProxyServerConfig) -> std::io::Result<()> {
 
     let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, quiet, stop.is_some());
+    let mut fine_timer = FineTimer::new(poll.registry());
     let dns_waker = Arc::new(Waker::new(poll.registry(), PROXY_DNS_WAKE_TOKEN)?);
     let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
 
@@ -2017,7 +2097,7 @@ pub fn run_proxy_server(mut cfg: ProxyServerConfig) -> std::io::Result<()> {
             wait = quiet_cap;
         }
 
-        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = fine_timer.arm_and_poll(&mut poll, &mut events, wait) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
@@ -2041,6 +2121,10 @@ pub fn run_proxy_server(mut cfg: ProxyServerConfig) -> std::io::Result<()> {
             if tok == WAKE_TOKEN {
                 continue;
             }
+            if tok == PROXY_TIMER_TOKEN {
+                fine_timer.drain();
+                continue;
+            }
             if tok == PROXY_DNS_WAKE_TOKEN {
                 engine.drain_dns_results(now);
                 continue;
@@ -2055,7 +2139,6 @@ pub fn run_proxy_server(mut cfg: ProxyServerConfig) -> std::io::Result<()> {
         for flow_addr in ingress.drain_closed_relay_flows() {
             engine.on_outer_flow_closed(flow_addr);
         }
-        let _ = engine.drive(&mut ServerOuter::Forward(&mut ingress), Instant::now());
 
         let post_now = Instant::now();
         if let Some(ref th) = telemetry {
@@ -2127,6 +2210,7 @@ pub fn run_proxy_server_reverse(mut cfg: ReverseProxyServerConfig) -> std::io::R
 
     let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, quiet, stop.is_some());
+    let mut fine_timer = FineTimer::new(poll.registry());
     let dns_waker = Arc::new(Waker::new(poll.registry(), PROXY_DNS_WAKE_TOKEN)?);
     let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
 
@@ -2203,7 +2287,7 @@ pub fn run_proxy_server_reverse(mut cfg: ReverseProxyServerConfig) -> std::io::R
             wait = quiet_cap;
         }
 
-        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = fine_timer.arm_and_poll(&mut poll, &mut events, wait) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
@@ -2228,11 +2312,15 @@ pub fn run_proxy_server_reverse(mut cfg: ReverseProxyServerConfig) -> std::io::R
             if tok == WAKE_TOKEN {
                 continue;
             }
+            if tok == PROXY_TIMER_TOKEN {
+                fine_timer.drain();
+                continue;
+            }
             if tok == PROXY_DNS_WAKE_TOKEN {
                 engine.drain_dns_results(now);
                 continue;
             }
-            if tok.0 >= PROXY_SERVER_TOK_BASE && tok.0 < usize::MAX - 4 {
+            if tok.0 >= PROXY_SERVER_TOK_BASE && tok.0 < usize::MAX - 5 {
                 engine.handle_outbound_event(ev, now);
             } else {
                 client.handle_event_proxy_server(
@@ -2248,13 +2336,6 @@ pub fn run_proxy_server_reverse(mut cfg: ReverseProxyServerConfig) -> std::io::R
 
         client.process_post_events_relay(now, standby_ready, standby_promoted, graceful_reconnects);
         client.ensure_persistent_tunnel(tunnel_key, Instant::now());
-        let _ = engine.drive(
-            &mut ServerOuter::Reverse {
-                worker: &mut client,
-                tunnel_key,
-            },
-            Instant::now(),
-        );
 
         let post_now = Instant::now();
         if let Some(ref th) = telemetry {

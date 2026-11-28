@@ -4,7 +4,9 @@
 //! - 外层 `ClientWorker`（DTLS 1.3 + Dual-SSRC SRTP + Lane Hunt + 0ms MBB + 1-RTT 迁移）；
 //! - 内层 `quinn-proto` Sans-IO 状态机（No-op 加密 + Brutal 拥塞控制 + RFC 9221 Datagram）；
 //! - 本地 SOCKS5 代理（TCP CONNECT + UDP ASSOCIATE，零侵入对接 Mihomo/OpenClash）；
-//! - 可重复的本地 L4 TCP 端口转发（`--tcp-forward 127.0.0.1:19443=198.51.100.10:443`）。
+//! - 可重复的本地 L4 TCP 端口转发（`--tcp-forward 127.0.0.1:19443=198.51.100.10:443`）；
+//! - 原生 Make-Before-Break 不断网热切换（`--hot-config <PATH>` + `SIGHUP`）：
+//!   不关闭本地监听端口，并行预热新外层+内层 QUIC 隧道，就绪后原子切流，旧隧道活跃 TCP 流继续无感排空至自然结束，预热失败自动回滚零影响。
 
 use super::brutal::{BrutalConfig, BrutalRateHandle};
 use super::proto::{
@@ -15,17 +17,23 @@ use super::quic_crypto::{
     build_endpoint_config, build_quic_client_config, build_transport_config,
     compute_inner_quic_mtu, DEFAULT_QUIC_IDLE_TIMEOUT_SECS,
 };
-use super::{log, make_udp_socket, proxy_quic_peer_addr, proxy_tunnel_key, PROXY_QUIET};
+use super::{
+    log, make_udp_socket, proxy_quic_peer_addr, proxy_tunnel_key, FineTimer, PROXY_QUIET,
+    PROXY_TIMER_TOKEN,
+};
 use crate::client::{ClientConfig, ClientWorker, REV_BACKEND_TOK_BASE};
-#[cfg(unix)]
-use crate::constants::SHUTDOWN_PIPE_TOKEN;
 use crate::constants::{
     outer_udp_hdr_len, worker_udp_write_buf_len, SharedPoll, LISTEN_TOKEN, MIO_EVENTS_CAP,
     SOCK_BUF_4MIB, TELEMETRY_DEFAULT_INTERVAL_SECS, WAKE_TOKEN, WORKER_QUIET_STOP_POLL_MS,
 };
+#[cfg(unix)]
+use crate::constants::{RELOAD_PIPE_TOKEN, SHUTDOWN_PIPE_TOKEN};
+use crate::hot_reload::{load_proxy_client_hot_config, read_psk_file, resolve_host_port};
+#[cfg(unix)]
+use crate::protocol::drain_reload_pipe;
 use crate::protocol::{
     build_dimpl_config_pool_for, detect_cpu_accel, is_shutdown_requested, rand_u32,
-    register_shutdown_poll,
+    register_reload_poll, register_shutdown_poll, take_reload_requested, CpuAccelInfo,
 };
 use crate::server::{SeenTxidCache, ServerConfig, ServerHook, ServerWorker, SharedV4Registry};
 use crate::telemetry::TelemetryHub;
@@ -41,6 +49,7 @@ use quinn_proto::{
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
 use std::net::{IpAddr, Ipv4Addr, Shutdown, SocketAddr};
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -50,14 +59,22 @@ const SOCKS_ACCEPT_TOK: Token = Token(PROXY_CLIENT_TOK_BASE);
 const FWD_ACCEPT_BASE: usize = PROXY_CLIENT_TOK_BASE + 1;
 const DYN_TOK_BASE: usize = PROXY_CLIENT_TOK_BASE + 256;
 
-/// 单次事件循环每条流最多搬运字节数，防止单条高速流饿死其他并发流或 ACK。
-const STREAM_IO_BUDGET: usize = 64 * 1024;
-/// 单次 QUIC 刷包最大报文数上限。
-const MAX_QUIC_TRANSMITS_PER_PASS: usize = 64;
+/// 单次事件循环每条流最多搬运字节数（RX QUIC->TCP 读预算；TX TCP->QUIC 仍按单视频帧整形边界分批喂入）。
+const STREAM_IO_BUDGET: usize = 256 * 1024;
+/// 单次 `drive()` 刷包最大报文数上限（对齐 quinn-proto 2ms Pacer 突发容量与 32 包 sendmmsg 批处理）。
+const MAX_QUIC_TRANSMITS_PER_PASS: usize = 128;
+/// 单次 `drive()` 内最多连续流水线化的整形视频帧轮次（严格逐帧排空短尾包后再喂下一帧，零帧间黏连）。
+const MAX_VIDEO_FRAME_ROUNDS_PER_PASS: usize = 16;
 /// 建连等待队列最长容忍时长（秒）。
 const PENDING_OPEN_TIMEOUT: Duration = Duration::from_secs(5);
 /// 内层 QUIC 断线后重拨退避（毫秒）。
 const QUIC_RECONNECT_BACKOFF: Duration = Duration::from_millis(300);
+/// 热切换预热备用隧道默认超时时间（秒），超时未完成则自动回滚、不影响现网主隧道。
+const DEFAULT_HOT_SWITCH_TIMEOUT_SECS: u64 = 12;
+/// 热切换切流后旧隧道活跃 TCP 流最长排空宽限时间（秒）。
+const HOT_SWITCH_DRAIN_CAP_SECS: u64 = 60;
+/// 最多允许并发存在的热切换令牌槽数量（含主槽、备槽与排空旧槽）。
+const MAX_HOT_SWITCH_CLIENT_SLOTS: usize = 8;
 
 /// 内嵌类 Hy2 代理客户端配置（`webrtc-cloak proxy --client`）。
 #[derive(Clone)]
@@ -73,6 +90,12 @@ pub struct ProxyClientConfig {
     pub down_bps: u64,
     /// 可选内层 QUIC MTU 覆盖（字节，`None` 默认收敛至 1200B 对齐 WebRTC/Hy2 伪装包长）。
     pub proxy_mtu: Option<u16>,
+    /// 可选热切换配置文件路径（收到 `SIGHUP` 或 `reload_trigger` 时原子读取并执行 Make-Before-Break 热切换）。
+    pub hot_config_path: Option<String>,
+    /// 可选测试/嵌入式代码触发热重载信号（生产 CLI 通过 Unix `SIGHUP` 自动触发）。
+    pub reload_trigger: Option<Arc<AtomicBool>>,
+    /// Make-Before-Break 热切换预热握手超时（秒，`0` 默认 12 秒）。
+    pub hot_switch_timeout_secs: u64,
 }
 
 /// 反向内嵌类 Hy2 代理入口客户端配置（`webrtc-cloak proxy --client --reverse`）。
@@ -144,6 +167,7 @@ enum ClientTcpState {
     },
     /// 已发送 `[STREAM_CMD_TCP, target]`，等待服务端返回 1 字节状态码。
     WaitServerReply {
+        tunnel_id: u64,
         stream_id: StreamId,
         is_socks5: bool,
         pending_to_quic: Vec<u8>,
@@ -152,6 +176,7 @@ enum ClientTcpState {
     },
     /// 全双工字节透传中。
     Relaying {
+        tunnel_id: u64,
         stream_id: StreamId,
         pending_to_quic: Vec<u8>,
         q_pos: usize,
@@ -199,33 +224,162 @@ struct InnerQuicConn {
     burst_started_at: Instant,
 }
 
-pub(crate) struct ProxyClientEngine {
-    poll: SharedPoll,
+/// 单个逻辑隧道（对应一对独立的 `ClientWorker` + `quinn_proto::Endpoint/Connection`）。
+struct QuicTunnel {
+    id: u64,
     endpoint: Endpoint,
     brutal_cfg: Arc<BrutalConfig>,
     quic_client_cfg: quinn_proto::ClientConfig,
     up_bps: u64,
     down_bps: u64,
     inner_mtu: u16,
+    quic: Option<InnerQuicConn>,
+    last_quic_attempt: Option<Instant>,
+    rx_queue: VecDeque<Vec<u8>>,
+    tx_batch: Option<UdpSendBatch>,
+    more_tx_pending: bool,
+    had_ready_outer: bool,
+}
+
+impl QuicTunnel {
+    #[allow(clippy::too_many_arguments)]
+    fn new(
+        id: u64,
+        outer_addr: SocketAddr,
+        wan_mtu: usize,
+        proxy_mtu: Option<u16>,
+        udp_batch: usize,
+        up_bps: u64,
+        down_bps: u64,
+    ) -> Self {
+        let outer_hdr = outer_udp_hdr_len(outer_addr);
+        let inner_mtu = compute_inner_quic_mtu(wan_mtu, outer_hdr, proxy_mtu);
+        let ep_cfg = build_endpoint_config(inner_mtu);
+        let endpoint = Endpoint::new(Arc::new(ep_cfg), None, true, None);
+        let brutal_cfg = Arc::new(BrutalConfig::new(up_bps / 8));
+        let transport = build_transport_config(
+            inner_mtu,
+            Arc::clone(&brutal_cfg),
+            DEFAULT_QUIC_IDLE_TIMEOUT_SECS,
+            None,
+        );
+        let quic_client_cfg = build_quic_client_config(transport);
+        let wbuf_len = worker_udp_write_buf_len(wan_mtu);
+        let tx_batch =
+            is_udp_batch_active(udp_batch).then(|| UdpSendBatch::new(udp_batch, wbuf_len));
+        Self {
+            id,
+            endpoint,
+            brutal_cfg,
+            quic_client_cfg,
+            up_bps,
+            down_bps,
+            inner_mtu,
+            quic: None,
+            last_quic_attempt: None,
+            rx_queue: VecDeque::with_capacity(64),
+            tx_batch,
+            more_tx_pending: false,
+            had_ready_outer: false,
+        }
+    }
+
+    fn ensure_quic_conn(&mut self, outer_ready: bool, now: Instant) {
+        if self.quic.is_some() || !outer_ready {
+            return;
+        }
+        if let Some(last) = self.last_quic_attempt {
+            if now.saturating_duration_since(last) < QUIC_RECONNECT_BACKOFF {
+                return;
+            }
+        }
+        self.last_quic_attempt = Some(now);
+        match self.endpoint.connect(
+            now,
+            self.quic_client_cfg.clone(),
+            proxy_quic_peer_addr(),
+            "cloak-proxy.internal",
+        ) {
+            Ok((handle, conn)) => {
+                let rate_handle = self.brutal_cfg.take_last_rate_handle();
+                self.quic = Some(InnerQuicConn {
+                    handle,
+                    conn,
+                    rate_handle,
+                    established: false,
+                    ctrl_stream: None,
+                    ctrl_rx: Vec::with_capacity(CTRL_HELLO_LEN),
+                    ctrl_negotiated: false,
+                    burst_drained: true,
+                    burst_bytes_rem: 0,
+                    burst_started_at: now,
+                });
+            }
+            Err(e) => {
+                log(
+                    "proxy-client",
+                    &format!("inner QUIC connect error: {:?}", e),
+                );
+            }
+        }
+    }
+}
+
+/// 持有主隧道、预热备隧道与旧流排空隧道集合，确保与 `tcp_conns` 等字段在 Rust 借用检查中完全正交。
+struct TunnelPool {
+    primary: QuicTunnel,
+    standby: Option<QuicTunnel>,
+    draining: Vec<QuicTunnel>,
+}
+
+impl TunnelPool {
+    #[inline]
+    fn get(&self, tid: u64) -> Option<&QuicTunnel> {
+        if self.primary.id == tid {
+            return Some(&self.primary);
+        }
+        if let Some(ref s) = self.standby {
+            if s.id == tid {
+                return Some(s);
+            }
+        }
+        self.draining.iter().find(|d| d.id == tid)
+    }
+
+    #[inline]
+    fn get_mut(&mut self, tid: u64) -> Option<&mut QuicTunnel> {
+        if self.primary.id == tid {
+            return Some(&mut self.primary);
+        }
+        if let Some(ref mut s) = self.standby {
+            if s.id == tid {
+                return Some(s);
+            }
+        }
+        self.draining.iter_mut().find(|d| d.id == tid)
+    }
+}
+
+pub(crate) struct ProxyClientEngine {
+    poll: SharedPoll,
+    tunnels: TunnelPool,
+    next_tunnel_id: u64,
+    rx_dispatch_tunnel_id: u64,
+    proxy_mtu: Option<u16>,
     socks_listener: Option<TcpListener>,
     fwd_listeners: Vec<(Token, TcpListener, TargetAddr)>,
     next_dyn_tok: usize,
     tcp_conns: HashMap<Token, ClientTcpConn>,
-    tok_by_stream: HashMap<StreamId, Token>,
+    tok_by_stream: HashMap<(u64, StreamId), Token>,
     pending_open_toks: VecDeque<Token>,
     next_udp_session_id: u32,
     udp_sessions: HashMap<u32, ClientUdpSession>,
     udp_sess_by_tok: HashMap<Token, u32>,
     udp_reassembler: UdpFragReassembler,
     next_frag_id: u16,
-    quic: Option<InnerQuicConn>,
-    last_quic_attempt: Option<Instant>,
-    rx_queue: VecDeque<Vec<u8>>,
     deferred_tcp_reads: VecDeque<Token>,
-    deferred_quic_reads: VecDeque<StreamId>,
-    more_tx_pending: bool,
+    deferred_quic_reads: VecDeque<(u64, StreamId)>,
     tx_scratch: Vec<u8>,
-    tx_batch: Option<UdpSendBatch>,
     io_buf: Vec<u8>,
     udp_buf: Vec<u8>,
     total_streams_opened: u64,
@@ -274,18 +428,9 @@ impl ProxyClientEngine {
         up_bps: u64,
         down_bps: u64,
     ) -> std::io::Result<Self> {
-        let outer_hdr = outer_udp_hdr_len(outer_addr);
-        let inner_mtu = compute_inner_quic_mtu(wan_mtu, outer_hdr, proxy_mtu);
-        let ep_cfg = build_endpoint_config(inner_mtu);
-        let endpoint = Endpoint::new(Arc::new(ep_cfg), None, true, None);
-        let brutal_cfg = Arc::new(BrutalConfig::new(up_bps / 8));
-        let transport = build_transport_config(
-            inner_mtu,
-            Arc::clone(&brutal_cfg),
-            DEFAULT_QUIC_IDLE_TIMEOUT_SECS,
-            None,
+        let primary = QuicTunnel::new(
+            1, outer_addr, wan_mtu, proxy_mtu, udp_batch, up_bps, down_bps,
         );
-        let quic_client_cfg = build_quic_client_config(transport);
 
         let socks_listener = if let Some(addr) = socks_listen {
             let mut l = TcpListener::bind(addr)?;
@@ -310,18 +455,16 @@ impl ProxyClientEngine {
             fwd_listeners.push((tok, l, rule.target.clone()));
         }
 
-        let wbuf_len = worker_udp_write_buf_len(wan_mtu);
-        let tx_batch =
-            is_udp_batch_active(udp_batch).then(|| UdpSendBatch::new(udp_batch, wbuf_len));
-
         Ok(Self {
             poll,
-            endpoint,
-            brutal_cfg,
-            quic_client_cfg,
-            up_bps,
-            down_bps,
-            inner_mtu,
+            tunnels: TunnelPool {
+                primary,
+                standby: None,
+                draining: Vec::new(),
+            },
+            next_tunnel_id: 2,
+            rx_dispatch_tunnel_id: 1,
+            proxy_mtu,
             socks_listener,
             fwd_listeners,
             next_dyn_tok: 0,
@@ -333,20 +476,114 @@ impl ProxyClientEngine {
             udp_sess_by_tok: HashMap::with_capacity(16),
             udp_reassembler: UdpFragReassembler::default(),
             next_frag_id: 1,
-            quic: None,
-            last_quic_attempt: None,
-            rx_queue: VecDeque::with_capacity(64),
             deferred_tcp_reads: VecDeque::with_capacity(32),
             deferred_quic_reads: VecDeque::with_capacity(32),
-            more_tx_pending: false,
             tx_scratch: Vec::with_capacity(2048),
-            tx_batch,
-            io_buf: vec![0u8; 32 * 1024],
+            io_buf: vec![0u8; 64 * 1024],
             udp_buf: vec![0u8; 65_536],
             total_streams_opened: 0,
             total_udp_tx: 0,
             total_udp_rx: 0,
         })
+    }
+
+    #[inline]
+    fn primary_id(&self) -> u64 {
+        self.tunnels.primary.id
+    }
+
+    #[inline]
+    fn primary_inner_mtu(&self) -> u16 {
+        self.tunnels.primary.inner_mtu
+    }
+
+    #[inline]
+    fn primary_up_bps(&self) -> u64 {
+        self.tunnels.primary.up_bps
+    }
+
+    #[inline]
+    fn primary_down_bps(&self) -> u64 {
+        self.tunnels.primary.down_bps
+    }
+
+    #[inline]
+    fn set_rx_dispatch_tunnel(&mut self, tid: u64) {
+        self.rx_dispatch_tunnel_id = tid;
+    }
+
+    fn start_standby(
+        &mut self,
+        outer_addr: SocketAddr,
+        wan_mtu: usize,
+        udp_batch: usize,
+        up_bps: u64,
+        down_bps: u64,
+    ) -> u64 {
+        let tid = self.next_tunnel_id;
+        self.next_tunnel_id = self.next_tunnel_id.wrapping_add(1).max(1);
+        self.tunnels.standby = Some(QuicTunnel::new(
+            tid,
+            outer_addr,
+            wan_mtu,
+            self.proxy_mtu,
+            udp_batch,
+            up_bps,
+            down_bps,
+        ));
+        tid
+    }
+
+    #[inline]
+    fn is_standby_ready(&self) -> bool {
+        self.tunnels
+            .standby
+            .as_ref()
+            .and_then(|s| s.quic.as_ref())
+            .is_some_and(|q| q.established && q.ctrl_negotiated)
+    }
+
+    fn abort_standby(&mut self) {
+        self.tunnels.standby = None;
+    }
+
+    #[inline]
+    fn active_stream_count_for(&self, tid: u64) -> usize {
+        self.tok_by_stream.keys().filter(|(t, _)| *t == tid).count()
+    }
+
+    #[inline]
+    fn has_draining_quic(&self, tid: u64) -> bool {
+        self.tunnels
+            .draining
+            .iter()
+            .find(|d| d.id == tid)
+            .is_some_and(|d| d.quic.is_some())
+    }
+
+    /// 原子提升预热就绪的备隧道为主隧道；返回 `(old_primary_id, old_active_stream_count)`。
+    fn promote_standby(&mut self) -> Option<(u64, usize)> {
+        let new_primary = self.tunnels.standby.take()?;
+        let old_primary = std::mem::replace(&mut self.tunnels.primary, new_primary);
+        let old_id = old_primary.id;
+        self.rx_dispatch_tunnel_id = self.tunnels.primary.id;
+        let remaining = self.active_stream_count_for(old_id);
+        if remaining > 0 {
+            self.tunnels.draining.push(old_primary);
+        }
+        // 立即将排队等待建流的连接切换到新主隧道
+        let pending: Vec<Token> = self.pending_open_toks.drain(..).collect();
+        for tok in pending {
+            if !self.try_open_stream_for_tok(tok) && self.tcp_conns.contains_key(&tok) {
+                self.pending_open_toks.push_back(tok);
+            }
+        }
+        Some((old_id, remaining))
+    }
+
+    fn drop_draining_tunnel(&mut self, tid: u64) {
+        self.reset_quic_conn(tid, "draining tunnel retired");
+        self.tunnels.draining.retain(|d| d.id != tid);
     }
 
     fn alloc_dyn_token(&mut self) -> Token {
@@ -365,59 +602,33 @@ impl ProxyClientEngine {
     #[inline]
     pub(crate) fn on_tunnel_datagram(&mut self, payload: &[u8]) {
         if !payload.is_empty() {
-            self.rx_queue.push_back(payload.to_vec());
+            if let Some(t) = self.tunnels.get_mut(self.rx_dispatch_tunnel_id) {
+                t.rx_queue.push_back(payload.to_vec());
+            }
         }
     }
 
-    fn ensure_quic_conn(&mut self, outer_ready: bool, now: Instant) {
-        if self.quic.is_some() || !outer_ready {
-            return;
-        }
-        if let Some(last) = self.last_quic_attempt {
-            if now.saturating_duration_since(last) < QUIC_RECONNECT_BACKOFF {
-                return;
-            }
-        }
-        self.last_quic_attempt = Some(now);
-        match self.endpoint.connect(
-            now,
-            self.quic_client_cfg.clone(),
-            proxy_quic_peer_addr(),
-            "cloak-proxy.internal",
-        ) {
-            Ok((handle, conn)) => {
-                let rate_handle = self.brutal_cfg.take_last_rate_handle();
-                self.quic = Some(InnerQuicConn {
-                    handle,
-                    conn,
-                    rate_handle,
-                    established: false,
-                    ctrl_stream: None,
-                    ctrl_rx: Vec::with_capacity(CTRL_HELLO_LEN),
-                    ctrl_negotiated: false,
-                    burst_drained: true,
-                    burst_bytes_rem: 0,
-                    burst_started_at: now,
-                });
-            }
-            Err(e) => {
+    fn reset_quic_conn(&mut self, tid: u64, reason: &str) {
+        if let Some(t) = self.tunnels.get_mut(tid) {
+            if let Some(old) = t.quic.take() {
+                let _ = old;
                 log(
                     "proxy-client",
-                    &format!("inner QUIC connect error: {:?}", e),
+                    &format!("inner QUIC#{} closed ({})", tid, reason),
                 );
             }
         }
-    }
-
-    fn reset_quic_conn(&mut self, reason: &str) {
-        if let Some(old) = self.quic.take() {
-            let _ = old;
-            log("proxy-client", &format!("inner QUIC closed ({})", reason));
-        }
-        // 关闭所有绑定在旧 QUIC 连接上的 TCP 流（避免僵尸连接挂起）
-        let dead_toks: Vec<Token> = self.tok_by_stream.drain().map(|(_, t)| t).collect();
-        for tok in dead_toks {
-            self.close_tcp_conn(tok);
+        // 仅关闭绑定在指定 QUIC 隧道上的 TCP 流（绝不影响热切换后新主隧道或其他排空隧道！）
+        let dead_keys: Vec<(u64, StreamId)> = self
+            .tok_by_stream
+            .keys()
+            .copied()
+            .filter(|(t, _)| *t == tid)
+            .collect();
+        for key in dead_keys {
+            if let Some(tok) = self.tok_by_stream.remove(&key) {
+                self.close_tcp_conn(tok);
+            }
         }
     }
 
@@ -436,12 +647,22 @@ impl ProxyClientEngine {
         };
         let _ = self.poll.registry().deregister(&mut c.stream);
         match c.state {
-            ClientTcpState::WaitServerReply { stream_id, .. }
-            | ClientTcpState::Relaying { stream_id, .. } => {
-                self.tok_by_stream.remove(&stream_id);
-                if let Some(ref mut q) = self.quic {
-                    let _ = q.conn.send_stream(stream_id).reset(VarInt::from_u32(0));
-                    let _ = q.conn.recv_stream(stream_id).stop(VarInt::from_u32(0));
+            ClientTcpState::WaitServerReply {
+                tunnel_id,
+                stream_id,
+                ..
+            }
+            | ClientTcpState::Relaying {
+                tunnel_id,
+                stream_id,
+                ..
+            } => {
+                self.tok_by_stream.remove(&(tunnel_id, stream_id));
+                if let Some(t) = self.tunnels.get_mut(tunnel_id) {
+                    if let Some(ref mut q) = t.quic {
+                        let _ = q.conn.send_stream(stream_id).reset(VarInt::from_u32(0));
+                        let _ = q.conn.recv_stream(stream_id).stop(VarInt::from_u32(0));
+                    }
                 }
             }
             ClientTcpState::SocksUdpCtrl { session_id, .. } => {
@@ -564,7 +785,12 @@ impl ProxyClientEngine {
     }
 
     fn try_open_stream_for_tok(&mut self, tok: Token) -> bool {
-        let ready = self.quic.as_ref().is_some_and(|q| q.established);
+        let ready = self
+            .tunnels
+            .primary
+            .quic
+            .as_ref()
+            .is_some_and(|q| q.established);
         if !ready {
             return false;
         }
@@ -577,7 +803,8 @@ impl ProxyClientEngine {
             } => (target.clone(), *is_socks5),
             _ => return true,
         };
-        let Some(ref mut q) = self.quic else {
+        let primary_id = self.tunnels.primary.id;
+        let Some(ref mut q) = self.tunnels.primary.quic else {
             return false;
         };
         let Some(stream_id) = q.conn.streams().open(Dir::Bi) else {
@@ -603,9 +830,10 @@ impl ProxyClientEngine {
             Vec::new()
         };
         self.total_streams_opened += 1;
-        self.tok_by_stream.insert(stream_id, tok);
+        self.tok_by_stream.insert((primary_id, stream_id), tok);
         if let Some(c) = self.tcp_conns.get_mut(&tok) {
             c.state = ClientTcpState::WaitServerReply {
+                tunnel_id: primary_id,
                 stream_id,
                 is_socks5,
                 pending_to_quic,
@@ -619,7 +847,7 @@ impl ProxyClientEngine {
     fn handle_tcp_writable(&mut self, tok: Token) {
         let mut close_now = false;
         let mut next_interest: Option<Interest> = None;
-        let mut drain_quic_stream: Option<StreamId> = None;
+        let mut drain_quic_stream: Option<(u64, StreamId)> = None;
 
         if let Some(c) = self.tcp_conns.get_mut(&tok) {
             match &mut c.state {
@@ -686,6 +914,7 @@ impl ProxyClientEngine {
                     }
                 }
                 ClientTcpState::Relaying {
+                    tunnel_id,
                     stream_id,
                     pending_to_quic,
                     pending_to_tcp,
@@ -717,16 +946,10 @@ impl ProxyClientEngine {
                                 close_now = true;
                             }
                         } else {
-                            drain_quic_stream = Some(*stream_id);
+                            drain_quic_stream = Some((*tunnel_id, *stream_id));
                         }
                         if !close_now {
-                            let want = if !*tcp_eof && pending_to_quic.is_empty() {
-                                Interest::READABLE
-                            } else {
-                                // 没有待写给 TCP 且暂停读 TCP：仅保持可读用于感知对端 FIN/RST
-                                Interest::READABLE
-                            };
-                            next_interest = Some(want);
+                            next_interest = Some(Interest::READABLE);
                         }
                     }
                 }
@@ -743,8 +966,8 @@ impl ProxyClientEngine {
         if let Some(want) = next_interest {
             self.update_tcp_interest(tok, want);
         }
-        if let Some(sid) = drain_quic_stream {
-            self.pump_quic_to_tcp(sid);
+        if let Some((tid, sid)) = drain_quic_stream {
+            self.pump_quic_to_tcp(tid, sid);
         }
     }
 
@@ -795,12 +1018,6 @@ impl ProxyClientEngine {
                                     Ok(2) => {
                                         let leftover = rx[2 + nm..].to_vec();
                                         c.state = ClientTcpState::SocksRequest { rx: leftover };
-                                        if let ClientTcpState::SocksRequest { rx: ref l } = c.state
-                                        {
-                                            if !l.is_empty() {
-                                                // 继续直接解析紧随其后的 SOCKS5 Request
-                                            }
-                                        }
                                     }
                                     Ok(n) => {
                                         *tx = reply[n..].to_vec();
@@ -822,28 +1039,24 @@ impl ProxyClientEngine {
                         }
                     }
                 }
-                ClientTcpState::SocksUdpCtrl { .. } => {
-                    // 控制连接只要 EOF 或错误就拆除关联的 UDP 会话
-                    loop {
-                        match c.stream.read(&mut self.io_buf[..256]) {
-                            Ok(0) => {
-                                action = Action::Close;
-                                break;
-                            }
-                            Ok(_) => {}
-                            Err(e) if e.kind() == ErrorKind::WouldBlock => break,
-                            Err(_) => {
-                                action = Action::Close;
-                                break;
-                            }
+                ClientTcpState::SocksUdpCtrl { .. } => loop {
+                    match c.stream.read(&mut self.io_buf[..256]) {
+                        Ok(0) => {
+                            action = Action::Close;
+                            break;
+                        }
+                        Ok(_) => {}
+                        Err(e) if e.kind() == ErrorKind::WouldBlock => break,
+                        Err(_) => {
+                            action = Action::Close;
+                            break;
                         }
                     }
-                }
+                },
                 ClientTcpState::WaitQuicReady { .. } | ClientTcpState::FlushAndClose { .. } => {}
-                ClientTcpState::WaitServerReply { .. } => {
-                    // 等待服务端 1B 确认期间暂缓读取本地 TCP（由 OS 缓冲提供天然背压）
-                }
+                ClientTcpState::WaitServerReply { .. } => {}
                 ClientTcpState::Relaying {
+                    tunnel_id,
                     stream_id,
                     pending_to_quic,
                     q_pos,
@@ -852,11 +1065,17 @@ impl ProxyClientEngine {
                     quic_eof,
                     ..
                 } => {
+                    let tid = *tunnel_id;
                     let sid = *stream_id;
                     if !pending_to_quic.is_empty() || *tcp_eof {
                         return;
                     }
-                    let Some(ref mut q) = self.quic else {
+                    let Some(tunnel) = self.tunnels.get_mut(tid) else {
+                        self.close_tcp_conn(tok);
+                        return;
+                    };
+                    let inner_mtu = tunnel.inner_mtu;
+                    let Some(ref mut q) = tunnel.quic else {
                         self.close_tcp_conn(tok);
                         return;
                     };
@@ -868,7 +1087,7 @@ impl ProxyClientEngine {
                     }
                     // v0.7.1: Shape bulk uplink TCP->QUIC bursts identically to downlink video frames:
                     // 5..=10 full-MTU packets + 1 genuine 500..=979B frame-tail packet per burst.
-                    let mss = (self.inner_mtu as usize).saturating_sub(42).max(512);
+                    let mss = (inner_mtu as usize).saturating_sub(42).max(512);
                     let full_pkts = 5 + ((rand_u32() as usize) % 6);
                     let tail_bytes = 500 + ((rand_u32() as usize) % 480);
                     let mut budget = (full_pkts * mss + tail_bytes).min(STREAM_IO_BUDGET);
@@ -1100,7 +1319,8 @@ impl ProxyClientEngine {
                 }
             }
         }
-        let Some(ref mut q) = self.quic else {
+        let inner_mtu = self.tunnels.primary.inner_mtu;
+        let Some(ref mut q) = self.tunnels.primary.quic else {
             return;
         };
         if !q.established {
@@ -1110,7 +1330,7 @@ impl ProxyClientEngine {
             .conn
             .datagrams()
             .max_size()
-            .unwrap_or(self.inner_mtu.saturating_sub(48) as usize);
+            .unwrap_or(inner_mtu.saturating_sub(48) as usize);
         for (_src, dst, payload) in pkts {
             let fid = self.next_frag_id;
             self.next_frag_id = self.next_frag_id.wrapping_add(1);
@@ -1123,14 +1343,17 @@ impl ProxyClientEngine {
         }
     }
 
-    fn flush_quic_write_for_stream(&mut self, stream_id: StreamId) {
-        let Some(&tok) = self.tok_by_stream.get(&stream_id) else {
+    fn flush_quic_write_for_stream(&mut self, tid: u64, stream_id: StreamId) {
+        let Some(&tok) = self.tok_by_stream.get(&(tid, stream_id)) else {
             return;
         };
         let mut close_now = false;
         let mut finish_now = false;
         let mut resume_tcp_read = false;
-        if let (Some(c), Some(ref mut q)) = (self.tcp_conns.get_mut(&tok), self.quic.as_mut()) {
+        if let (Some(c), Some(ref mut q)) = (
+            self.tcp_conns.get_mut(&tok),
+            self.tunnels.get_mut(tid).and_then(|t| t.quic.as_mut()),
+        ) {
             match &mut c.state {
                 ClientTcpState::WaitServerReply {
                     pending_to_quic,
@@ -1204,17 +1427,17 @@ impl ProxyClientEngine {
         }
     }
 
-    fn pump_quic_to_tcp(&mut self, stream_id: StreamId) {
-        // 先检查是否是 Control Stream
+    fn pump_quic_to_tcp(&mut self, tid: u64, stream_id: StreamId) {
         if self
-            .quic
-            .as_ref()
+            .tunnels
+            .get(tid)
+            .and_then(|t| t.quic.as_ref())
             .is_some_and(|q| q.ctrl_stream == Some(stream_id))
         {
-            self.pump_ctrl_stream(stream_id);
+            self.pump_ctrl_stream(tid, stream_id);
             return;
         }
-        let Some(&tok) = self.tok_by_stream.get(&stream_id) else {
+        let Some(&tok) = self.tok_by_stream.get(&(tid, stream_id)) else {
             return;
         };
         let mut close_now = false;
@@ -1229,7 +1452,7 @@ impl ProxyClientEngine {
             let mut extra_data = Vec::new();
             let mut hit_eof = false;
             let mut hit_reset = false;
-            if let Some(ref mut q) = self.quic {
+            if let Some(ref mut q) = self.tunnels.get_mut(tid).and_then(|t| t.quic.as_mut()) {
                 if let Ok(mut chunks) = q.conn.recv_stream(stream_id).read(true) {
                     loop {
                         match chunks.next(32 * 1024) {
@@ -1263,6 +1486,7 @@ impl ProxyClientEngine {
             if let Some(status) = got_status {
                 if let Some(c) = self.tcp_conns.get_mut(&tok) {
                     if let ClientTcpState::WaitServerReply {
+                        tunnel_id,
                         is_socks5,
                         pending_to_quic,
                         q_pos,
@@ -1276,10 +1500,12 @@ impl ProxyClientEngine {
                                 out.extend_from_slice(&socks5_reply(0x00, None));
                             }
                             out.extend_from_slice(&extra_data);
+                            let t_id = *tunnel_id;
                             let p_q = std::mem::take(pending_to_quic);
                             let qp = *q_pos;
                             let teof = *tcp_eof;
                             c.state = ClientTcpState::Relaying {
+                                tunnel_id: t_id,
                                 stream_id,
                                 pending_to_quic: p_q,
                                 q_pos: qp,
@@ -1313,7 +1539,6 @@ impl ProxyClientEngine {
                 return;
             }
             if need_writable {
-                // 转入 Relaying 后可能已有提前到达的本地 TCP 数据（如 --tcp-forward），立即排期读取
                 if matches!(
                     self.tcp_conns.get(&tok).map(|c| &c.state),
                     Some(ClientTcpState::Relaying { .. })
@@ -1330,7 +1555,10 @@ impl ProxyClientEngine {
 
         // 2) 处于 Relaying 状态且 pending_to_tcp 为空时直接从 QUIC 搬运到 TCP
         let mut hit_quic_blocked = true;
-        if let (Some(c), Some(ref mut q)) = (self.tcp_conns.get_mut(&tok), self.quic.as_mut()) {
+        if let (Some(c), Some(ref mut q)) = (
+            self.tcp_conns.get_mut(&tok),
+            self.tunnels.get_mut(tid).and_then(|t| t.quic.as_mut()),
+        ) {
             if let ClientTcpState::Relaying {
                 pending_to_quic,
                 pending_to_tcp,
@@ -1415,13 +1643,17 @@ impl ProxyClientEngine {
                 self.update_tcp_interest(tok, Interest::READABLE | Interest::WRITABLE);
             }
             if !hit_quic_blocked {
-                self.deferred_quic_reads.push_back(stream_id);
+                self.deferred_quic_reads.push_back((tid, stream_id));
             }
         }
     }
 
-    fn pump_ctrl_stream(&mut self, stream_id: StreamId) {
-        let Some(ref mut q) = self.quic else {
+    fn pump_ctrl_stream(&mut self, tid: u64, stream_id: StreamId) {
+        let Some(tunnel) = self.tunnels.get_mut(tid) else {
+            return;
+        };
+        let inner_mtu = tunnel.inner_mtu;
+        let Some(ref mut q) = tunnel.quic else {
             return;
         };
         if q.ctrl_negotiated {
@@ -1443,8 +1675,9 @@ impl ProxyClientEngine {
             log(
                 "proxy-client",
                 &format!(
-                    "QUIC+Brutal READY (No-op crypto, mtu={}) negotiated up={:.1}Mbps down={:.1}Mbps",
-                    self.inner_mtu,
+                    "QUIC+Brutal#{} READY (No-op crypto, mtu={}) negotiated up={:.1}Mbps down={:.1}Mbps",
+                    tid,
+                    inner_mtu,
                     hello.up_bps as f64 / 1e6,
                     hello.down_bps as f64 / 1e6
                 ),
@@ -1452,9 +1685,9 @@ impl ProxyClientEngine {
         }
     }
 
-    fn drain_incoming_datagrams(&mut self, now: Instant) {
+    fn drain_incoming_datagrams(&mut self, tid: u64, now: Instant) {
         let mut received = Vec::new();
-        if let Some(ref mut q) = self.quic {
+        if let Some(ref mut q) = self.tunnels.get_mut(tid).and_then(|t| t.quic.as_mut()) {
             while let Some(d) = q.conn.datagrams().recv() {
                 received.push(d);
             }
@@ -1478,54 +1711,85 @@ impl ProxyClientEngine {
         }
     }
 
-    fn drive(&mut self, outer: &mut ClientOuter<'_>, now: Instant) -> Duration {
-        let outer_ready = outer.is_ready();
-        self.ensure_quic_conn(outer_ready, now);
+    fn sync_outer_for_tunnel(&mut self, tid: u64, outer_ready: bool, allow_reset_reconnect: bool) {
+        let mut trigger_reset = false;
+        if let Some(t) = self.tunnels.get_mut(tid) {
+            if outer_ready {
+                t.had_ready_outer = true;
+            } else if t.had_ready_outer {
+                t.had_ready_outer = false;
+                trigger_reset = true;
+                if allow_reset_reconnect {
+                    t.last_quic_attempt = None;
+                }
+            }
+        }
+        if trigger_reset {
+            self.reset_quic_conn(tid, "outer tunnel disconnected (non-MBB)");
+        }
+    }
 
-        // 1) 喂入来自外层 WebRTC-Cloak 的下行 QUIC 报文
-        let peer_addr = proxy_quic_peer_addr();
-        while let Some(raw) = self.rx_queue.pop_front() {
-            let mut resp_buf = Vec::new();
-            let ev = self.endpoint.handle(
-                now,
-                peer_addr,
-                None,
-                None,
-                BytesMut::from(&raw[..]),
-                &mut resp_buf,
-            );
-            match ev {
-                Some(DatagramEvent::ConnectionEvent(ch, cev)) => {
-                    if let Some(ref mut q) = self.quic {
-                        if q.handle == ch {
-                            q.conn.handle_event(cev);
-                        }
-                    }
-                }
-                Some(DatagramEvent::Response(_)) if !resp_buf.is_empty() => {
-                    outer.send_single(&resp_buf, now);
-                }
-                _ => {}
+    fn drive_tunnel(
+        &mut self,
+        tid: u64,
+        outer: &mut ClientOuter<'_>,
+        now: Instant,
+        allow_connect: bool,
+    ) -> Duration {
+        let is_primary = self.tunnels.primary.id == tid;
+        let outer_ready = outer.is_ready();
+        if allow_connect {
+            if let Some(t) = self.tunnels.get_mut(tid) {
+                t.ensure_quic_conn(outer_ready, now);
             }
         }
 
-        // 2) 推进 QUIC 定时器与 Endpoint 事件
-        if let Some(ref mut q) = self.quic {
-            if let Some(t) = q.conn.poll_timeout() {
-                if now >= t {
-                    q.conn.handle_timeout(now);
+        // 1) 喂入来自外层 WebRTC-Cloak 的下行 QUIC 报文
+        let peer_addr = proxy_quic_peer_addr();
+        if let Some(t) = self.tunnels.get_mut(tid) {
+            while let Some(raw) = t.rx_queue.pop_front() {
+                let mut resp_buf = Vec::new();
+                let ev = t.endpoint.handle(
+                    now,
+                    peer_addr,
+                    None,
+                    None,
+                    BytesMut::from(&raw[..]),
+                    &mut resp_buf,
+                );
+                match ev {
+                    Some(DatagramEvent::ConnectionEvent(ch, cev)) => {
+                        if let Some(ref mut q) = t.quic {
+                            if q.handle == ch {
+                                q.conn.handle_event(cev);
+                            }
+                        }
+                    }
+                    Some(DatagramEvent::Response(_)) if !resp_buf.is_empty() => {
+                        outer.send_single(&resp_buf, now);
+                    }
+                    _ => {}
                 }
             }
-            while let Some(ev) = q.conn.poll_endpoint_events() {
-                if let Some(cev) = self.endpoint.handle_event(q.handle, ev) {
-                    q.conn.handle_event(cev);
+
+            // 2) 推进 QUIC 定时器与 Endpoint 事件
+            if let Some(ref mut q) = t.quic {
+                if let Some(tm) = q.conn.poll_timeout() {
+                    if now >= tm {
+                        q.conn.handle_timeout(now);
+                    }
+                }
+                while let Some(ev) = q.conn.poll_endpoint_events() {
+                    if let Some(cev) = t.endpoint.handle_event(q.handle, ev) {
+                        q.conn.handle_event(cev);
+                    }
                 }
             }
         }
 
         // 3) 消费 QUIC 应用事件
         let mut quic_events = Vec::new();
-        if let Some(ref mut q) = self.quic {
+        if let Some(ref mut q) = self.tunnels.get_mut(tid).and_then(|t| t.quic.as_mut()) {
             while let Some(ev) = q.conn.poll() {
                 quic_events.push(ev);
             }
@@ -1534,23 +1798,26 @@ impl ProxyClientEngine {
         for ev in quic_events {
             match ev {
                 QuicEvent::Connected => {
-                    if let Some(ref mut q) = self.quic {
-                        q.established = true;
-                        if let Some(sid) = q.conn.streams().open(Dir::Bi) {
-                            let hello = CtrlHello {
-                                up_bps: self.up_bps,
-                                down_bps: self.down_bps,
+                    if let Some(t) = self.tunnels.get_mut(tid) {
+                        let up_bps = t.up_bps;
+                        let down_bps = t.down_bps;
+                        if let Some(ref mut q) = t.quic {
+                            q.established = true;
+                            if let Some(sid) = q.conn.streams().open(Dir::Bi) {
+                                let hello = CtrlHello { up_bps, down_bps }.encode();
+                                let _ = q.conn.send_stream(sid).write(&hello);
+                                q.ctrl_stream = Some(sid);
                             }
-                            .encode();
-                            let _ = q.conn.send_stream(sid).write(&hello);
-                            q.ctrl_stream = Some(sid);
                         }
                     }
-                    // 立即为排队中的本地连接打开 QUIC 流
-                    let pending: Vec<Token> = self.pending_open_toks.drain(..).collect();
-                    for tok in pending {
-                        if !self.try_open_stream_for_tok(tok) && self.tcp_conns.contains_key(&tok) {
-                            self.pending_open_toks.push_back(tok);
+                    if is_primary {
+                        let pending: Vec<Token> = self.pending_open_toks.drain(..).collect();
+                        for tok in pending {
+                            if !self.try_open_stream_for_tok(tok)
+                                && self.tcp_conns.contains_key(&tok)
+                            {
+                                self.pending_open_toks.push_back(tok);
+                            }
                         }
                     }
                 }
@@ -1558,14 +1825,13 @@ impl ProxyClientEngine {
                     lost_reason = Some(format!("{:?}", reason));
                 }
                 QuicEvent::Stream(StreamEvent::Readable { id }) => {
-                    self.pump_quic_to_tcp(id);
+                    self.pump_quic_to_tcp(tid, id);
                 }
                 QuicEvent::Stream(StreamEvent::Writable { id }) => {
-                    self.flush_quic_write_for_stream(id);
+                    self.flush_quic_write_for_stream(tid, id);
                 }
                 QuicEvent::Stream(StreamEvent::Stopped { id, .. }) => {
-                    // 对端停止接收我方上行（STOP_SENDING），仅关闭发送侧，绝不提前丢弃对端待读的响应/下行数据
-                    if let Some(&tok) = self.tok_by_stream.get(&id) {
+                    if let Some(&tok) = self.tok_by_stream.get(&(tid, id)) {
                         let mut close_now = false;
                         if let Some(c) = self.tcp_conns.get_mut(&tok) {
                             match &mut c.state {
@@ -1603,78 +1869,201 @@ impl ProxyClientEngine {
                     }
                 }
                 QuicEvent::DatagramReceived => {
-                    self.drain_incoming_datagrams(now);
+                    self.drain_incoming_datagrams(tid, now);
                 }
                 _ => {}
             }
         }
         if let Some(reason) = lost_reason {
-            self.reset_quic_conn(&reason);
+            self.reset_quic_conn(tid, &reason);
         }
 
-        // 清理超时的 WaitQuicReady 连接
-        let mut timed_out = Vec::new();
-        for (&tok, c) in &self.tcp_conns {
-            if let ClientTcpState::WaitQuicReady { created_at, .. } = c.state {
-                if now.saturating_duration_since(created_at) > PENDING_OPEN_TIMEOUT {
-                    timed_out.push(tok);
+        // 清理超时的 WaitQuicReady 连接（仅在主隧道驱动时执行一次）
+        if is_primary {
+            let mut timed_out = Vec::new();
+            for (&tok, c) in &self.tcp_conns {
+                if let ClientTcpState::WaitQuicReady { created_at, .. } = c.state {
+                    if now.saturating_duration_since(created_at) > PENDING_OPEN_TIMEOUT {
+                        timed_out.push(tok);
+                    }
                 }
             }
-        }
-        for tok in timed_out {
-            self.close_tcp_conn(tok);
+            for tok in timed_out {
+                self.close_tcp_conn(tok);
+            }
         }
 
-        // 3.5) 执行一轮延迟的边缘触发读写续传（遇 !burst_drained 立即 break 保留队首公平轮转，杜绝多流饥饿）
-        let n_tcp = self.deferred_tcp_reads.len();
-        for _ in 0..n_tcp {
-            if self.quic.as_ref().is_some_and(|q| !q.burst_drained) {
-                break;
-            }
-            if let Some(tok) = self.deferred_tcp_reads.pop_front() {
-                if self.tcp_conns.contains_key(&tok) {
-                    self.handle_tcp_readable(tok, now);
-                }
-            }
-        }
+        // 3.5) 执行一轮属于本隧道的延迟 QUIC->TCP 边缘触发续传
         let n_quic = self.deferred_quic_reads.len();
         for _ in 0..n_quic {
-            if let Some(sid) = self.deferred_quic_reads.pop_front() {
-                if self.tok_by_stream.contains_key(&sid) {
-                    self.pump_quic_to_tcp(sid);
+            if let Some((q_tid, sid)) = self.deferred_quic_reads.pop_front() {
+                if q_tid == tid {
+                    if self.tok_by_stream.contains_key(&(q_tid, sid)) {
+                        self.pump_quic_to_tcp(q_tid, sid);
+                    }
+                } else if self.tok_by_stream.contains_key(&(q_tid, sid)) {
+                    self.deferred_quic_reads.push_back((q_tid, sid));
                 }
             }
         }
 
-        // 4) 批量刷出所有待发 QUIC 报文（有 sendmmsg 批处理时合并一次系统调用直发公网！）
-        self.flush_quic_transmits(outer, now);
+        // 4) 帧级流水线：严格逐帧排空短尾包后再喂下一帧，共享 sendmmsg tx_batch 填充 Pacer 令牌桶
+        let mut tx_batch = if let Some(t) = self.tunnels.get_mut(tid) {
+            t.more_tx_pending = false;
+            t.tx_batch.take()
+        } else {
+            return Duration::from_secs(1);
+        };
+        let mut total_emitted = 0usize;
+        for round in 0..MAX_VIDEO_FRAME_ROUNDS_PER_PASS {
+            let pumped = self.pump_ready_deferred_tcp_reads(tid, now);
+            if round > 0 && !pumped {
+                break;
+            }
+            let budget = MAX_QUIC_TRANSMITS_PER_PASS.saturating_sub(total_emitted);
+            if budget == 0 {
+                if let Some(t) = self.tunnels.get_mut(tid) {
+                    t.more_tx_pending = true;
+                }
+                break;
+            }
+            let emitted = self.flush_quic_transmits_into(tid, outer, now, &mut tx_batch, budget);
+            total_emitted += emitted;
+            let more_pending = self.tunnels.get(tid).is_some_and(|t| t.more_tx_pending);
+            if more_pending || (round > 0 && emitted == 0) {
+                break;
+            }
+            let has_more_ready = self.has_deferred_tcp_read_for(tid)
+                && self
+                    .tunnels
+                    .get(tid)
+                    .and_then(|t| t.quic.as_ref())
+                    .is_none_or(|q| q.burst_drained);
+            if !has_more_ready {
+                break;
+            }
+        }
+        Self::finish_tx_batch(outer, now, &mut tx_batch);
+        if let Some(t) = self.tunnels.get_mut(tid) {
+            t.tx_batch = tx_batch;
+        }
 
-        // 5) 计算精确的下一次唤醒时间（支持 2ms Brutal Pacer 定时唤醒）
-        let has_ready_tcp_read = !self.deferred_tcp_reads.is_empty()
-            && self.quic.as_ref().is_none_or(|q| q.burst_drained);
-        if self.more_tx_pending || has_ready_tcp_read || !self.deferred_quic_reads.is_empty() {
+        // 5) 计算精确的下一次唤醒时间（配合 Linux timerfd 实现 1.6ms Brutal Pacer 精准唤醒）
+        let has_ready_tcp_read = self.has_deferred_tcp_read_for(tid)
+            && self
+                .tunnels
+                .get(tid)
+                .and_then(|t| t.quic.as_ref())
+                .is_none_or(|q| q.burst_drained);
+        let has_deferred_quic = self.deferred_quic_reads.iter().any(|(t, _)| *t == tid);
+        let more_tx_pending = self.tunnels.get(tid).is_some_and(|t| t.more_tx_pending);
+        if more_tx_pending || has_ready_tcp_read || has_deferred_quic {
             return Duration::ZERO;
         }
         let mut wait = Duration::from_secs(1);
-        if let Some(ref mut q) = self.quic {
-            if let Some(t) = q.conn.poll_timeout() {
-                wait = wait.min(t.saturating_duration_since(now));
+        if let Some(t) = self.tunnels.get_mut(tid) {
+            if let Some(ref mut q) = t.quic {
+                if let Some(tm) = q.conn.poll_timeout() {
+                    wait = wait.min(tm.saturating_duration_since(now));
+                }
+                if !q.burst_drained {
+                    let fuse = q.burst_started_at + Duration::from_millis(120);
+                    wait = wait.min(fuse.saturating_duration_since(now));
+                }
+            } else if allow_connect && outer_ready {
+                wait = wait.min(QUIC_RECONNECT_BACKOFF);
             }
-            if !q.burst_drained && !self.deferred_tcp_reads.is_empty() {
-                let fuse = q.burst_started_at + Duration::from_millis(120);
-                wait = wait.min(fuse.saturating_duration_since(now));
-            }
-        } else if outer_ready {
-            wait = wait.min(QUIC_RECONNECT_BACKOFF);
         }
         wait
     }
 
-    fn flush_quic_transmits(&mut self, outer: &mut ClientOuter<'_>, now: Instant) {
-        self.more_tx_pending = false;
-        let full_pkt_thresh = (self.inner_mtu as usize).saturating_sub(64);
-        let Some(ref mut q) = self.quic else {
+    #[inline]
+    fn has_deferred_tcp_read_for(&self, tid: u64) -> bool {
+        self.deferred_tcp_reads.iter().any(|tok| {
+            matches!(
+                self.tcp_conns.get(tok).map(|c| &c.state),
+                Some(ClientTcpState::Relaying { tunnel_id, .. }) if *tunnel_id == tid
+            )
+        })
+    }
+
+    fn pump_ready_deferred_tcp_reads(&mut self, tid: u64, now: Instant) -> bool {
+        let n_tcp = self.deferred_tcp_reads.len();
+        if n_tcp == 0 {
+            return false;
+        }
+        let mut pumped = false;
+        for _ in 0..n_tcp {
+            if self
+                .tunnels
+                .get(tid)
+                .and_then(|t| t.quic.as_ref())
+                .is_some_and(|q| !q.burst_drained)
+            {
+                break;
+            }
+            if let Some(tok) = self.deferred_tcp_reads.pop_front() {
+                let belongs = matches!(
+                    self.tcp_conns.get(&tok).map(|c| &c.state),
+                    Some(ClientTcpState::Relaying { tunnel_id, .. }) if *tunnel_id == tid
+                );
+                if belongs {
+                    self.handle_tcp_readable(tok, now);
+                    pumped = true;
+                } else if self.tcp_conns.contains_key(&tok) {
+                    self.deferred_tcp_reads.push_back(tok);
+                }
+            }
+        }
+        pumped
+    }
+
+    fn finish_tx_batch(
+        outer: &mut ClientOuter<'_>,
+        now: Instant,
+        tx_batch: &mut Option<UdpSendBatch>,
+    ) {
+        let Some(ref mut batch) = tx_batch else {
             return;
+        };
+        if batch.is_empty() {
+            return;
+        }
+        match outer {
+            ClientOuter::Forward { worker, tunnel_key } => {
+                if let Some(up_tok) = worker.ready_upstream_tok(*tunnel_key) {
+                    let _ = worker.flush_batched_uplink(up_tok, batch, now);
+                } else {
+                    batch.clear();
+                }
+            }
+            ClientOuter::Reverse { worker, flow_addr } => {
+                if let Some(fa) = *flow_addr {
+                    let (sp, sb) = batch.flush_to(&worker.listen_sock);
+                    if sp > 0 {
+                        worker.record_downlink_sent(fa, sp, sb, now);
+                    }
+                } else {
+                    batch.clear();
+                }
+            }
+        }
+    }
+
+    fn flush_quic_transmits_into(
+        &mut self,
+        tid: u64,
+        outer: &mut ClientOuter<'_>,
+        now: Instant,
+        tx_batch: &mut Option<UdpSendBatch>,
+        max_pkts: usize,
+    ) -> usize {
+        let Some(tunnel) = self.tunnels.get_mut(tid) else {
+            return 0;
+        };
+        let full_pkt_thresh = (tunnel.inner_mtu as usize).saturating_sub(64);
+        let Some(ref mut q) = tunnel.quic else {
+            return 0;
         };
         let mut count = 0usize;
         let mut saw_tail = false;
@@ -1682,8 +2071,8 @@ impl ProxyClientEngine {
         match outer {
             ClientOuter::Forward { worker, tunnel_key } => {
                 let ready_tok = worker.ready_upstream_tok(*tunnel_key);
-                if let (Some(up_tok), Some(mut tx_batch)) = (ready_tok, self.tx_batch.take()) {
-                    while count < MAX_QUIC_TRANSMITS_PER_PASS {
+                if let (Some(up_tok), Some(ref mut batch)) = (ready_tok, tx_batch) {
+                    while count < max_pkts {
                         self.tx_scratch.clear();
                         let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                             break;
@@ -1699,22 +2088,18 @@ impl ProxyClientEngine {
                             saw_tail = true;
                         }
                         let pkt = &self.tx_scratch[..t.size];
-                        if tx_batch.is_full() {
-                            let _ = worker.flush_batched_uplink(up_tok, &mut tx_batch, now);
+                        if batch.is_full() {
+                            let _ = worker.flush_batched_uplink(up_tok, batch, now);
                         }
-                        if let Some(slot) = tx_batch.next_slot_mut() {
+                        if let Some(slot) = batch.next_slot_mut() {
                             if let Some(wn) = worker.wrap_uplink_into_slot(up_tok, pkt, slot, now) {
-                                tx_batch.commit_slot(wn, pkt.len() as u64, None);
+                                batch.commit_slot(wn, pkt.len() as u64, None);
                             }
                         }
                         count += 1;
                     }
-                    if !tx_batch.is_empty() {
-                        let _ = worker.flush_batched_uplink(up_tok, &mut tx_batch, now);
-                    }
-                    self.tx_batch = Some(tx_batch);
                 } else {
-                    while count < MAX_QUIC_TRANSMITS_PER_PASS {
+                    while count < max_pkts {
                         self.tx_scratch.clear();
                         let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                             break;
@@ -1736,12 +2121,10 @@ impl ProxyClientEngine {
             }
             ClientOuter::Reverse { worker, flow_addr } => {
                 let Some(fa) = *flow_addr else {
-                    return;
+                    return 0;
                 };
-                if let Some(mut tx_batch) = self.tx_batch.take() {
-                    let mut sent_pkts = 0usize;
-                    let mut sent_bytes = 0u64;
-                    while count < MAX_QUIC_TRANSMITS_PER_PASS {
+                if let Some(ref mut batch) = tx_batch {
+                    while count < max_pkts {
                         self.tx_scratch.clear();
                         let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                             break;
@@ -1757,31 +2140,23 @@ impl ProxyClientEngine {
                             saw_tail = true;
                         }
                         let pkt = &self.tx_scratch[..t.size];
-                        if tx_batch.is_full() {
-                            let (sp, sb) = tx_batch.flush_to(&worker.listen_sock);
-                            sent_pkts += sp;
-                            sent_bytes += sb;
+                        if batch.is_full() {
+                            let (sp, sb) = batch.flush_to(&worker.listen_sock);
+                            if sp > 0 {
+                                worker.record_downlink_sent(fa, sp, sb, now);
+                            }
                         }
-                        if let Some(slot) = tx_batch.next_slot_mut() {
+                        if let Some(slot) = batch.next_slot_mut() {
                             if let Some((wn, peer_addr)) =
                                 worker.encrypt_downlink_into_slot(fa, pkt, slot, now)
                             {
-                                tx_batch.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
+                                batch.commit_slot(wn, pkt.len() as u64, Some(peer_addr));
                             }
                         }
                         count += 1;
                     }
-                    if !tx_batch.is_empty() {
-                        let (sp, sb) = tx_batch.flush_to(&worker.listen_sock);
-                        sent_pkts += sp;
-                        sent_bytes += sb;
-                    }
-                    if sent_pkts > 0 {
-                        worker.record_downlink_sent(fa, sent_pkts, sent_bytes, now);
-                    }
-                    self.tx_batch = Some(tx_batch);
                 } else {
-                    while count < MAX_QUIC_TRANSMITS_PER_PASS {
+                    while count < max_pkts {
                         self.tx_scratch.clear();
                         let Some(t) = q.conn.poll_transmit(now, 1, &mut self.tx_scratch) else {
                             break;
@@ -1802,8 +2177,8 @@ impl ProxyClientEngine {
                 }
             }
         }
-        if count >= MAX_QUIC_TRANSMITS_PER_PASS {
-            self.more_tx_pending = true;
+        if count >= max_pkts {
+            tunnel.more_tx_pending = true;
         } else if !q.burst_drained
             && (saw_tail
                 || q.burst_bytes_rem == 0
@@ -1812,6 +2187,7 @@ impl ProxyClientEngine {
             q.burst_drained = true;
             q.burst_bytes_rem = 0;
         }
+        count
     }
 
     fn shutdown_all(&mut self) {
@@ -1830,6 +2206,202 @@ impl ProxyClientEngine {
         }
         self.udp_sess_by_tok.clear();
     }
+}
+
+struct StandbyOuter {
+    client: ClientWorker,
+    tid: u64,
+    deadline: Instant,
+    target_addr: SocketAddr,
+    up_bps: u64,
+    down_bps: u64,
+}
+
+struct DrainingOuter {
+    client: ClientWorker,
+    tid: u64,
+    deadline: Instant,
+}
+
+fn pick_free_token_slot(
+    primary: &ClientWorker,
+    standby: Option<&StandbyOuter>,
+    draining: &[DrainingOuter],
+) -> Option<usize> {
+    (0..MAX_HOT_SWITCH_CLIENT_SLOTS).find(|&slot| {
+        primary.token_slot() != slot
+            && standby.is_none_or(|s| s.client.token_slot() != slot)
+            && draining.iter().all(|d| d.client.token_slot() != slot)
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn trigger_proxy_client_hot_switch(
+    path: &str,
+    cpu: &CpuAccelInfo,
+    shared_poll: &SharedPoll,
+    telemetry: &Option<Arc<TelemetryHub>>,
+    tunnel_key: SocketAddr,
+    timeout_secs: u64,
+    primary_client: &ClientWorker,
+    standby_slot: &mut Option<StandbyOuter>,
+    draining_slots: &mut Vec<DrainingOuter>,
+    engine: &mut ProxyClientEngine,
+    now: Instant,
+) {
+    let hot = match load_proxy_client_hot_config(path) {
+        Ok(c) => c,
+        Err(e) => {
+            log(
+                "proxy-client",
+                &format!("HOT-SWITCH ignored (invalid config): {}", e),
+            );
+            return;
+        }
+    };
+
+    let base = primary_client.config();
+    let mut new_cfg = base.clone();
+
+    new_cfg.server_addr = match (&hot.server_host, hot.server_port) {
+        (Some(h), Some(p)) => match resolve_host_port(h, p) {
+            Ok(a) => a,
+            Err(e) => {
+                log("proxy-client", &format!("HOT-SWITCH ignored: {}", e));
+                return;
+            }
+        },
+        (Some(h), None) => match resolve_host_port(h, base.server_addr.port()) {
+            Ok(a) => a,
+            Err(e) => {
+                log("proxy-client", &format!("HOT-SWITCH ignored: {}", e));
+                return;
+            }
+        },
+        (None, Some(p)) => SocketAddr::new(base.server_addr.ip(), p),
+        (None, None) => base.server_addr,
+    };
+
+    if let Some(ref psk_path) = hot.psk_file {
+        match read_psk_file(psk_path) {
+            Ok(k) => new_cfg.psk = k,
+            Err(e) => {
+                log("proxy-client", &format!("HOT-SWITCH ignored: {}", e));
+                return;
+            }
+        }
+    } else if let Some(ref psk_str) = hot.psk {
+        new_cfg.psk = psk_str.as_bytes().to_vec();
+    }
+
+    if let Some(scope) = hot.stun_scope {
+        new_cfg.stun_scope = if scope.is_empty() { None } else { Some(scope) };
+    }
+    if let Some(cipher) = hot.cipher_pref {
+        new_cfg.cipher_pref = cipher;
+    }
+    if let Some(ver) = hot.dtls_min_version {
+        new_cfg.dtls_min_version = ver;
+    }
+    if let Some(lh) = hot.lane_hunt {
+        new_cfg.lane_hunt.enabled = lh;
+    }
+    if let Some(p) = hot.lane_probes {
+        new_cfg.lane_hunt.probes = p;
+    }
+    if let Some(r) = hot.lane_rounds {
+        new_cfg.lane_hunt.max_rounds = r;
+    }
+    new_cfg.lane_hunt = new_cfg.lane_hunt.normalized();
+    if let Some(rot) = hot.rotate_interval_secs {
+        new_cfg.rotate_interval_secs = rot;
+    }
+
+    let new_up = hot.up_bps.unwrap_or_else(|| engine.primary_up_bps());
+    let new_down = hot.down_bps.unwrap_or_else(|| engine.primary_down_bps());
+
+    let unchanged = new_cfg.server_addr == base.server_addr
+        && new_cfg.psk == base.psk
+        && new_cfg.stun_scope == base.stun_scope
+        && new_cfg.cipher_pref == base.cipher_pref
+        && new_cfg.dtls_min_version == base.dtls_min_version
+        && new_cfg.lane_hunt.enabled == base.lane_hunt.enabled
+        && new_cfg.lane_hunt.probes == base.lane_hunt.probes
+        && new_cfg.lane_hunt.max_rounds == base.lane_hunt.max_rounds
+        && new_cfg.rotate_interval_secs == base.rotate_interval_secs
+        && new_up == engine.primary_up_bps()
+        && new_down == engine.primary_down_bps();
+    if unchanged {
+        log("proxy-client", "HOT-SWITCH config unchanged (no-op)");
+        return;
+    }
+
+    // 若上一次预热尚未完成，先取消旧预热槽
+    if let Some(mut old_sb) = standby_slot.take() {
+        old_sb.client.graceful_shutdown_all();
+        engine.abort_standby();
+    }
+
+    // 若排空队列已满，提前淘汰最老的一条排空隧道腾出令牌槽
+    if pick_free_token_slot(primary_client, None, draining_slots).is_none()
+        && !draining_slots.is_empty()
+    {
+        let mut oldest = draining_slots.remove(0);
+        oldest.client.graceful_shutdown_all();
+        engine.drop_draining_tunnel(oldest.tid);
+    }
+    let Some(token_slot) = pick_free_token_slot(primary_client, None, draining_slots) else {
+        log(
+            "proxy-client",
+            "HOT-SWITCH skipped: no free client token slot available",
+        );
+        return;
+    };
+
+    let target_addr = new_cfg.server_addr;
+    let wan_mtu = new_cfg.wan_mtu;
+    let udp_batch = new_cfg.udp_batch;
+    let dtls_pool = build_dimpl_config_pool_for(
+        new_cfg.cipher_pref,
+        cpu,
+        true,
+        wan_mtu,
+        outer_udp_hdr_len(target_addr),
+    );
+    let sb_client = ClientWorker::new_for_proxy_client_slot(
+        0,
+        new_cfg,
+        dtls_pool,
+        shared_poll.clone(),
+        telemetry.clone(),
+        tunnel_key,
+        token_slot,
+    );
+    let sb_tid = engine.start_standby(target_addr, wan_mtu, udp_batch, new_up, new_down);
+    let dur = Duration::from_secs(if timeout_secs == 0 {
+        DEFAULT_HOT_SWITCH_TIMEOUT_SECS
+    } else {
+        timeout_secs
+    });
+    *standby_slot = Some(StandbyOuter {
+        client: sb_client,
+        tid: sb_tid,
+        deadline: now + dur,
+        target_addr,
+        up_bps: new_up,
+        down_bps: new_down,
+    });
+    log(
+        "proxy-client",
+        &format!(
+            "HOT-SWITCH pre-warming standby#{} -> {} (up={:.0}Mbps down={:.0}Mbps timeout={}s)",
+            sb_tid,
+            target_addr,
+            new_up as f64 / 1e6,
+            new_down as f64 / 1e6,
+            dur.as_secs()
+        ),
+    );
 }
 
 fn socks5_reply(rep: u8, bind: Option<SocketAddr>) -> Vec<u8> {
@@ -1857,6 +2429,9 @@ fn socks5_reply(rep: u8, bind: Option<SocketAddr>) -> Vec<u8> {
 pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
     let quiet = cfg.client.quiet;
     let stop = cfg.client.stop.clone();
+    let hot_config_path = cfg.hot_config_path.clone();
+    let reload_trigger = cfg.reload_trigger.clone();
+    let hot_switch_timeout_secs = cfg.hot_switch_timeout_secs;
     PROXY_QUIET.with(|q| q.set(quiet));
     if cfg.client.workers > 1 && !quiet {
         eprintln!("[proxy-client] WARN: embedded proxy client uses a single persistent tunnel; clamping --workers to 1.");
@@ -1882,6 +2457,8 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
 
     let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, quiet, stop.is_some());
+    register_reload_poll(&poll, quiet, hot_config_path.is_some());
+    let mut fine_timer = FineTimer::new(poll.registry());
     let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
 
     let mut engine = ProxyClientEngine::new(shared_poll.clone(), &cfg)?;
@@ -1897,8 +2474,9 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
             .iter()
             .map(|f| format!("{}->{}", f.listen, f.target))
             .collect();
+        let hot_desc = hot_config_path.as_deref().unwrap_or("off");
         println!(
-            "[proxy-client] CPU arch={} hw_accel=[{}] recommended={} server={} socks5={} tcp_fwds=[{}] brutal={:.0}/{:.0}Mbps inner_mtu={} dtls=dimpl-{} udp_batch={}",
+            "[proxy-client] CPU arch={} hw_accel=[{}] recommended={} server={} socks5={} tcp_fwds=[{}] brutal={:.0}/{:.0}Mbps inner_mtu={} dtls=dimpl-{} udp_batch={} hot_config={}",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
@@ -1907,22 +2485,25 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
             fwds_desc.join(","),
             cfg.up_bps as f64 / 1e6,
             cfg.down_bps as f64 / 1e6,
-            engine.inner_mtu,
+            engine.primary_inner_mtu(),
             cfg.client.dtls_min_version.as_str(),
             format_udp_batch_mode(cfg.client.udp_batch),
+            hot_desc,
         );
     }
 
     let stats_dur = Duration::from_secs(cfg.client.stats_interval_secs);
     let stats_enabled = cfg.client.stats_interval_secs > 0;
-    let mut client = ClientWorker::new_for_proxy_client(
+    let mut primary_client = ClientWorker::new_for_proxy_client(
         0,
         cfg.client,
         dtls_pool,
-        shared_poll,
+        shared_poll.clone(),
         telemetry.clone(),
         tunnel_key,
     );
+    let mut standby_slot: Option<StandbyOuter> = None;
+    let mut draining_slots: Vec<DrainingOuter> = Vec::new();
 
     let telemetry_dur = telemetry
         .as_ref()
@@ -1932,19 +2513,6 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
     let mut last_stats = last_telemetry;
     let mut last_gc = last_telemetry;
     let mut events = Events::with_capacity(MIO_EVENTS_CAP);
-    let mut had_ready_outer = false;
-
-    let sync_outer_quic =
-        |client: &ClientWorker, engine: &mut ProxyClientEngine, had_ready_outer: &mut bool| {
-            let is_ready = client.ready_upstream_tok(tunnel_key).is_some();
-            if is_ready {
-                *had_ready_outer = true;
-            } else if *had_ready_outer {
-                *had_ready_outer = false;
-                engine.reset_quic_conn("outer tunnel disconnected (non-MBB)");
-                engine.last_quic_attempt = None;
-            }
-        };
 
     loop {
         if is_shutdown_requested(stop.as_ref(), quiet) {
@@ -1952,36 +2520,189 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
         }
 
         let now = Instant::now();
-        client.ensure_persistent_tunnel(tunnel_key, now);
-        let (w_outer, mut standby_promoted, mut standby_ready) = client.process_timers_relay(now);
-        sync_outer_quic(&client, &mut engine, &mut had_ready_outer);
-        let w_inner = engine.drive(
+        if let Some(ref hot_path) = hot_config_path {
+            if take_reload_requested(reload_trigger.as_ref(), quiet) {
+                trigger_proxy_client_hot_switch(
+                    hot_path,
+                    &cpu,
+                    &shared_poll,
+                    &telemetry,
+                    tunnel_key,
+                    hot_switch_timeout_secs,
+                    &primary_client,
+                    &mut standby_slot,
+                    &mut draining_slots,
+                    &mut engine,
+                    now,
+                );
+            }
+        }
+
+        // 1) 驱动主隧道
+        let primary_tid = engine.primary_id();
+        primary_client.ensure_persistent_tunnel(tunnel_key, now);
+        let (w_outer, mut p_promoted, mut p_ready) = primary_client.process_timers_relay(now);
+        engine.sync_outer_for_tunnel(
+            primary_tid,
+            primary_client.ready_upstream_tok(tunnel_key).is_some(),
+            true,
+        );
+        let w_inner = engine.drive_tunnel(
+            primary_tid,
             &mut ClientOuter::Forward {
-                worker: &mut client,
+                worker: &mut primary_client,
                 tunnel_key,
             },
             now,
+            true,
         );
+        let mut wait = w_outer.min(w_inner);
+
+        // 2) 驱动 Make-Before-Break 预热备隧道，并判定就绪原子切流或超时自动回滚
+        let mut sb_promoted = Vec::new();
+        let mut sb_ready = Vec::new();
+        let mut promote_standby_now = false;
+        let mut abort_standby_now = false;
+        if let Some(ref mut sb) = standby_slot {
+            sb.client.ensure_persistent_tunnel(tunnel_key, now);
+            let (ws_out, sp, sr) = sb.client.process_timers_relay(now);
+            sb_promoted = sp;
+            sb_ready = sr;
+            let ws_in = engine.drive_tunnel(
+                sb.tid,
+                &mut ClientOuter::Forward {
+                    worker: &mut sb.client,
+                    tunnel_key,
+                },
+                now,
+                true,
+            );
+            wait = wait
+                .min(ws_out)
+                .min(ws_in)
+                .min(sb.deadline.saturating_duration_since(now));
+            if engine.is_standby_ready() {
+                promote_standby_now = true;
+            } else if now >= sb.deadline {
+                abort_standby_now = true;
+            }
+        }
+        if promote_standby_now {
+            if let Some(sb) = standby_slot.take() {
+                let old_client = std::mem::replace(&mut primary_client, sb.client);
+                if let Some((old_tid, remaining)) = engine.promote_standby() {
+                    if remaining > 0 {
+                        draining_slots.push(DrainingOuter {
+                            client: old_client,
+                            tid: old_tid,
+                            deadline: now + Duration::from_secs(HOT_SWITCH_DRAIN_CAP_SECS),
+                        });
+                    } else {
+                        let mut oc = old_client;
+                        oc.graceful_shutdown_all();
+                    }
+                    log(
+                        "proxy-client",
+                        &format!(
+                            "HOT-SWITCH PROMOTED tunnel#{} -> {} (up={:.0}Mbps down={:.0}Mbps, draining_old_streams={})",
+                            sb.tid,
+                            sb.target_addr,
+                            sb.up_bps as f64 / 1e6,
+                            sb.down_bps as f64 / 1e6,
+                            remaining
+                        ),
+                    );
+                }
+                wait = Duration::ZERO;
+            }
+        } else if abort_standby_now {
+            if let Some(mut sb) = standby_slot.take() {
+                sb.client.graceful_shutdown_all();
+                engine.abort_standby();
+                log(
+                    "proxy-client",
+                    &format!(
+                        "HOT-SWITCH ABORTED (standby#{} -> {} handshake timeout); keeping active tunnel {}",
+                        sb.tid,
+                        sb.target_addr,
+                        primary_client.config().server_addr
+                    ),
+                );
+            }
+        }
+
+        // 3) 驱动排空中的旧隧道（已有 TCP 流继续满速完成，归零或到宽限期后优雅关闭）
+        type DrainPendingEvents = (Vec<(Token, SocketAddr)>, Vec<(Token, SocketAddr)>);
+        let mut drain_states: Vec<DrainPendingEvents> = Vec::with_capacity(draining_slots.len());
+        let mut finished_drains = Vec::new();
+        for (idx, d) in draining_slots.iter_mut().enumerate() {
+            let (wd_out, dp, dr) = d.client.process_timers_relay(now);
+            engine.sync_outer_for_tunnel(
+                d.tid,
+                d.client.ready_upstream_tok(tunnel_key).is_some(),
+                false,
+            );
+            let wd_in = engine.drive_tunnel(
+                d.tid,
+                &mut ClientOuter::Forward {
+                    worker: &mut d.client,
+                    tunnel_key,
+                },
+                now,
+                false,
+            );
+            wait = wait
+                .min(wd_out)
+                .min(wd_in)
+                .min(d.deadline.saturating_duration_since(now));
+            drain_states.push((dp, dr));
+            if engine.active_stream_count_for(d.tid) == 0
+                || !engine.has_draining_quic(d.tid)
+                || now >= d.deadline
+            {
+                finished_drains.push(idx);
+            }
+        }
+        for idx in finished_drains.into_iter().rev() {
+            let mut d = draining_slots.remove(idx);
+            drain_states.remove(idx);
+            let leftover = engine.active_stream_count_for(d.tid);
+            d.client.graceful_shutdown_all();
+            engine.drop_draining_tunnel(d.tid);
+            log(
+                "proxy-client",
+                &format!(
+                    "HOT-SWITCH old tunnel#{} drained cleanly (forced_closed={})",
+                    d.tid, leftover
+                ),
+            );
+        }
 
         if now.duration_since(last_gc) >= Duration::from_secs(2) {
             last_gc = now;
             engine.udp_reassembler.gc(now);
         }
 
-        let mut wait = w_outer.min(w_inner);
         if telemetry.is_some() && wait > telemetry_dur {
             wait = telemetry_dur;
         }
         let quiet_cap = Duration::from_millis(WORKER_QUIET_STOP_POLL_MS);
-        if stop.is_some() && quiet && wait > quiet_cap {
+        if (stop.is_some() || reload_trigger.is_some()) && quiet && wait > quiet_cap {
             wait = quiet_cap;
         }
 
-        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = fine_timer.arm_and_poll(&mut poll, &mut events, wait) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
             engine.shutdown_all();
+            primary_client.graceful_shutdown_all();
+            if let Some(mut sb) = standby_slot.take() {
+                sb.client.graceful_shutdown_all();
+            }
+            for mut d in draining_slots.drain(..) {
+                d.client.graceful_shutdown_all();
+            }
             if let Some(ref th) = telemetry {
                 th.shutdown();
             }
@@ -1992,52 +2713,137 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
         }
 
         let now = Instant::now();
-        let mut graceful_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
+        let primary_tid = engine.primary_id();
+        let mut p_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut sb_reconnects: Vec<(Token, SocketAddr)> = Vec::new();
+        let mut drain_reconnects: Vec<Vec<(Token, SocketAddr)>> =
+            vec![Vec::new(); draining_slots.len()];
+        #[cfg(unix)]
+        let mut saw_reload_pipe = false;
+
         for ev in events.iter() {
             let tok = ev.token();
             #[cfg(unix)]
             if tok == SHUTDOWN_PIPE_TOKEN {
                 continue;
             }
+            #[cfg(unix)]
+            if tok == RELOAD_PIPE_TOKEN {
+                drain_reload_pipe();
+                saw_reload_pipe = true;
+                continue;
+            }
             if tok == WAKE_TOKEN {
                 continue;
             }
-            if tok.0 >= PROXY_CLIENT_TOK_BASE && tok.0 < usize::MAX - 2 {
+            if tok == PROXY_TIMER_TOKEN {
+                fine_timer.drain();
+                continue;
+            }
+            if tok.0 >= PROXY_CLIENT_TOK_BASE && tok.0 < usize::MAX - 5 {
                 engine.handle_local_event(ev, now);
-            } else {
-                client.handle_event_proxy(
+            } else if primary_client.owns_token(tok) {
+                engine.set_rx_dispatch_tunnel(primary_tid);
+                primary_client.handle_event_proxy(
                     tok,
                     &mut engine,
                     now,
-                    &mut standby_ready,
-                    &mut standby_promoted,
-                    &mut graceful_reconnects,
+                    &mut p_ready,
+                    &mut p_promoted,
+                    &mut p_reconnects,
                 );
+            } else if standby_slot
+                .as_ref()
+                .is_some_and(|sb| sb.client.owns_token(tok))
+            {
+                if let Some(ref mut sb) = standby_slot {
+                    engine.set_rx_dispatch_tunnel(sb.tid);
+                    sb.client.handle_event_proxy(
+                        tok,
+                        &mut engine,
+                        now,
+                        &mut sb_ready,
+                        &mut sb_promoted,
+                        &mut sb_reconnects,
+                    );
+                }
+            } else {
+                for (idx, d) in draining_slots.iter_mut().enumerate() {
+                    if d.client.owns_token(tok) {
+                        engine.set_rx_dispatch_tunnel(d.tid);
+                        if let Some((ref mut dp, ref mut dr)) = drain_states.get_mut(idx) {
+                            d.client.handle_event_proxy(
+                                tok,
+                                &mut engine,
+                                now,
+                                dr,
+                                dp,
+                                &mut drain_reconnects[idx],
+                            );
+                        }
+                        break;
+                    }
+                }
+            }
+        }
+        engine.set_rx_dispatch_tunnel(primary_tid);
+
+        primary_client.process_post_events_relay(now, p_ready, p_promoted, p_reconnects);
+        engine.sync_outer_for_tunnel(
+            primary_tid,
+            primary_client.ready_upstream_tok(tunnel_key).is_some(),
+            true,
+        );
+        primary_client.ensure_persistent_tunnel(tunnel_key, Instant::now());
+
+        if let Some(ref mut sb) = standby_slot {
+            sb.client
+                .process_post_events_relay(now, sb_ready, sb_promoted, sb_reconnects);
+            sb.client
+                .ensure_persistent_tunnel(tunnel_key, Instant::now());
+        }
+        for (idx, d) in draining_slots.iter_mut().enumerate() {
+            if let Some((dp, dr)) = drain_states.get_mut(idx) {
+                let dp = std::mem::take(dp);
+                let dr = std::mem::take(dr);
+                let rec = std::mem::take(&mut drain_reconnects[idx]);
+                d.client.process_post_events_relay(now, dr, dp, rec);
             }
         }
 
-        client.process_post_events_relay(now, standby_ready, standby_promoted, graceful_reconnects);
-        sync_outer_quic(&client, &mut engine, &mut had_ready_outer);
-        client.ensure_persistent_tunnel(tunnel_key, Instant::now());
-        let _ = engine.drive(
-            &mut ClientOuter::Forward {
-                worker: &mut client,
-                tunnel_key,
-            },
-            Instant::now(),
-        );
+        #[cfg(unix)]
+        if saw_reload_pipe {
+            if let Some(ref hot_path) = hot_config_path {
+                let _ = take_reload_requested(reload_trigger.as_ref(), quiet);
+                trigger_proxy_client_hot_switch(
+                    hot_path,
+                    &cpu,
+                    &shared_poll,
+                    &telemetry,
+                    tunnel_key,
+                    hot_switch_timeout_secs,
+                    &primary_client,
+                    &mut standby_slot,
+                    &mut draining_slots,
+                    &mut engine,
+                    Instant::now(),
+                );
+            }
+        }
 
         let post_now = Instant::now();
         if let Some(ref th) = telemetry {
             if post_now.duration_since(last_telemetry) >= telemetry_dur {
                 last_telemetry = post_now;
-                th.update_worker(0, client.build_worker_snapshot());
+                th.update_worker(0, primary_client.build_worker_snapshot());
             }
         }
         if stats_enabled && post_now.duration_since(last_stats) >= stats_dur {
             last_stats = post_now;
-            let snap = client.build_worker_snapshot();
+            let snap = primary_client.build_worker_snapshot();
             let q_rtt = engine
+                .tunnels
+                .primary
                 .quic
                 .as_ref()
                 .map(|q| q.conn.rtt().as_secs_f64() * 1000.0)
@@ -2045,11 +2851,12 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
             log(
                 "proxy-client",
                 &format!(
-                    "stats outer_sport={} quic_rtt={:.1}ms tcp_active={} streams_total={} udp_tx={} udp_rx={} tx={:.1}KB rx={:.1}KB loss={:.1}%",
+                    "stats outer_sport={} quic_rtt={:.1}ms tcp_active={} streams_total={} draining_tunnels={} udp_tx={} udp_rx={} tx={:.1}KB rx={:.1}KB loss={:.1}%",
                     snap.active_up_sport,
                     q_rtt,
                     engine.tcp_conns.len(),
                     engine.total_streams_opened,
+                    draining_slots.len(),
                     engine.total_udp_tx,
                     engine.total_udp_rx,
                     snap.tx_bytes_total as f64 / 1024.0,
@@ -2061,7 +2868,13 @@ pub fn run_proxy_client(mut cfg: ProxyClientConfig) -> std::io::Result<()> {
     }
 
     engine.shutdown_all();
-    client.graceful_shutdown_all();
+    primary_client.graceful_shutdown_all();
+    if let Some(mut sb) = standby_slot.take() {
+        sb.client.graceful_shutdown_all();
+    }
+    for mut d in draining_slots.drain(..) {
+        d.client.graceful_shutdown_all();
+    }
     if let Some(ref th) = telemetry {
         th.shutdown();
     }
@@ -2100,6 +2913,7 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
 
     let mut poll = Poll::new()?;
     register_shutdown_poll(&poll, quiet, stop.is_some());
+    let mut fine_timer = FineTimer::new(poll.registry());
     let shared_poll = SharedPoll::new(poll.registry().try_clone()?);
 
     let mut engine = ProxyClientEngine::new_reverse(shared_poll.clone(), &cfg)?;
@@ -2124,7 +2938,7 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             fwds_desc.join(","),
             cfg.up_bps as f64 / 1e6,
             cfg.down_bps as f64 / 1e6,
-            engine.inner_mtu,
+            engine.primary_inner_mtu(),
             cfg.server.dtls_min_version.as_str(),
             format_udp_batch_mode(cfg.server.udp_batch),
         );
@@ -2160,10 +2974,11 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
     let sync_active_flow = |ingress: &mut ServerWorker,
                             engine: &mut ProxyClientEngine,
                             active_flow: &mut Option<SocketAddr>| {
+        let primary_tid = engine.primary_id();
         for closed in ingress.drain_closed_relay_flows() {
             if *active_flow == Some(closed) {
                 *active_flow = None;
-                engine.reset_quic_conn("reverse exit tunnel closed");
+                engine.reset_quic_conn(primary_tid, "reverse exit tunnel closed");
             }
         }
         let cur = ingress.active_ready_relay_flow();
@@ -2171,10 +2986,13 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             Some(new_fa) => {
                 if *active_flow != Some(new_fa) {
                     if active_flow.is_some() {
-                        engine.reset_quic_conn("reverse exit reconnected on new session");
+                        engine.reset_quic_conn(
+                            primary_tid,
+                            "reverse exit reconnected on new session",
+                        );
                     }
                     *active_flow = Some(new_fa);
-                    engine.last_quic_attempt = None;
+                    engine.tunnels.primary.last_quic_attempt = None;
                     log(
                         "proxy-rev-client",
                         &format!("reverse exit agent attached flow={}", new_fa),
@@ -2184,7 +3002,7 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             None => {
                 if active_flow.is_some() {
                     *active_flow = None;
-                    engine.reset_quic_conn("reverse exit tunnel closing");
+                    engine.reset_quic_conn(primary_tid, "reverse exit tunnel closing");
                 }
             }
         }
@@ -2196,16 +3014,20 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
         }
 
         let now = Instant::now();
+        let primary_tid = engine.primary_id();
+        engine.set_rx_dispatch_tunnel(primary_tid);
         ingress.drain_worker_cmds_with(now, Some(ServerHook::ProxyClient(&mut engine)));
         let w_outer = ingress.process_timers_with(now, Some(ServerHook::ProxyClient(&mut engine)));
         sync_active_flow(&mut ingress, &mut engine, &mut active_flow);
 
-        let w_inner = engine.drive(
+        let w_inner = engine.drive_tunnel(
+            primary_tid,
             &mut ClientOuter::Reverse {
                 worker: &mut ingress,
                 flow_addr: active_flow,
             },
             now,
+            true,
         );
 
         if now.duration_since(last_gc) >= Duration::from_secs(2) {
@@ -2222,7 +3044,7 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             wait = quiet_cap;
         }
 
-        if let Err(e) = poll.poll(&mut events, Some(wait)) {
+        if let Err(e) = fine_timer.arm_and_poll(&mut poll, &mut events, wait) {
             if e.kind() == ErrorKind::Interrupted {
                 continue;
             }
@@ -2246,22 +3068,20 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             if tok == WAKE_TOKEN {
                 continue;
             }
+            if tok == PROXY_TIMER_TOKEN {
+                fine_timer.drain();
+                continue;
+            }
             if tok == LISTEN_TOKEN {
+                engine.set_rx_dispatch_tunnel(primary_tid);
                 ingress
                     .handle_listen_readable_with(now, Some(ServerHook::ProxyClient(&mut engine)));
-            } else if tok.0 >= PROXY_CLIENT_TOK_BASE && tok.0 < usize::MAX - 4 {
+            } else if tok.0 >= PROXY_CLIENT_TOK_BASE && tok.0 < usize::MAX - 5 {
                 engine.handle_local_event(ev, now);
             }
         }
 
         sync_active_flow(&mut ingress, &mut engine, &mut active_flow);
-        let _ = engine.drive(
-            &mut ClientOuter::Reverse {
-                worker: &mut ingress,
-                flow_addr: active_flow,
-            },
-            Instant::now(),
-        );
 
         let post_now = Instant::now();
         if let Some(ref th) = telemetry {
@@ -2274,6 +3094,8 @@ pub fn run_proxy_client_reverse(mut cfg: ReverseProxyClientConfig) -> std::io::R
             last_stats = post_now;
             let snap = ingress.build_worker_snapshot();
             let q_rtt = engine
+                .tunnels
+                .primary
                 .quic
                 .as_ref()
                 .map(|q| q.conn.rtt().as_secs_f64() * 1000.0)

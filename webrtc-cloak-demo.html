@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-<title>WebRTC-Cloak V4.0 (v0.7.0) 协议原理、内嵌代理与红蓝对抗交互演示</title>
+<title>WebRTC-Cloak V4.0 (v0.8.0) 协议原理、内嵌代理、透传热切换与红蓝对抗交互演示</title>
 <style>
   :root {
     --bg: #070b14;
@@ -496,13 +496,13 @@
 <div class="container">
   <header>
     <div class="title-wrap">
-      <h1>WebRTC-Cloak V4.0 (v0.7.0) 协议原理、内嵌代理与对抗交互演示</h1>
-      <p>纯 Rust · 零 C 依赖 · <strong>Chrome/BoringSSL 对齐 DTLS 1.3 默认锁定</strong> (<code>patches/dimpl</code>) + 域隔离 ICE STUN + <strong>动态 24/28B 双 SSRC SRTP</strong> + <strong>零回环内嵌类 Hy2 代理 (<code>proxy</code> 正向/反向)</strong> + <strong>1-RTT 黑洞迁移 (0xFFFD)</strong> + <strong>MBB 原子过户 (0xFFFC)</strong></p>
+      <h1>WebRTC-Cloak V4.0 (v0.8.0) 协议原理、内嵌代理、透传热切换与对抗交互演示</h1>
+      <p>纯 Rust · 零 C 依赖 · <strong>Chrome/BoringSSL 对齐 DTLS 1.3 默认锁定</strong> (<code>patches/dimpl</code>) + 域隔离 ICE STUN + <strong>动态 24/28B 双 SSRC SRTP</strong> + <strong>零回环内嵌类 Hy2 代理 (<code>proxy</code> 正向/反向/MBB 热切换)</strong> + <strong>零解密透传中继 (<code>passthrough</code> + <code>SIGHUP</code> 热切)</strong> + <strong>1-RTT 黑洞迁移 (0xFFFD)</strong> + <strong>MBB 原子过户 (0xFFFC)</strong></p>
     </div>
     <div class="badge-row">
-      <span class="badge green">V4.0 · v0.7.0</span>
+      <span class="badge green">V4.0 · v0.8.0</span>
       <span class="badge purple">默认 DTLS 1.3 · 0% HRR · BoringSSL GREASE</span>
-      <span class="badge">零回环 proxy / relay / reverse</span>
+      <span class="badge">零解密透传 + SIGHUP 零断网热切换</span>
       <span class="badge amber">全架构 SIMD · 1488B Anti-Frag</span>
     </div>
   </header>
@@ -791,8 +791,8 @@
   <!-- ==================== SECTION 4: EVOLUTION, BENCHMARKS & BOUNDARIES ==================== -->
   <section class="card" id="sec-bench">
     <div class="card-head">
-      <div class="card-title"><span class="dot amber"></span> 4. V3 → V4.0 (v0.7.0) 关键演进、实测指标与客观边界</div>
-      <span class="badge green">V4.0 · v0.7.0 · 56 项测试全绿 + 16 架构</span>
+      <div class="card-title"><span class="dot amber"></span> 4. V3 → V4.0 (v0.8.0) 关键演进、实测指标与客观边界</div>
+      <span class="badge green">V4.0 · v0.8.0 · 63 项测试全绿 + 16 架构</span>
     </div>
 
     <div class="evo-grid">
@@ -835,6 +835,15 @@
           <li><strong>全栈协议细节硬化</strong>：端点域分离 STUN HKDF（<code>--stun-scope</code>）、<code>±10s</code> 窗口、<code>Ready</code> 态 <code>mi_key_mig</code> 保活、<code>HuntUfragTable</code> 墓碑、动态 <code>24/28B</code> RFC 8285 + <code>P=1</code> SRTP、30/60 FPS 量化视频时钟与异步 <code>BYE → close_notify</code>。</li>
         </ul>
       </div>
+      <div class="evo-card">
+        <div class="ec-tag">v0.8.0 · 零解密透传中继、SIGHUP 无感热切换与高 BDP 提速</div>
+        <div class="ec-title">passthrough 透传 + AB/MBB 零断网热切 + Linux timerfd 流水线</div>
+        <ul>
+          <li><strong>零解密透传中继（<code>relay --upstream-mode passthrough</code>）</strong>：中继节点零加解密、零 PSK 依赖，按客户端源端口固定出站套接字执行 IPv6↔IPv4 <code>recvmmsg</code>/<code>sendmmsg</code> 批量直通，完整保留端到端 DTLS 1.3、<code>--lane-hunt</code> 与 0ms MBB，单核中继 CPU 占用降 <strong><code>~3×</code></strong>。</li>
+          <li><strong>全链路不断网热切换（<code>--hot-config</code> + <code>SIGHUP</code>）</strong>：<code>relay</code> 不关主端口支持 <code>cloak ↔ passthrough ↔ bypass</code> 过渡期 <code>AB</code> 双模排空；<code>proxy --client</code> 进程内预热备用隧道并原子切流，在途 TCP 流无损排空至完成，超时自动回滚零中断。</li>
+          <li><strong>保伪装高 BDP 优化</strong>：<code>quinn-proto</code>/<code>bytes</code> <code>-O3</code> + Brutal <code>CWND_BDP_GAIN=1.00</code>（消除 <code>fq flows_plimit</code> 丢包）+ Linux <code>timerfd</code> 纳秒级唤醒 + 16 帧严界视频帧流水线，跨洋吞吐提升 <strong><code>+37%</code></strong> 且 100% 保留 1200B + 尾包分布。</li>
+        </ul>
+      </div>
     </div>
 
     <div class="metric-grid">
@@ -844,30 +853,30 @@
         <div class="m-note">正向 1,586–2,037M / 反向 1,653–1,778M · 交互 0.1–0.4ms</div>
       </div>
       <div class="metric-box">
-        <div class="m-label">MBB 换口 / 黑洞 / 尾包损坏</div>
-        <div class="m-val amber">0ms / 5.2s</div>
-        <div class="m-note">0 丢包 0 换口 · 加密 Flight-4 损坏 10/10 (274–409ms) 恢复</div>
+        <div class="m-label">MBB 换口 / SIGHUP 热切 / 尾包损坏</div>
+        <div class="m-val amber">0ms / 0 丢包</div>
+        <div class="m-note">AB/MBB 不断网排空 · 加密 Flight-4 损坏 10/10 恢复</div>
       </div>
       <div class="metric-box">
         <div class="m-label">低功耗 x86_64 软路由 (AES-NI)</div>
         <div class="m-val cyan">900–1,449 Mbps</div>
-        <div class="m-note">1W 900M / 4W 1,449M · 132s 静默 0 信标 · RSS 2.1–2.8 MB</div>
+        <div class="m-note">1W 900M / 4W 1,449M · 132s 静默 0 信标 · RSS 2.1–3.0 MB</div>
       </div>
       <div class="metric-box">
         <div class="m-label">Apple Silicon (ARM64, 12C)</div>
         <div class="m-val purple">18.7 / 127.4 Gbps</div>
-        <div class="m-note">单核 18,720M / 12核 127.4G · ChaCha20 4,027M · 56 项测试全绿</div>
+        <div class="m-note">单核 18,720M / 12核 127.4G · ChaCha20 4,027M · 63 项测试全绿</div>
       </div>
     </div>
 
     <div class="boundary-note">
-      <strong>客观工程定位与适用边界（<code>v0.7.0</code>）：</strong>
-      本项目提供<strong>透明 UDP 封装（<code>client</code>/<code>server</code>/<code>relay</code>/<code>reverse</code>）</strong>与<strong>可选零回环内嵌 SOCKS5/TCP 转发代理（<code>proxy</code>）</strong>，非内核 TUN VPN；<code>v0.7.0</code> 线格式与密钥域不向前兼容 <code>v0.6.x</code>（DNAT 场景使用 <code>--stun-scope</code> 对齐）。<code>bypass</code> 仅用于<strong>非 DPI 链路</strong>的 ECMP 路由优选，不提供抗 DPI 封装且不可直接承载无加密内层 <code>proxy</code>；在彻底禁止 100% UDP 出口或高强度单租户宏观 NetFlow 流量分析场景下仍存在物理与拓扑边界。
+      <strong>客观工程定位与适用边界（<code>v0.8.0</code>）：</strong>
+      本项目提供<strong>透明 UDP 封装（<code>client</code>/<code>server</code>/<code>relay</code>/<code>reverse</code>）</strong>与<strong>可选零回环内嵌 SOCKS5/TCP 转发代理（<code>proxy</code>）</strong>，非内核 TUN VPN；<code>v0.8.0</code> 与 <code>v0.7.x</code> 100% 线格式兼容（较 <code>v0.6.x</code> 需两端升级，DNAT 场景使用 <code>--stun-scope</code> 对齐）。<code>bypass</code> 仅用于<strong>非 DPI 链路</strong>的 ECMP 路由优选，不提供抗 DPI 封装且不可直接承载无加密内层 <code>proxy</code>；在彻底禁止 100% UDP 出口或高强度单租户宏观 NetFlow 流量分析场景下仍存在物理与拓扑边界。
     </div>
   </section>
 
   <footer>
-    WebRTC-Cloak V4.0 / v0.7.0 (Pure Rust · patches/dimpl DTLS 1.3 · No-op quinn-proto · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
+    WebRTC-Cloak V4.0 / v0.8.0 (Pure Rust · patches/dimpl DTLS 1.3 · No-op quinn-proto · mio) · 单文件离线 / GitHub Pages 交互原理演示 · 仅供网络协议学习与授权实验
   </footer>
 </div>
 

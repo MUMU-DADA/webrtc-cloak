@@ -114,19 +114,25 @@ pub(crate) enum ClientDownlink<'a> {
 
 /// 反向隧道 Agent 本地后端套接字保留令牌基址（与 `ClientWorker` 自身会话令牌严格隔离）。
 pub(crate) const REV_BACKEND_TOK_BASE: usize = 1usize << (usize::BITS - 2);
+/// 每个 `ClientWorker` 并发槽位独占的 `mio::Token` 跨度（支持主/备/排空多 `ClientWorker` 共享同一 `Poll`）。
+pub(crate) const CLIENT_TOK_SLOT_STRIDE: usize = 1 << 20;
 
 #[inline]
 pub(super) fn alloc_token(next_id: &mut usize) -> Token {
-    loop {
-        let id = *next_id;
-        *next_id = next_id.wrapping_add(1);
-        if *next_id >= REV_BACKEND_TOK_BASE {
-            *next_id = 1;
-        }
-        if id != 0 && id < REV_BACKEND_TOK_BASE {
-            return Token(id);
-        }
-    }
+    let slot_base = (*next_id / CLIENT_TOK_SLOT_STRIDE) * CLIENT_TOK_SLOT_STRIDE;
+    let slot_start = if slot_base == 0 { 1 } else { slot_base };
+    let slot_end = slot_base + CLIENT_TOK_SLOT_STRIDE;
+    let id = if *next_id < slot_start || *next_id >= slot_end {
+        slot_start
+    } else {
+        *next_id
+    };
+    *next_id = if id + 1 >= slot_end {
+        slot_start
+    } else {
+        id + 1
+    };
+    Token(id)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

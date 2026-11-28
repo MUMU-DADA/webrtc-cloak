@@ -4,6 +4,7 @@ mod bench_tools;
 mod bypass;
 mod client;
 mod constants;
+mod hot_reload;
 mod protocol;
 #[cfg(feature = "embedded-proxy")]
 mod proxy;
@@ -25,8 +26,8 @@ use crate::constants::{
     DEFAULT_UDP_BATCH, DEFAULT_WAN_MTU,
 };
 use crate::protocol::{
-    detect_cpu_accel, install_shutdown_handler, set_global_stun_scope, CipherPref, CipherSuite,
-    DtlsMinVersion,
+    detect_cpu_accel, install_reload_handler, install_shutdown_handler, set_global_stun_scope,
+    CipherPref, CipherSuite, DtlsMinVersion,
 };
 #[cfg(feature = "embedded-proxy")]
 use crate::proxy::{
@@ -34,7 +35,7 @@ use crate::proxy::{
     run_proxy_server, run_proxy_server_reverse, AclConfig, AclRule, ProxyClientConfig,
     ProxyServerConfig, ReverseProxyClientConfig, ReverseProxyServerConfig, TcpForwardRule,
 };
-use crate::relay::{run_relay, RelayConfig, RelayUpstreamConfig};
+use crate::relay::{run_relay, PassthroughConfig, RelayConfig, RelayUpstreamConfig};
 use crate::reverse::{
     run_reverse_agent, run_reverse_entry, ReverseAgentConfig, ReverseEntryConfig,
 };
@@ -184,12 +185,12 @@ fn usage() -> ! {
          webrtc-cloak cpu\n  \
          webrtc-cloak client --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak server --listen-host 0.0.0.0 --listen-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
-         webrtc-cloak relay --listen-host 0.0.0.0 --listen-port 19643 [--upstream-mode bypass|cloak|reverse] (--upstream-host <IPv4|IPv6> [--upstream-port 19643] | --reverse-listen-port <PORT> [--reverse-listen-host 0.0.0.0]) (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--upstream-psk <KEY> | --upstream-psk-file <PATH> | env WEBRTC_CLOAK_UPSTREAM_PSK] [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--upstream-cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--upstream-dtls-min-version 1.3|1.2|auto] [--lane-hunt | --no-lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak relay --listen-host 0.0.0.0 --listen-port 19643 [--upstream-mode passthrough|bypass|cloak|reverse] (--upstream-host <IPv4|IPv6> [--upstream-port 19643] | --reverse-listen-port <PORT> [--reverse-listen-host 0.0.0.0]) [--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK] [--upstream-psk <KEY> | --upstream-psk-file <PATH> | env WEBRTC_CLOAK_UPSTREAM_PSK] [--hot-config <PATH>] [--passthrough-fallback] [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--upstream-cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--upstream-dtls-min-version 1.3|1.2|auto] [--lane-hunt | --no-lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak reverse --entry --listen-host 0.0.0.0 --listen-port 19643 --expose-host 127.0.0.1 --expose-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak reverse --agent --server-host <IPv4|IPv6> --server-port 19643 --backend-host 127.0.0.1 --backend-port <PORT> (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bypass --listen-host 127.0.0.1 --listen-port 19543 --server-host <IPv4|IPv6> --server-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--no-lane-hunt] [--rotate-interval 0] [--workers 1|auto] [--max-sessions 4096] [--mtu 1488] [--udp-batch 0] [--keepalive 5] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
          webrtc-cloak bypass --responder --listen-host 127.0.0.1 --listen-port 19643 (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--workers 1|auto] [--mtu 1488] [--udp-batch 0] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5]\n  \
-         webrtc-cloak proxy --client [--reverse --listen-host 0.0.0.0 --listen-port 19643 | --server-host <IPv4|IPv6> --server-port 19643] [--socks-listen 127.0.0.1:19548 | --no-socks] [--tcp-forward LOCAL=TARGET]... [--up 100Mbps] [--down 300Mbps] [--proxy-mtu <BYTES>] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
+         webrtc-cloak proxy --client [--reverse --listen-host 0.0.0.0 --listen-port 19643 | --server-host <IPv4|IPv6> --server-port 19643] [--socks-listen 127.0.0.1:19548 | --no-socks] [--tcp-forward LOCAL=TARGET]... [--up 100Mbps] [--down 300Mbps] [--proxy-mtu <BYTES>] [--hot-config <PATH>] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--lane-probes 4] [--lane-rounds 3] [--lane-target-rtt <MS>] [--lane-cooldown 60] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak proxy --server [--reverse --server-host <IPv4|IPv6> --server-port 19643 | --listen-host 0.0.0.0 --listen-port 19643] [--max-up 500Mbps] [--max-down 500Mbps] [--proxy-mtu <BYTES>] [--acl-allow CIDR[:PORT]]... [--acl-deny CIDR[:PORT]]... [--allow-private] [--outbound-ipv4-only] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--lane-hunt] [--rotate-interval 0] [--rotate-bytes <MB>] [--keepalive 5] [--mtu 1488] [--udp-batch 0] [--idle-timeout 120] [--status-file <PATH>] [--status-http 127.0.0.1:PORT] [--status-interval 5] [--no-dtls-decoy]\n  \
          webrtc-cloak bench [count] [payload_bytes] [all|aes-gcm|chacha20|blake2b]\n  \
          webrtc-cloak selftest --server-host <IP|HOST> [--server-port 19643] (--psk <KEY> | --psk-file <PATH> | env WEBRTC_CLOAK_PSK) [--stun-scope <TAG>] [--cipher auto|aes-gcm|chacha20|blake2b] [--dtls-min-version 1.3|1.2|auto] [--mtu 1488] [--count 20] [--no-probe] [--no-color] [--json]\n  \
@@ -241,7 +242,14 @@ fn check_no_extra(args: Arguments) {
     }
 }
 
-fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_args::Error> {
+fn finish_common_tunnel(args: Arguments) -> Result<CommonTunnelArgs, pico_args::Error> {
+    finish_common_tunnel_ex(args, true)
+}
+
+fn finish_common_tunnel_ex(
+    mut args: Arguments,
+    require_psk: bool,
+) -> Result<CommonTunnelArgs, pico_args::Error> {
     let psk_arg: Option<String> = args.opt_value_from_str("--psk")?;
     let psk_file: Option<String> = args.opt_value_from_str("--psk-file")?;
     let stun_scope: Option<String> = args.opt_value_from_str("--stun-scope")?;
@@ -276,8 +284,13 @@ fn finish_common_tunnel(mut args: Arguments) -> Result<CommonTunnelArgs, pico_ar
         status_interval_secs: args.opt_value_from_str("--status-interval")?.unwrap_or(0),
     };
     check_no_extra(args);
+    let psk = if require_psk {
+        resolve_psk(psk_arg, psk_file)
+    } else {
+        resolve_optional_psk(psk_arg, psk_file, "WEBRTC_CLOAK_PSK").unwrap_or_default()
+    };
     Ok(CommonTunnelArgs {
-        psk: resolve_psk(psk_arg, psk_file),
+        psk,
         stun_scope,
         cipher_pref,
         dtls_min_version,
@@ -594,7 +607,10 @@ fn run() -> Result<(), pico_args::Error> {
             let lane_rounds_opt: Option<usize> = args.opt_value_from_str("--lane-rounds")?;
             let lane_target_rtt_opt: Option<u64> = args.opt_value_from_str("--lane-target-rtt")?;
             let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
-            let common = finish_common_tunnel(args)?;
+            let hot_config_path: Option<String> = args.opt_value_from_str("--hot-config")?;
+            let passthrough_fallback = args.contains("--passthrough-fallback");
+            let is_passthrough = upstream_mode == "passthrough";
+            let common = finish_common_tunnel_ex(args, !is_passthrough)?;
             let upstream_psk = resolve_optional_psk(
                 upstream_psk_arg,
                 upstream_psk_file,
@@ -622,6 +638,9 @@ fn run() -> Result<(), pico_args::Error> {
                 parse_socket_addr(&upstream_host, upstream_port, "upstream")
             };
             let stop = Some(install_shutdown_handler());
+            if hot_config_path.is_some() {
+                install_reload_handler();
+            }
 
             let ingress = ServerConfig {
                 listen_addr,
@@ -644,6 +663,13 @@ fn run() -> Result<(), pico_args::Error> {
             };
 
             let upstream = match upstream_mode.as_str() {
+                "passthrough" => RelayUpstreamConfig::Passthrough(PassthroughConfig {
+                    target_addr: upstream_addr,
+                    max_sessions: common.max_sessions,
+                    wan_mtu: common.wan_mtu,
+                    udp_batch: common.udp_batch,
+                    idle_timeout_secs: common.idle_timeout_secs,
+                }),
                 "bypass" => {
                     let lane_hunt = LaneHuntConfig {
                         enabled: !no_lane_hunt,
@@ -741,14 +767,20 @@ fn run() -> Result<(), pico_args::Error> {
                 }),
                 other => {
                     eprintln!(
-                        "Unknown --upstream-mode: {} (expected bypass, cloak, or reverse)",
+                        "Unknown --upstream-mode: {} (expected passthrough, bypass, cloak, or reverse)",
                         other
                     );
                     usage();
                 }
             };
 
-            if let Err(e) = run_relay(RelayConfig { ingress, upstream }) {
+            if let Err(e) = run_relay(RelayConfig {
+                ingress,
+                upstream,
+                hot_config_path,
+                reload_trigger: None,
+                passthrough_fallback,
+            }) {
                 eprintln!("relay error: {}", e);
                 process::exit(1);
             }
@@ -1242,6 +1274,10 @@ fn run() -> Result<(), pico_args::Error> {
                 let lane_target_rtt_opt: Option<u64> =
                     args.opt_value_from_str("--lane-target-rtt")?;
                 let lane_cooldown_opt: Option<u64> = args.opt_value_from_str("--lane-cooldown")?;
+                let hot_config_path: Option<String> = args.opt_value_from_str("--hot-config")?;
+                let hot_switch_timeout_secs: u64 = args
+                    .opt_value_from_str("--hot-switch-timeout")?
+                    .unwrap_or(0);
                 let lane_enabled = lane_hunt_flag
                     || lane_probes_opt.is_some_and(|p| p > 1)
                     || lane_target_rtt_opt.is_some_and(|t| t > 0);
@@ -1276,6 +1312,9 @@ fn run() -> Result<(), pico_args::Error> {
                     None => 0,
                 };
                 let server_addr = parse_socket_addr(&server_host, server_port, "server");
+                if hot_config_path.is_some() {
+                    install_reload_handler();
+                }
                 if let Err(e) = run_proxy_client(ProxyClientConfig {
                     client: ClientConfig {
                         listen_addr: socks_listen.unwrap_or_else(|| tcp_forwards[0].listen),
@@ -1307,6 +1346,9 @@ fn run() -> Result<(), pico_args::Error> {
                     up_bps,
                     down_bps,
                     proxy_mtu,
+                    hot_config_path,
+                    reload_trigger: None,
+                    hot_switch_timeout_secs,
                 }) {
                     eprintln!("proxy client error: {}", e);
                     process::exit(1);

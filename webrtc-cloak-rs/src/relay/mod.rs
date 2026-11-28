@@ -1,18 +1,19 @@
 //! 原生单进程零回环中继模式（`webrtc-cloak relay`）。
 //!
-//! 将入站 `ServerWorker`（Leg 1：终止前跳 DTLS 1.3 + SRTP 伪装隧道）与出站 `RelayEgress`
-//! （Leg 2：`BypassWorker` 零封装 UDP + 带外认证 STUN ECMP 抽卡，或 `ClientWorker` 完整
-//! DTLS 1.3 + SRTP 二跳再封装）融合在同一单线程 `mio::Poll` 事件循环内：
-//! - 彻底消除 `127.0.0.1` 回环套接字、两次内核态收发与进程间上下文切换；
-//! - 上行热路径在单次 `recvmmsg` 后原地解密入批，直接 `sendmmsg` 出公网；
-//! - 下行热路径在单次 `recvmmsg` 后原地加密入批，直接 `sendmmsg` 回入站隧道；
-//! - 入站 `0xFFFC` MBB 轮换原子接管 `BackendPipe::RelayFlow`，对出站五元组零扰动；
-//! - 出站 ECMP 换道/黑洞逃逸对入站五元组与上层 QUIC/WG 会话零感知。
+//! 支持四种出站中继形态及不断网 `SIGHUP` 热切换（`--hot-config`）：
+//! - `passthrough`：零解密 L4 UDP 透传中继（零加解密、零 PSK 依赖，支持 IPv6↔IPv4 双栈直通与 `recvmmsg`/`sendmmsg` 批量转发）；
+//! - `bypass`：入站终止 DTLS 1.3 + SRTP，出站零封装 UDP + 带外认证 ICE STUN ECMP 抽卡；
+//! - `cloak`：入站终止 Leg 1 并同进程 L1 缓存直连二跳 DTLS 1.3 + SRTP 隧道；
+//! - `reverse`：公网被动会合 NAT 后反向出口的零回环中继；
+//! - 热切换（`--hot-config` + `SIGHUP`）：支持不关闭主监听套接字、过渡期 `AB` 双模引流排空，实现 `cloak ↔ passthrough ↔ bypass` 与上游目标零丢包切换。
 
+mod passthrough;
 #[cfg(test)]
 mod tests;
 mod worker;
 
+pub use self::passthrough::PassthroughConfig;
+pub(crate) use self::passthrough::PassthroughTable;
 use self::worker::run_relay_worker;
 pub(crate) use self::worker::RelayEgress;
 use crate::bypass::BypassConfig;
@@ -23,6 +24,7 @@ use crate::server::{SeenTxidCache, ServerConfig, SharedV4Registry};
 use crate::telemetry::TelemetryHub;
 use crate::udp_batch::format_udp_batch_mode;
 use std::cell::Cell;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
@@ -33,6 +35,8 @@ thread_local! {
 /// 中继节点出站侧（Leg 2）传输模式配置。
 #[derive(Clone)]
 pub enum RelayUpstreamConfig {
+    /// 零解密 L4 UDP 透传中继（零加解密、零 PSK，客户端与出口端到端直连 DTLS 1.3 + SRTP）。
+    Passthrough(PassthroughConfig),
     /// 零封装原始 UDP 直通 + 带外认证 ICE STUN 多候选 ECMP 选路与黑洞自愈。
     Bypass(BypassConfig),
     /// 完整二跳 DTLS 1.3 + SRTP 伪装隧道（同进程 L1 缓存直连解密→再加密，零回环）。
@@ -46,6 +50,12 @@ pub enum RelayUpstreamConfig {
 pub struct RelayConfig {
     pub ingress: ServerConfig,
     pub upstream: RelayUpstreamConfig,
+    /// 可选热切换配置文件路径（收到 `SIGHUP` 或 `reload_trigger` 时原子读取并无感热切模式/目标）。
+    pub hot_config_path: Option<String>,
+    /// 可选测试/嵌入式代码触发热重载信号（生产 CLI 通过 Unix `SIGHUP` 自动触发）。
+    pub reload_trigger: Option<Arc<AtomicBool>>,
+    /// 是否在 `cloak`/`bypass` 模式下默认允许未通过入站 PSK 的 STUN 报文自动落入透传表（用于双模共存）。
+    pub passthrough_fallback: bool,
 }
 
 pub(super) fn log(worker_id: usize, msg: &str) {
@@ -64,14 +74,26 @@ pub fn run_relay(mut cfg: RelayConfig) -> std::io::Result<()> {
     }
     let workers = cfg.ingress.workers.max(1);
     let cpu = detect_cpu_accel();
-    let ingress_dtls_pool = build_dimpl_config_pool_for(
-        cfg.ingress.cipher_pref,
-        &cpu,
-        false,
-        cfg.ingress.wan_mtu,
-        outer_udp_hdr_len(cfg.ingress.listen_addr),
-    );
+    let ingress_dtls_pool = if matches!(cfg.upstream, RelayUpstreamConfig::Passthrough(_)) {
+        None
+    } else {
+        Some(build_dimpl_config_pool_for(
+            cfg.ingress.cipher_pref,
+            &cpu,
+            false,
+            cfg.ingress.wan_mtu,
+            outer_udp_hdr_len(cfg.ingress.listen_addr),
+        ))
+    };
     let (role, egress_dtls_pool, upstream_summary) = match &cfg.upstream {
+        RelayUpstreamConfig::Passthrough(p) => (
+            "relay-passthrough",
+            None,
+            format!(
+                "passthrough(zero-crypto L4 UDP -> {}, max_sessions={})",
+                p.target_addr, p.max_sessions
+            ),
+        ),
         RelayUpstreamConfig::Bypass(b) => {
             let lh_desc = if b.lane_hunt.enabled {
                 let tgt = if b.lane_hunt.target_rtt_ms == 0 {
@@ -159,17 +181,17 @@ pub fn run_relay(mut cfg: RelayConfig) -> std::io::Result<()> {
     );
 
     if !cfg.ingress.quiet {
+        let hot_desc = cfg.hot_config_path.as_deref().unwrap_or("off");
         println!(
-            "[relay-rs] zero-loopback CPU arch={} hw_accel=[{}] recommended={} workers={} ingress={} (dtls-{}, cipher={:?}) upstream={} udp_batch={}",
+            "[relay-rs] zero-loopback CPU arch={} hw_accel=[{}] recommended={} workers={} ingress={} upstream={} udp_batch={} hot_config={}",
             cpu.arch,
             cpu.features.join(", "),
             cpu.recommended.name(),
             workers,
             cfg.ingress.listen_addr,
-            cfg.ingress.dtls_min_version.as_str(),
-            cfg.ingress.cipher_pref,
             upstream_summary,
             format_udp_batch_mode(cfg.ingress.udp_batch),
+            hot_desc,
         );
     }
     #[cfg(not(target_os = "linux"))]

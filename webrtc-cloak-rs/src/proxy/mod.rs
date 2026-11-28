@@ -32,9 +32,122 @@ pub use self::server::{
 };
 
 use mio::net::UdpSocket as MioUdpSocket;
+use mio::{Events, Poll, Registry, Token};
 use socket2::{Domain, Protocol, Socket, Type};
 use std::cell::Cell;
 use std::net::{Ipv6Addr, SocketAddr, SocketAddrV6};
+use std::time::Duration;
+
+/// 代理事件循环高精度 Pacer 唤醒定时器令牌（与 `LISTEN_TOKEN` / `WAKE_TOKEN` / `SHUTDOWN_PIPE_TOKEN` / `PROXY_DNS_WAKE_TOKEN` / `REVERSE_LISTEN_TOKEN` 严格隔离）。
+pub(super) const PROXY_TIMER_TOKEN: Token = Token(usize::MAX - 5);
+
+/// Linux 高精度（hrtimer / 纳秒级）`timerfd` 唤醒器，解决 `mio` `epoll_wait` 毫秒级向上取整导致
+/// `quinn-proto` 1.6ms Pacer 周期过睡丢令牌的问题；非 Linux 平台自动零成本回退标准 `poll.poll()`。
+pub(super) struct FineTimer {
+    #[cfg(target_os = "linux")]
+    fd: std::os::unix::io::RawFd,
+    #[cfg(target_os = "linux")]
+    armed: bool,
+}
+
+impl FineTimer {
+    #[cfg(target_os = "linux")]
+    pub(super) fn new(registry: &Registry) -> Self {
+        use mio::unix::SourceFd;
+        use mio::Interest;
+        let fd = unsafe {
+            libc::timerfd_create(
+                libc::CLOCK_MONOTONIC,
+                libc::TFD_NONBLOCK | libc::TFD_CLOEXEC,
+            )
+        };
+        if fd >= 0
+            && registry
+                .register(&mut SourceFd(&fd), PROXY_TIMER_TOKEN, Interest::READABLE)
+                .is_err()
+        {
+            unsafe {
+                libc::close(fd);
+            }
+            return Self {
+                fd: -1,
+                armed: false,
+            };
+        }
+        Self { fd, armed: false }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn new(_registry: &Registry) -> Self {
+        Self {}
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn arm_and_poll(
+        &mut self,
+        poll: &mut Poll,
+        events: &mut Events,
+        wait: Duration,
+    ) -> std::io::Result<()> {
+        if self.fd >= 0 && wait > Duration::ZERO && wait <= Duration::from_millis(20) {
+            let mut spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+            spec.it_value.tv_sec = wait.as_secs() as _;
+            spec.it_value.tv_nsec = wait.subsec_nanos().max(1_000) as _;
+            let rc = unsafe { libc::timerfd_settime(self.fd, 0, &spec, std::ptr::null_mut()) };
+            if rc == 0 {
+                self.armed = true;
+                return poll.poll(events, Some(wait + Duration::from_millis(5)));
+            }
+        } else if self.fd >= 0 && self.armed {
+            let spec: libc::itimerspec = unsafe { std::mem::zeroed() };
+            unsafe {
+                libc::timerfd_settime(self.fd, 0, &spec, std::ptr::null_mut());
+            }
+            self.armed = false;
+        }
+        poll.poll(events, Some(wait))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn arm_and_poll(
+        &mut self,
+        poll: &mut Poll,
+        events: &mut Events,
+        wait: Duration,
+    ) -> std::io::Result<()> {
+        poll.poll(events, Some(wait))
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn drain(&mut self) {
+        if self.fd >= 0 {
+            let mut expirations: u64 = 0;
+            let _ = unsafe {
+                libc::read(
+                    self.fd,
+                    (&mut expirations as *mut u64).cast::<libc::c_void>(),
+                    std::mem::size_of::<u64>(),
+                )
+            };
+            self.armed = false;
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(super) fn drain(&mut self) {}
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for FineTimer {
+    fn drop(&mut self) {
+        if self.fd >= 0 {
+            unsafe {
+                libc::close(self.fd);
+            }
+            self.fd = -1;
+        }
+    }
+}
 
 thread_local! {
     pub(super) static PROXY_QUIET: Cell<bool> = const { Cell::new(false) };

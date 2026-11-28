@@ -1,8 +1,8 @@
-# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.7.0`)
+# WebRTC-Cloak Protocol Specification (`V4.0` / `v0.8.0`)
 
-This document specifies the wire format, cryptographic schedule, state machine, operating topologies, embedded proxy architecture, SIMD dispatch invariants, and security boundaries of `webrtc-cloak-rs`.
+This document specifies the wire format, cryptographic schedule, state machine, operating topologies, embedded proxy architecture, zero-decrypt passthrough & `SIGHUP` hot-switch semantics, SIMD dispatch invariants, and security boundaries of `webrtc-cloak-rs`.
 
-> **Wire Compatibility Note (`v0.7.0`)**: `v0.7.0` introduces breaking wire & key-domain upgrades over `v0.6.x` — endpoint-scoped STUN HKDF, per-session DTLS-PFS `mi_key_mig` Ready keepalives, dynamic multi-element `24B/28B` RFC 8285 RTP headers, RFC 3550 `P=1` (`0xB0`) SRTP padding, and default `--dtls-min-version 1.3` (`V13Only`). Both endpoints must upgrade to `v0.7.0` together.
+> **Wire Compatibility Note (`v0.8.0`)**: `v0.8.0` is **100% wire-compatible with `v0.7.0` and `v0.7.1`** and can be upgraded independently. Relative to `v0.6.x`, `v0.7+` introduced breaking wire & key-domain upgrades — endpoint-scoped STUN HKDF, per-session DTLS-PFS `mi_key_mig` Ready keepalives, dynamic multi-element `24B/28B` RFC 8285 RTP headers, RFC 3550 `P=1` (`0xB0`) SRTP padding, and default `--dtls-min-version 1.3` (`V13Only`) — so upgrades from `v0.6.x` require updating both endpoints together.
 
 ---
 
@@ -158,16 +158,19 @@ iv[8..12] = ext_seq[31:0]
 
 ---
 
-## 7. Operating Topologies & Transport Modes (`v0.5.0`–`v0.7.0`)
+## 7. Operating Topologies & Transport Modes (`v0.5.0`–`v0.8.0`)
 
 ### 7.1 Out-of-Band ECMP Lane-Hunting Raw UDP Bypass (`webrtc-cloak bypass`, non-DPI only)
 - Shares a single UDP 5-tuple between minimal `68B` authenticated RFC 5389 STUN probes (isolated under `bypass:` HKDF domain) and raw unframed inner UDP payloads (e.g., QUIC / WireGuard).
 - Delivers zero payload overhead, zero double-encryption, and full kernel `UDP_SEGMENT` (UDP GSO) compatibility for non-DPI ECMP lane hunting, seamless NAT-rebinding port migration (3s drain overlap), and blackhole escape. Companion `bypass --responder` serves ultra-lightweight STUN replies.
 
-### 7.2 Native Single-Process Zero-Loopback Relay (`webrtc-cloak relay`)
-- Fuses an ingress `ServerWorker` (WebRTC DTLS 1.3 + SRTP termination) and an egress `BypassWorker` (`--upstream-mode bypass`), `ClientWorker` (`--upstream-mode cloak`), or reverse-listening `ServerWorker` (`--upstream-mode reverse` via `--reverse-listen-host`/`--reverse-listen-port`) inside a single thread and single `mio::Poll` event loop (`SharedPoll`).
-- Eliminates localhost loopback sockets, redundant kernel UDP packet copies, and cross-process context switches via direct in-memory handoff hooks.
-- Supports independent ingress/egress PSKs (`--upstream-psk[-file]` / `WEBRTC_CLOAK_UPSTREAM_PSK`), independent STUN scopes (`--upstream-stun-scope`), independent cipher suites, independent DTLS minimum versions, Linux `recvmmsg/sendmmsg` batching, and full `0xFFFC` MBB + `0xFFFD` 1-RTT self-healing on both legs.
+### 7.2 Native Single-Process Zero-Loopback Relay (`webrtc-cloak relay`, `v0.6.0`–`v0.8.0`)
+- Supports four single-thread `mio::Poll` relay modes:
+  - **`passthrough` (`v0.8.0`, Zero-Decrypt L4 UDP Pass-Through)**: Pure L4 IPv6↔IPv4 UDP forwarding with **zero decryption/encryption and zero PSK requirement** (`--psk` optional), `recvmmsg`/`sendmmsg` batching (`--udp-batch`), idle session GC, and bounded LRU eviction (`--max-sessions`). Pins one dedicated connected upstream UDP socket per client source `SocketAddr`, preserving end-to-end client↔exit DTLS 1.3 + Dual-SSRC SRTP, `--lane-hunt` multi-port probing, and 0ms MBB rotation through the relay.
+  - **`bypass` / `cloak` / `reverse`**: Fuses ingress `ServerWorker` (Leg 1 DTLS 1.3 + SRTP termination) and egress `BypassWorker`, `ClientWorker`, or reverse-listening `ServerWorker` inside a single `mio::Poll` loop (`SharedPoll`) with zero localhost loopback sockets, independent ingress/egress PSKs (`--upstream-psk[-file]`), independent STUN scopes (`--upstream-stun-scope`), independent cipher suites/DTLS minimums, and full `0xFFFC`/`0xFFFD` self-healing.
+- **Zero-Downtime `SIGHUP` Hot-Switching (`--hot-config <PATH>`, `v0.8.0`)**:
+  - Uses an async-signal-safe Unix `SIGHUP` self-pipe (`RELOAD_PIPE_TOKEN = Token(usize::MAX - 2)`) and zero-dependency `key=value`/flat-JSON config loader (`src/hot_reload.rs`) without ever closing the bound ingress UDP socket.
+  - Supports seamless `AB` dual-mode draining via `RelayPassthroughPolicy` (`Disabled`, `DrainExistingOnly`, `PreferPassthrough`, `FallbackOnUnauth` / `--passthrough-fallback`) using disjoint `mio::Token` space (`PASSTHROUGH_TOK_BASE`): transitioning `cloak → passthrough` drains existing tracked `cloak` sessions to completion while immediately forwarding new client flows via zero-crypto `passthrough`, then automatically sheds `ServerWorker` + `DtlsConfigPool` once old sessions hit zero; transitioning `passthrough → cloak/bypass` drains existing passthrough flows while accepting new `cloak`/`bypass` handshakes on the same port.
 
 ### 7.3 Native L4 UDP Reverse Tunnel Mode (`webrtc-cloak reverse --entry | --agent`)
 - Enables NAT-traversal exposure of arbitrary L4 UDP services with **zero inbound ports** on the Agent side:
@@ -187,10 +190,11 @@ iv[8..12] = ext_seq[31:0]
 - **Forward & Reverse Topologies (`--reverse`)**:
   - Forward: `proxy --client` dials `proxy --server`.
   - Reverse (NAT-to-NAT / zero inbound port on exit): `proxy --client --reverse` listens on `--listen-host:--listen-port` while exposing local SOCKS5/`--tcp-forward`; `proxy --server --reverse` dials outbound 24×7 to the entry (or to a 3-hop `relay --upstream-mode reverse`).
-- **Persistence, Orphan Cleanup & Video-Frame Tail Shaping**:
+- **Persistence, Orphan Cleanup, High-BDP Pacing & In-Process MBB Hot-Switch (`v0.7.0`–`v0.8.0`)**:
   - Outer tunnel runs in `persistent_tunnel` mode (exempt from data-idle teardown, emitting 0 SRTP beacons during long silence while maintaining symmetric long-trickle RTCP RR and 45s ICE consent).
   - On reverse peer `SIGKILL` + reconnect, `ServerHook::Proxy` receives `NewConnection` and immediately reaps orphaned `ServerQuicConn` and backend TCP/UDP sockets (`0` FD leaks; lossless outer MBB `0xFFFC` handovers transfer the outer pipe without emitting `NewConnection`).
-  - Both `ProxyServerEngine` (DL) and `ProxyClientEngine` (UL) shape continuous bulk TCP→QUIC streams into `5..=10 * mss + 500..=979B` video-frame bursts (yielding `~10.4–10.7%` packets in `[450, 1150]B` under bulk load with zero buffering penalty on tiny interactive writes) while preserving `deferred_tcp_reads` fair-front scheduling across concurrent streams.
+  - Both `ProxyServerEngine` (DL) and `ProxyClientEngine` (UL) shape continuous bulk TCP→QUIC streams into `5..=10 * mss + 500..=979B` video-frame bursts (yielding `~10–12%` non-full frame-tail packets under bulk load with zero buffering penalty on tiny interactive writes), pipelining up to `16` strictly frame-separated bursts per pass into a shared 32-pkt `sendmmsg` batch, calibrated with Brutal `CWND_BDP_GAIN = 1.00` (matching `quinn-proto`'s 1.25× pacer to avoid `fq flows_plimit` drops) and Linux `timerfd` nanosecond wakeup (`PROXY_TIMER_TOKEN`) to eliminate sub-millisecond `epoll_wait` rounding stalls (`v0.8.0`).
+  - **In-Process Make-Before-Break Hot-Switch (`proxy --client --hot-config <PATH>`, `v0.8.0`)**: On `SIGHUP`, keeps local SOCKS5 and `--tcp-forward` listeners open continuously, spawns a standby `(ClientWorker, QuicTunnel)` in an isolated 1M-token slot (`CLIENT_TOK_SLOT_STRIDE`), and waits up to `--hot-switch-timeout` (default `12s`) for end-to-end outer DTLS 1.3 + inner QUIC `CtrlHello` readiness. Upon readiness, atomically promotes standby to primary for all new TCP/UDP streams while moving the previous tunnel into a draining pool (up to 60s grace) so in-flight TCP streams complete with zero drops; on timeout or invalid config, automatically aborts and rolls back with zero disruption to live traffic.
 
 ---
 

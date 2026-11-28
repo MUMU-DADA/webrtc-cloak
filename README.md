@@ -2,21 +2,21 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
 [![Rust](https://img.shields.io/badge/Rust-Pure%20Rust%20%7C%20Zero%20C%20Deps-orange.svg)](#从源码构建与目录结构)
-[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.7.0-6366f1.svg)](./SPEC.md)
+[![Protocol Spec](https://img.shields.io/badge/Protocol%20Spec-V4.0%20%7C%20v0.8.0-6366f1.svg)](./SPEC.md)
 [![Interactive Demo](https://img.shields.io/badge/Live%20Demo-GitHub%20Pages-0ea5e9.svg)](https://mumu-dada.github.io/webrtc-cloak/)
 [![Release](https://img.shields.io/github/v/release/MUMU-DADA/webrtc-cloak?color=10b981)](https://github.com/MUMU-DADA/webrtc-cloak/releases)
 
 > 快捷导航：[协议架构与六大模式](#协议架构与核心特性) · [全架构 SIMD 加速](#全架构指令集simd加速矩阵) · [实测数据与图表](#实测数据与效果对比) · [快速上手](#快速上手) · [自测诊断](#内置自测套件与基准诊断) · [源码构建](#从源码构建与目录结构) · [协议规范 (`SPEC.md`)](./SPEC.md)
 
-一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用、透明 UDP 封装与可选零回环内嵌代理实验原型。基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 9147 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550 / 7587 / 9221），完整实现 `ICE STUN + Chrome/BoringSSL 对齐真双向加密证书 DTLS 1.3/1.2 + 动态 RFC 8285 双 SSRC SRTP/SRTCP` 传输层框架，覆盖**正向封装 (`client`/`server`)、可选零回环内嵌类 Hysteria 2 代理 (`proxy` 正向 / `--reverse` 反向)、单进程零回环原生中继 (`relay`)、零入站端口原生反向隧道 (`reverse`) 与带外优车道旁路直通 (`bypass`)** 全套模式，用于研究现代深度包检测（DPI）、UDP 状态化防火墙/CGNAT 黑洞自愈、ECMP 多路径优选、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
+一个**纯 Rust、零 C 依赖**的 WebRTC 单端口协议复用、透明 UDP 封装与可选零回环内嵌代理实验原型。基于标准 RFC 规范（RFC 5389 / 8445 / 7675 / 9147 / 6347 / 5764 / 7983 / 3711 / 7714 / 8285 / 3550 / 7587 / 9221），完整实现 `ICE STUN + Chrome/BoringSSL 对齐真双向加密证书 DTLS 1.3/1.2 + 动态 RFC 8285 双 SSRC SRTP/SRTCP` 传输层框架，覆盖**正向封装 (`client`/`server`)、可选零回环内嵌类 Hysteria 2 代理 (`proxy` 正向 / `--reverse` 反向 / `SIGHUP` MBB 零断网热切换)、单进程零回环原生中继 (`relay` 零解密透传 `passthrough` / `bypass` / `cloak` / `reverse` + `AB` 双模热切换)、零入站端口原生反向隧道 (`reverse`) 与带外优车道旁路直通 (`bypass`)** 全套模式，用于研究现代深度包检测（DPI）、UDP 状态化防火墙/CGNAT 黑洞自愈、ECMP 多路径优选、前向安全混合密钥派生以及高性能无锁 `mio` 事件循环架构。
 
 > [!TIP]
 > - **在线交互式原理演示**：👉 **[https://mumu-dada.github.io/webrtc-cloak/](https://mumu-dada.github.io/webrtc-cloak/)**（对抗与自愈推演、字节级报文解剖、双 SSRC / PPPoE MTU 1488 模拟，亦可离线打开 [`webrtc-cloak-demo.html`](./webrtc-cloak-demo.html)）
-> - **协议规范文档（线格式 / 密钥派生 / 状态机 / 全模式与 SIMD）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.7.0`）
+> - **协议规范文档（线格式 / 密钥派生 / 状态机 / 全模式与 SIMD）**：👉 **[`SPEC.md`](./SPEC.md)**（`V4.0 / v0.8.0`）
 > - **全平台预编译下载（16 架构）**：👉 **[GitHub Releases](https://github.com/MUMU-DADA/webrtc-cloak/releases/latest)**（Linux 11 架构静态 musl、macOS ARM64/x86_64、Windows x86_64/ARM64/i686 与 `SHA256SUMS.txt`）
 
 > [!IMPORTANT]
-> **`v0.7.0` 升级与兼容说明**：`v0.7.0` 面向红蓝对抗深度加固引入了端点域分离 STUN HKDF（按端口与 `cloak`/`bypass` 隔离）、每会话 DTLS-PFS `mi_key_mig` 签名的 `Ready` 保活、动态多元素 `24B/28B` RFC 8285 RTP 扩展头、RFC 3550 `P=1` (`0xB0`) SRTP 填充以及默认 `--dtls-min-version 1.3`，**线格式不向前兼容 `v0.6.x`**，部署时需两端同步升级。若服务端位于 DNAT / Docker / `nftables` 端口映射之后（客户端目的端口与服务端监听端口不一致），两端或映射侧显式传入相同的 `--stun-scope <TAG>` 即可匹配。
+> **`v0.8.0` 升级与兼容说明**：**`v0.8.0` 与 `v0.7.0` / `v0.7.1` 100% 线格式兼容**，可独立滚动升级；新增零解密透传中继（`relay --upstream-mode passthrough`）、`relay` 与 `proxy --client` 原生 `SIGHUP` + `--hot-config` 不断网热切换以及内嵌代理数据面吞吐优化（保持完整 WebRTC 伪装）。相较 `v0.6.x`，`v0.7+` 引入的域隔离 STUN HKDF、每会话 `mi_key_mig` `Ready` 保活、动态 `24B/28B` RFC 8285 RTP 头、RFC 3550 `P=1` 填充与默认 `--dtls-min-version 1.3` 不向前兼容 `v0.6.x`，从 `v0.6.x` 升级需两端同步（DNAT / 端口转发场景两端传入一致的 `--stun-scope <TAG>`）。
 
 ---
 
@@ -40,8 +40,8 @@
 | 模式 | 子命令 | 适用场景与核心特性 |
 | :--- | :--- | :--- |
 | **正向加密隧道** | `client` ↔ `server` | 标准点对点透明 UDP 封装（STUN + DTLS 1.3 + 双 SSRC SRTP/SRTCP），支持 MBB `0xFFFC` 0 丢包轮换、1-RTT `0xFFFD` 黑洞迁移与 `--lane-hunt` 优车道 |
-| **零回环内嵌类 Hy2 代理** | `proxy --client` ↔ `proxy --server` *(支持 `--reverse`)* | 默认 Cargo feature `embedded-proxy` 开启（可用 `--no-default-features` 裁剪）。与外层共享单线程 `mio::Poll`，内层 Sans-IO `quinn-proto`（No-op 加密、零 `rustls`、零二次 AEAD）+ Brutal 恒速丢包补偿 + RFC 9221 UDP 分片重组 + SOCKS5 / `--tcp-forward` + 异步 DNS & CIDR ACL + 视频帧尾包整形；支持 `--reverse` 实现 NAT 后零入站端口代理出口 |
-| **原生零回环中继** | `relay` (`--upstream-mode bypass\|cloak\|reverse`) | **单进程单线程 `mio::Poll`** 融合入站 `ServerWorker` 与出站 `Bypass`/`Client`/`Reverse`，彻底消除本地回环 socket 与双进程切换；支持 `bypass`（非 DPI 裸 UDP + 带外 STUN 优选）、`cloak`（双段加密双 PSK）与 `reverse`（三跳零入站反向出口）三种形态 |
+| **零回环内嵌类 Hy2 代理** | `proxy --client` ↔ `proxy --server` *(支持 `--reverse` 与 `--hot-config`)* | 默认 Cargo feature `embedded-proxy` 开启（可用 `--no-default-features` 裁剪）。与外层共享单线程 `mio::Poll`，内层 Sans-IO `quinn-proto`（No-op 加密、零 `rustls`、零二次 AEAD）+ Brutal 恒速丢包补偿（`CWND_BDP_GAIN=1.00`）+ Linux `timerfd` 纳秒级发包唤醒 + 16 帧严界流水线 + RFC 9221 UDP 分片重组 + SOCKS5 / `--tcp-forward` + 异步 DNS & CIDR ACL + 视频帧尾包整形；支持 `--reverse` 实现 NAT 后零入站端口代理出口及 **`SIGHUP` 进程内 MBB 零断网热切换** |
+| **原生零回环中继** | `relay` (`--upstream-mode passthrough\|bypass\|cloak\|reverse`, 支持 `--hot-config`) | **单进程单线程 `mio::Poll`** 原生中继，支持四种出站形态：`passthrough`（**零解密、零 PSK 纯 L4 IPv6↔IPv4 `recvmmsg`/`sendmmsg` 透传**，完整保留端到端 `--lane-hunt` 与 0ms MBB）、`bypass`（非 DPI 裸 UDP + 带外 STUN 优选）、`cloak`（双段加密双 PSK）与 `reverse`（三跳零入站反向出口）；支持 **`SIGHUP` 不关主端口 + 过渡期 `AB` 双模无损排空热切换** |
 | **原生反向隧道** | `reverse --entry` ↔ `reverse --agent` | 类反向 WireGuard：**内网/NAT 侧零公网入站端口**，Agent 主动外拨 Entry 建立 24×7 常驻加密隧道；单隧道内借密文 `0xFFFB` 帧按 `flow_id: u32` 复用任意多条 L4 UDP 业务流，Agent 侧按流固定本地源端口，继承 MBB / 1-RTT / `--lane-hunt` |
 | **旁路优车道直通** | `bypass` / `bypass --responder` | **仅限非 DPI 路由优选**：共享五元组带外极简 `68B` 认证 STUN 抽卡/劣化切路/黑洞逃生 + 数据面 0 封装原始 UDP 透传（兼容内核 `UDP_SEGMENT` / GSO、零二次加密） |
 | **自测与基准工具** | `selftest` / `cpu` / `bench` / `sink` / `loadgen` | 线上零干扰 12 项实网体检、本地离线故障注入沙箱、全密码后端/SIMD 诊断与吞吐压测 |
@@ -87,6 +87,11 @@ flowchart LR
 
 ### 核心工程亮点
 
+- **零解密透传中继与全链路 `SIGHUP` 零断网热切换（`v0.8.0`）**：
+  - **零解密透传中继（`relay --upstream-mode passthrough`）**：中继节点零加解密、零 PSK 依赖（`--psk` 可省略），以每客户端源端口独立固定出站 UDP 套接字执行 IPv6↔IPv4 双栈 `recvmmsg`/`sendmmsg` 批量转发；端到端 DTLS 1.3 + Dual-SSRC SRTP 与 `--lane-hunt` / 0ms MBB 直接贯穿客户端与最终出口，在 1 vCPU 中继节点上可将高负载 CPU 占比从双加密 `~75%` 降至 `~25%`（常驻内存 `~3 MB`）。
+  - **`relay` 过渡期 `AB` 双模热切换（`--hot-config <PATH>` + `SIGHUP`）**：绝不关闭主监听端口，支持 `cloak ↔ passthrough ↔ bypass` 与上游地址/PSK 实时切换；切出时既有活跃会话在旧路径零丢包排空，新连接即时走新模式，旧会话归零后自动释放旧加密状态（另支持 `--passthrough-fallback` 双模共存）。
+  - **`proxy --client` 进程内 Make-Before-Break 热切换（`--hot-config <PATH>` + `SIGHUP`）**：不关闭本地 SOCKS5 / `--tcp-forward` 监听口；收到 `SIGHUP` 后并行预热备用外层 Cloak + 内层 QUIC 隧道，待 `CtrlHello` 协商就绪后原子切流，旧隧道在途 TCP 流在独立排空槽中继续满速传输至自然结束，预热超时自动回滚零影响。
+  - **内嵌代理数据面零损伪装提速（`v0.8.0`）**：`quinn-proto`/`bytes` 启用 `opt-level = 3`，Brutal `CWND_BDP_GAIN` 由 `1.20` 校准为 `1.00`（对齐 `quinn-proto` 内置 `1.25×` Pacer，消除高 BDP 下 `fq flows_plimit` 尾丢包），Linux 侧引入 `timerfd` 纳秒级精准唤醒替换毫秒级 `epoll_wait` 截断，并实现单轮最高 16 帧严界视频帧流水线 + 32 包共享 `sendmmsg` 批发送；高延迟跨洋链路实测吞吐提升 **`+36.9%`** 且完整保留 1200B 满包 + `500..=979B` 帧尾包分布（`~12%` 非满包尾包）。
 - **Chrome/BoringSSL 线格式对齐与深度防探测（`v0.7.0`）**：
   - **默认锁定 DTLS 1.3（`--dtls-min-version 1.3`）**：100% 免疫在途 1 字节降级篡改（0 明文 `CN=WebRTC` 证书泄露）；显式开启 `auto` 时亦内置 RFC 8446 §4.1.3 `DOWNGRD\x01` 降级哨兵。
   - **定制 `patches/dimpl` 零特征加固**：已鉴权 STUN 后跳过冗余 `HelloRetryRequest`（1-RTT 直出 `ServerHello`）、彻底移除 `0x0015 EXT_PADDING` 全零块、统一 `V13Only`/`auto` 下的 Chrome 套件序与 `use_srtp` 序、实现 BoringSSL 首位空 GREASE + 末位 1B `0x00` GREASE 书立与中间扩展 Fisher-Yates 洗牌，并对 DTLS 1.3 `Handshake` / `Ack` / `Alert` 启用 RFC 9147 §4.2 密文内层随机填充（彻底抹除 `709B`/`506B`/`72B`/`24B` 固定长度指纹）。
@@ -307,6 +312,15 @@ chmod 600 /tmp/webrtc-cloak.psk
   --upstream-mode reverse \
   --reverse-listen-host 0.0.0.0 --reverse-listen-port 19644 \
   --psk-file /tmp/leg1.psk --upstream-psk-file /tmp/leg2.psk
+
+# C4. 零解密透传中继（零 PSK、零加解密、IPv6↔IPv4 双栈直通）+ SIGHUP 热切换
+./webrtc-cloak relay \
+  --listen-host :: --listen-port 27418 \
+  --upstream-mode passthrough \
+  --upstream-host 198.51.100.20 --upstream-port 27418 \
+  --hot-config /etc/webrtc-cloak/relay-hot.conf \
+  --udp-batch 32
+# 修改 relay-hot.conf 后发送 kill -HUP <pid> 即可在 passthrough / cloak / bypass 与目标地址间不断网热切
 ```
 
 #### 模式 D：原生 L4 UDP 反向隧道（`reverse --entry` + `reverse --agent`，NAT 侧零入站端口）
@@ -344,10 +358,10 @@ chmod 600 /tmp/webrtc-cloak.psk
 
 | 参数 | 默认值 | 说明 |
 | :--- | :---: | :--- |
-| `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 | 预置共享密钥（推荐文件或环境变量，避免进程列表泄露） |
+| `--psk-file <PATH>` / `WEBRTC_CLOAK_PSK` / `--psk <KEY>` | 必填其一 *(纯 `passthrough` 中继可省略)* | 预置共享密钥（推荐文件或环境变量，避免进程列表泄露） |
 | `--stun-scope <TAG>` / `--upstream-stun-scope <TAG>` | 自动按监听/目的端口 | 可选显式 STUN HKDF 作用域标签（经 DNAT / 端口转发部署时用于双端显式对齐） |
 | `--cipher <auto\|aes-gcm\|chacha20\|blake2b>` | `auto` | 加密套件；`auto` 依据两端真实硬件加速能力经 DTLS 握手自动协商 |
-| `--dtls-min-version <1.3\|1.2\|auto>` | **`1.3`** | DTLS 最低版本；`v0.7.0` 默认锁定 `1.3` 防降级与零明文证书泄露，仅在特殊互操作场景显式指定 `auto`/`1.2` |
+| `--dtls-min-version <1.3\|1.2\|auto>` | **`1.3`** | DTLS 最低版本；`v0.7.0+` 默认锁定 `1.3` 防降级与零明文证书泄露，仅在特殊互操作场景显式指定 `auto`/`1.2` |
 | `--client` / `--server` / `--reverse` *(仅 `proxy`)* | 必填角色 | 内嵌类 Hy2 代理角色；加 `--reverse` 切换外层拨号方向（`--client --reverse` 监听、`--server --reverse` 外拨） |
 | `--socks-listen <IP:PORT>` / `--no-socks` *(仅 `proxy --client`)* | `127.0.0.1:19548` | 本地 SOCKS5 监听地址（支持 TCP + UDP Associate）；纯端口转发场景可用 `--no-socks` 关闭 |
 | `--tcp-forward <LOCAL=TARGET>` *(仅 `proxy --client`, 可重复)* | 无 | 本地 L4 TCP 端口直通转发规则（如 `127.0.0.1:19443=example.com:443`） |
@@ -355,7 +369,9 @@ chmod 600 /tmp/webrtc-cloak.psk
 | `--max-up` / `--max-down` *(仅 `proxy --server`)* | `500Mbps` / `500Mbps` | 服务端允许的上下行 Brutal 带宽硬上限 |
 | `--proxy-mtu <BYTES>` *(仅 `proxy`)* | 自动推导 | 可选覆写内层 QUIC 最大 UDP 载荷 MTU |
 | `--acl-allow` / `--acl-deny <CIDR[:PORT]>` *(仅 `proxy --server`, 可重复)* | 默认拒绝私网 | 解析后出站目标 CIDR/端口 ACL 规则；配合 `--allow-private`（允许私网/回环）与 `--outbound-ipv4-only` |
-| `--upstream-mode <bypass\|cloak\|reverse>` *(仅 `relay`)* | `bypass` | 中继出站形态：`bypass`（裸 UDP 直通）、`cloak`（二段 WebRTC 加密）或 `reverse`（监听反向出口拨入） |
+| `--upstream-mode <passthrough\|bypass\|cloak\|reverse>` *(仅 `relay`)* | `bypass` | 中继出站形态：`passthrough`（零解密纯 L4 透传）、`bypass`（裸 UDP + 带外 STUN）、`cloak`（二段 WebRTC 加密）或 `reverse`（监听反向出口拨入） |
+| `--hot-config <PATH>` *(支持 `relay` 与 `proxy --client`)* | 关闭 | 热切换配置文件路径（支持 `key=value` 与扁平 JSON）；收到 Unix `SIGHUP` 时无感热切目标/模式/PSK/带宽（`proxy --client` 可选 `--hot-switch-timeout <SECS>`，默认 `12s`） |
+| `--passthrough-fallback` *(仅 `relay`)* | 关闭 | 在 `cloak`/`bypass` 模式下允许未通过入站 PSK 鉴权的端到端流自动落入透传表实现双模共存 |
 | `--upstream-host` / `--upstream-port` / `--reverse-listen-port` *(仅 `relay`)* | 按模式必填 | `bypass`/`cloak` 指定上游目标；`reverse` 指定 `--reverse-listen-port`（可选 `--reverse-listen-host`） |
 | `--upstream-psk[-file]` / `WEBRTC_CLOAK_UPSTREAM_PSK` *(仅 `relay`)* | 同入站 PSK | 可选独立上游 PSK；另支持 `--upstream-cipher`、`--upstream-dtls-min-version`、`--upstream-stun-scope` |
 | `--entry` / `--agent` *(仅 `reverse`)* | 二选一必填 | 反向 UDP 隧道角色：公网入口端 (`--entry` + `--expose-host`/`--expose-port`) 或 NAT 内网出口端 (`--agent` + `--server-host`/`--backend-port`) |
@@ -419,15 +435,15 @@ chmod 600 /tmp/webrtc-cloak.psk
 
 ```bash
 cd webrtc-cloak-rs
-cargo test --all-targets                                          # 56 项协议不变式、内嵌代理、中继、反向隧道与安全回归测试
-cargo test --no-default-features --all-targets                    # 46 项精简纯 UDP 封装模式回归测试
+cargo test --all-targets                                          # 63 项协议不变式、内嵌代理、透传中继、热切换、反向隧道与安全回归测试
+cargo test --no-default-features --all-targets                    # 51 项精简纯 UDP 封装模式回归测试
 cargo build --release                                             # 编译默认全功能 Release 版本（含 embedded-proxy）
 cargo build --release --no-default-features                       # 可选：裁剪 quinn-proto，编译极简纯 UDP 封装版本
 rustup target add x86_64-unknown-linux-musl                       # 可选：交叉编译 Linux 静态 musl
 cargo build --release --target x86_64-unknown-linux-musl
 ```
 
-> 注：macOS 默认 `ulimit -n` 为 `256`，并发运行 56 项网络集成测试前建议先执行 `ulimit -n 4096`。
+> 注：macOS 默认 `ulimit -n` 为 `256`，并发运行 63 项网络集成测试前建议先执行 `ulimit -n 4096`。
 
 ```text
 .
@@ -439,7 +455,7 @@ cargo build --release --target x86_64-unknown-linux-musl
 │   ├── bandwidth-overhead.svg             # 4. 带宽损耗与外层流量放大折线图
 │   └── benchmark-performance.svg          # 5. 多平台加解密算力与全隧道环回跑分图
 ├── README.md                              # 项目说明、全模式指南、SIMD 矩阵与实测对比
-├── SPEC.md                                # V4.0 / v0.7.0 线格式、密码学、全模式与状态机协议规范
+├── SPEC.md                                # V4.0 / v0.8.0 线格式、密码学、全模式、透传热切换与状态机规范
 ├── webrtc-cloak-demo.html                 # 交互式协议原理演示页（离线 / GitHub Pages）
 ├── LICENSE                                # MIT 开源许可证
 └── webrtc-cloak-rs/                       # 纯 Rust 源码工程（零 C 外部库依赖 / 零 OpenSSL）
@@ -452,12 +468,13 @@ cargo build --release --target x86_64-unknown-linux-musl
     └── src/
         ├── main.rs                        # CLI 参数解析 (pico-args) 与全子命令分发
         ├── constants.rs                   # 跨模块共享的协议契约、帧魔数、缓冲与双端耦合时序常量
+        ├── hot_reload.rs                  # 零依赖热切换配置文件解析器（key=value / 扁平 JSON）与校验
         ├── bench_tools.rs                 # cpu (真实 SIMD 后端) / bench / sink / loadgen 诊断工具
-        ├── protocol/                      # 域隔离 STUN / dimpl DTLS 1.3+1.2 / X.509 / 动态 RFC 8285 双 SSRC SRTP / SRTCP
-        ├── client/                        # 客户端 mio 循环、1-RTT 黑洞迁移、MBB 状态机、ECMP 优车道与测试
-        ├── server/                        # 服务端 mio 循环、SeenTxidCache、HuntUfragTable 墓碑、跨 worker 注册表与 Silent Drop
-        ├── proxy/                         # 可选零回环内嵌类 Hy2 代理（No-op quinn-proto、Brutal、SOCKS5、TCP 转发、ACL、反向模式）
-        ├── relay/                         # 原生单进程零回环中继模式 (bypass / cloak / reverse 三出站) 与测试
+        ├── protocol/                      # 域隔离 STUN / dimpl DTLS 1.3+1.2 / X.509 / 动态 RFC 8285 双 SSRC SRTP / SRTCP / SIGHUP 自管道
+        ├── client/                        # 客户端 mio 循环、1-RTT 黑洞迁移、MBB 状态机、分槽令牌隔离、ECMP 优车道与测试
+        ├── server/                        # 服务端 mio 循环、SeenTxidCache、HuntUfragTable 墓碑、过渡期透传分流与 Silent Drop
+        ├── proxy/                         # 可选零回环内嵌类 Hy2 代理（No-op quinn-proto、Brutal、Linux timerfd、SOCKS5、MBB 热切换、ACL、反向模式）
+        ├── relay/                         # 原生单进程零回环中继（passthrough 零解密透传 / bypass / cloak / reverse + AB 热切换）与测试
         ├── reverse/                       # 原生 L4 UDP 反向隧道模式 (entry / agent, 0xFFFB/0xFFFA 多流复用) 与测试
         ├── bypass/                        # 一级旁路直通模式（极简 68B 带外 STUN ECMP 抽卡 + 原始 UDP 零损耗透传）
         ├── udp_batch.rs                   # 可选 Linux recvmmsg/sendmmsg 批量收发引擎 (--udp-batch)

@@ -95,6 +95,11 @@ pub const REVERSE_LISTEN_TOKEN: Token = Token(usize::MAX - 4);
 /// `mio::Poll` 中用于 Unix 信号自管道无锁优雅退出唤醒的保留令牌。
 #[cfg(unix)]
 pub const SHUTDOWN_PIPE_TOKEN: Token = Token(usize::MAX - 1);
+/// `mio::Poll` 中用于 Unix `SIGHUP` 热切换自管道唤醒的保留令牌。
+#[cfg(unix)]
+pub const RELOAD_PIPE_TOKEN: Token = Token(usize::MAX - 2);
+/// `mio::Poll` 中零解密透传中继（`relay --upstream-mode passthrough`）上游套接字令牌基址（与 `ClientWorker` / `BypassWorker` 严格隔离）。
+pub const PASSTHROUGH_TOK_BASE: usize = (1usize << (usize::BITS - 2)) + 16_384;
 /// `mio::Poll` 中用于跨线程命令和优雅退出唤醒的保留令牌。
 pub const WAKE_TOKEN: Token = Token(usize::MAX);
 

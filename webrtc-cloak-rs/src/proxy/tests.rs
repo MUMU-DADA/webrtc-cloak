@@ -549,6 +549,9 @@ fn test_proxy_e2e_socks5_tcp_udp_forward_and_acl() {
             up_bps: 200_000_000,
             down_bps: 420_000_000,
             proxy_mtu: None,
+            hot_config_path: None,
+            reload_trigger: None,
+            hot_switch_timeout_secs: 0,
         })
         .unwrap();
     });
@@ -771,6 +774,9 @@ fn test_proxy_e2e_over_relay_cloak_with_8pct_loss() {
                 quiet: true,
                 stop: Some(r_stop),
             }),
+            hot_config_path: None,
+            reload_trigger: None,
+            passthrough_fallback: false,
         })
         .unwrap();
     });
@@ -811,6 +817,9 @@ fn test_proxy_e2e_over_relay_cloak_with_8pct_loss() {
             up_bps: 100_000_000,
             down_bps: 300_000_000,
             proxy_mtu: None,
+            hot_config_path: None,
+            reload_trigger: None,
+            hot_switch_timeout_secs: 0,
         })
         .unwrap();
     });
@@ -917,6 +926,9 @@ fn test_proxy_e2e_concurrent_4_streams_and_outer_mbb() {
             up_bps: 1_000_000_000,
             down_bps: 1_000_000_000,
             proxy_mtu: None,
+            hot_config_path: None,
+            reload_trigger: None,
+            hot_switch_timeout_secs: 0,
         })
         .unwrap();
     });
@@ -1204,6 +1216,9 @@ fn test_proxy_reverse_3hop_nat_to_nat_via_relay_reverse() {
                 quiet: true,
                 stop: Some(r_stop),
             }),
+            hot_config_path: None,
+            reload_trigger: None,
+            passthrough_fallback: false,
         })
         .unwrap();
     });
@@ -1295,6 +1310,9 @@ fn test_proxy_reverse_3hop_nat_to_nat_via_relay_reverse() {
             up_bps: 500_000_000,
             down_bps: 500_000_000,
             proxy_mtu: None,
+            hot_config_path: None,
+            reload_trigger: None,
+            hot_switch_timeout_secs: 0,
         })
         .unwrap();
     });
@@ -1451,6 +1469,9 @@ fn test_proxy_v70_idle_timeout_survival_and_server_restart_quic_reset() {
             up_bps: 100_000_000,
             down_bps: 300_000_000,
             proxy_mtu: None,
+            hot_config_path: None,
+            reload_trigger: None,
+            hot_switch_timeout_secs: 0,
         })
         .unwrap();
     });
@@ -1527,4 +1548,196 @@ fn test_proxy_v70_idle_timeout_survival_and_server_restart_quic_reset() {
     stop_tcp_echo.store(true, Ordering::SeqCst);
     cli_h.join().unwrap();
     srv2_h.join().unwrap();
+}
+
+#[test]
+fn test_proxy_client_hot_switch_mbb_zero_drop_and_rollback() {
+    let (echo1_addr, stop_e1) = spawn_tcp_echo_server();
+    let (echo2_addr, stop_e2) = spawn_tcp_echo_server();
+
+    let srv1_addr: SocketAddr = format!("127.0.0.1:{}", free_udp_port()).parse().unwrap();
+    let srv2_addr: SocketAddr = format!("127.0.0.1:{}", free_udp_port()).parse().unwrap();
+    let dead_port = free_udp_port();
+    let socks_addr: SocketAddr = format!("127.0.0.1:{}", free_tcp_port()).parse().unwrap();
+
+    let psk1 = b"hot-mbb-exit-1-psk".to_vec();
+    let psk2 = b"hot-mbb-exit-2-psk".to_vec();
+    let stop = Arc::new(AtomicBool::new(false));
+    let reload_trigger = Arc::new(AtomicBool::new(false));
+
+    let hot_file = std::env::temp_dir().join(format!(
+        "webrtc-cloak-proxy-hot-{}-{}.conf",
+        std::process::id(),
+        free_udp_port()
+    ));
+
+    // Exit 1 ONLY allows echo1_addr; Exit 2 ONLY allows echo2_addr (proves which exit each stream used!)
+    let spawn_exit =
+        |listen: SocketAddr, psk: Vec<u8>, allowed: SocketAddr, st: Arc<AtomicBool>| {
+            thread::spawn(move || {
+                run_proxy_server(ProxyServerConfig {
+                    server: ServerConfig {
+                        listen_addr: listen,
+                        backend_addr: listen,
+                        psk,
+                        stun_scope: None,
+                        cipher_pref: CipherPref::Auto,
+                        dtls_required: true,
+                        dtls_min_version: DtlsMinVersion::V13Only,
+                        workers: 1,
+                        max_sessions: 32,
+                        wan_mtu: 1488,
+                        udp_batch: 16,
+                        idle_timeout_secs: 60,
+                        stats_interval_secs: 0,
+                        wire_audit_file: None,
+                        telemetry: TelemetryConfig::default(),
+                        quiet: true,
+                        stop: Some(st),
+                    },
+                    max_up_bps: 500_000_000,
+                    max_down_bps: 500_000_000,
+                    acl: AclConfig {
+                        allow: vec![
+                            AclRule::parse(&format!("127.0.0.1/32:{}", allowed.port())).unwrap()
+                        ],
+                        deny: Vec::new(),
+                        reject_private: true,
+                        outbound_ipv4_only: true,
+                    },
+                    proxy_mtu: None,
+                })
+                .unwrap();
+            })
+        };
+
+    let srv1_h = spawn_exit(srv1_addr, psk1.clone(), echo1_addr, Arc::clone(&stop));
+    let srv2_h = spawn_exit(srv2_addr, psk2.clone(), echo2_addr, Arc::clone(&stop));
+    thread::sleep(Duration::from_millis(80));
+
+    let cli_h = {
+        let st = Arc::clone(&stop);
+        let trig = Arc::clone(&reload_trigger);
+        let hf = hot_file.to_string_lossy().to_string();
+        thread::spawn(move || {
+            run_proxy_client(ProxyClientConfig {
+                client: ClientConfig {
+                    listen_addr: socks_addr,
+                    server_addr: srv1_addr,
+                    psk: psk1,
+                    stun_scope: None,
+                    cipher_pref: CipherPref::Auto,
+                    dtls_decoy: true,
+                    dtls_min_version: DtlsMinVersion::V13Only,
+                    rotate_interval_secs: 0,
+                    rotate_max_bytes: 0,
+                    rotate_cooldown_secs: 60,
+                    workers: 1,
+                    max_sessions: 32,
+                    wan_mtu: 1488,
+                    udp_batch: 16,
+                    retry_ms: 100,
+                    max_retries: 6,
+                    keepalive_secs: 5,
+                    idle_timeout_secs: 60,
+                    stats_interval_secs: 0,
+                    lane_hunt: LaneHuntConfig::default(),
+                    telemetry: TelemetryConfig::default(),
+                    quiet: true,
+                    stop: Some(st),
+                },
+                socks_listen: Some(socks_addr),
+                tcp_forwards: Vec::new(),
+                up_bps: 100_000_000,
+                down_bps: 300_000_000,
+                proxy_mtu: None,
+                hot_config_path: Some(hf),
+                reload_trigger: Some(trig),
+                hot_switch_timeout_secs: 2,
+            })
+            .unwrap();
+        })
+    };
+
+    wait_tcp_ready(socks_addr);
+
+    // 1) Open an active TCP stream on Exit 1 BEFORE hot-switch
+    let (mut s_old, rep_old) =
+        socks5_connect(socks_addr, &TargetAddr::from_socket_addr(echo1_addr));
+    assert_eq!(rep_old, 0x00, "initial Exit 1 dial must succeed");
+    s_old.write_all(b"PRE_SWITCH_OK").unwrap();
+    let mut rb = [0u8; 32];
+    s_old.read_exact(&mut rb[..13]).unwrap();
+    assert_eq!(&rb[..13], b"PRE_SWITCH_OK");
+
+    // Verify Exit 1 rejects echo2 before switch
+    let (_s_deny, rep_deny) = socks5_connect(socks_addr, &TargetAddr::from_socket_addr(echo2_addr));
+    assert_eq!(rep_deny, 0x02, "Exit 1 must deny echo2 before hot-switch");
+
+    // 2) Trigger Make-Before-Break hot-switch from Exit 1 -> Exit 2 (different port + different PSK + new bandwidth)
+    std::fs::write(
+        &hot_file,
+        format!(
+            "server_host=127.0.0.1\nserver_port={}\npsk={}\nup=150Mbps\ndown=450Mbps\n",
+            srv2_addr.port(),
+            String::from_utf8_lossy(&psk2)
+        ),
+    )
+    .unwrap();
+    reload_trigger.store(true, Ordering::SeqCst);
+
+    // Wait for standby promotion: new SOCKS5 dial to echo2 MUST succeed (proving Exit 2 is now primary!)
+    let dl = Instant::now() + Duration::from_secs(5);
+    let mut switched = false;
+    while Instant::now() < dl {
+        let (s_new, rep_new) =
+            socks5_connect(socks_addr, &TargetAddr::from_socket_addr(echo2_addr));
+        if rep_new == 0x00 {
+            assert_tcp_echo_payload(s_new, &vec![0x66u8; 256 * 1024]);
+            switched = true;
+            break;
+        }
+        thread::sleep(Duration::from_millis(80));
+    }
+    assert!(switched, "proxy --client failed to hot-switch to Exit 2!");
+
+    // 3) CRITICAL ZERO-DROP PROOF: The in-flight stream `s_old` opened BEFORE hot-switch MUST still
+    // finish transferring 512 KiB cleanly on the draining Exit 1 tunnel with 0 errors!
+    let drain_payload: Vec<u8> = (0..512 * 1024)
+        .map(|i| ((i * 23 + 5) % 251) as u8)
+        .collect();
+    assert_tcp_echo_payload(s_old, &drain_payload);
+
+    // 4) ROLLBACK PROOF: Hot-switch to an unreachable server port -> standby MUST time out (2s)
+    // and auto-rollback cleanly while Exit 2 keeps serving live traffic without interruption!
+    std::fs::write(
+        &hot_file,
+        format!(
+            "server_host=127.0.0.1\nserver_port={}\npsk=wrong-unreachable-psk\n",
+            dead_port
+        ),
+    )
+    .unwrap();
+    reload_trigger.store(true, Ordering::SeqCst);
+
+    // Even DURING the failed standby attempt and AFTER its 2s rollback timeout, Exit 2 stays 100% healthy!
+    for round in 0..3 {
+        let (s_alive, rep_alive) =
+            socks5_connect(socks_addr, &TargetAddr::from_socket_addr(echo2_addr));
+        assert_eq!(
+            rep_alive, 0x00,
+            "Active Exit 2 tunnel must stay alive during/after failed hot-switch rollback (round {})",
+            round
+        );
+        assert_tcp_echo_payload(s_alive, &vec![0x33u8; 64 * 1024]);
+        thread::sleep(Duration::from_millis(900));
+    }
+
+    stop.store(true, Ordering::SeqCst);
+    stop_e1.store(true, Ordering::SeqCst);
+    stop_e2.store(true, Ordering::SeqCst);
+    cli_h.join().unwrap();
+    srv1_h.join().unwrap();
+    srv2_h.join().unwrap();
+    let _ = std::fs::remove_file(&hot_file);
 }
